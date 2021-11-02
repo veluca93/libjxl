@@ -110,6 +110,7 @@ set(JPEGXL_INTERNAL_SOURCES_DEC
   jxl/entropy_coder.h
   jxl/epf.cc
   jxl/epf.h
+  jxl/fast_dct-inl.h
   jxl/fast_math-inl.h
   jxl/field_encodings.h
   jxl/fields.cc
