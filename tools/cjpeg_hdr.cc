@@ -71,7 +71,6 @@ void FillJPEGData(const jxl::Image3F& ycbcr, const jxl::PaddedBytes& icc,
   out->quant[1].index = 1;
   jxl::DequantMatrices dequant;
 
-  // mozjpeg q99
   int qluma[64] = {
       1, 1, 1, 1, 1, 1, 1, 2,  //
       1, 1, 1, 1, 1, 1, 1, 2,  //
@@ -82,10 +81,9 @@ void FillJPEGData(const jxl::Image3F& ycbcr, const jxl::PaddedBytes& icc,
       1, 1, 2, 2, 3, 3, 5, 6,  //
       2, 2, 3, 3, 4, 5, 6, 8,  //
   };
-  // mozjpeg q95
   int qchroma[64] = {
-      2, 2, 2,  2,  3,  4,  6,  9,   //
-      2, 2, 2,  3,  3,  4,  5,  8,   //
+      1, 1, 2,  2,  3,  4,  6,  9,   //
+      1, 2, 2,  3,  3,  4,  5,  8,   //
       2, 2, 2,  3,  4,  6,  9,  14,  //
       2, 3, 3,  4,  5,  7,  11, 16,  //
       3, 3, 4,  5,  7,  9,  13, 19,  //
@@ -93,10 +91,6 @@ void FillJPEGData(const jxl::Image3F& ycbcr, const jxl::PaddedBytes& icc,
       6, 5, 9,  11, 13, 17, 23, 31,  //
       9, 8, 14, 16, 19, 24, 31, 42,  //
   };
-  // Disable quantization for now.
-  std::fill(std::begin(qluma), std::end(qluma), 1);
-  std::fill(std::begin(qchroma), std::end(qchroma), 1);
-
   memcpy(out->quant[0].values.data(), qluma, sizeof(qluma));
   memcpy(out->quant[1].values.data(), qchroma, sizeof(qchroma));
 
@@ -131,8 +125,7 @@ void FillJPEGData(const jxl::Image3F& ycbcr, const jxl::PaddedBytes& icc,
     for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
       for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
         float deadzone = 0.5f / quant_field.Row(by)[bx];
-        // Disable quantization for now.
-        deadzone = 0;
+        deadzone = 0.65;
         auto q = [&](float coeff, size_t x, size_t y) -> int {
           size_t pos = x * 8 + y;
           float scoeff = coeff / qt[pos];
