@@ -197,6 +197,7 @@ Status DecodeANSCodes(const size_t num_histograms,
     std::vector<uint16_t> alphabet_sizes(num_histograms);
     for (size_t c = 0; c < num_histograms; c++) {
       alphabet_sizes[c] = DecodeVarLenUint16(in) + 1;
+      fprintf(stderr, "HSIZE %u\n", alphabet_sizes[c]);
       if (alphabet_sizes[c] > max_alphabet_size) {
         return JXL_FAILURE("Alphabet size is too long: %u", alphabet_sizes[c]);
       }
@@ -265,6 +266,8 @@ Status DecodeUintConfig(size_t log_alpha_size, HybridUintConfig* uint_config,
                         BitReader* br) {
   br->Refill();
   size_t split_exponent = br->ReadBits(CeilLog2Nonzero(log_alpha_size + 1));
+  fprintf(stderr, "SE: %zu %zu\n", CeilLog2Nonzero(log_alpha_size + 1),
+          split_exponent);
   size_t msb_in_token = 0, lsb_in_token = 0;
   if (split_exponent != log_alpha_size) {
     // otherwise, msb/lsb don't matter.
@@ -282,6 +285,8 @@ Status DecodeUintConfig(size_t log_alpha_size, HybridUintConfig* uint_config,
     return JXL_FAILURE("Invalid HybridUintConfig");
   }
   *uint_config = HybridUintConfig(split_exponent, msb_in_token, lsb_in_token);
+  fprintf(stderr, "HUC: %zu %zu %zu\n", split_exponent, msb_in_token,
+          lsb_in_token);
   return true;
 }
 
@@ -304,6 +309,7 @@ Status LZ77Params::VisitFields(Visitor* JXL_RESTRICT visitor) {
                                          BitsOffset(15, 8), 224, &min_symbol));
   JXL_QUIET_RETURN_IF_ERROR(visitor->U32(Val(3), Val(4), BitsOffset(2, 5),
                                          BitsOffset(8, 9), 3, &min_length));
+  fprintf(stderr, "%d %d\n", min_symbol, min_length);
   return true;
 }
 
@@ -349,6 +355,7 @@ Status DecodeHistograms(BitReader* br, size_t num_contexts, ANSCode* code,
   }
   code->lz77.nonserialized_distance_context = context_map->back();
   code->use_prefix_code = br->ReadFixedBits<1>();
+  fprintf(stderr, "use huff: %d\n", code->use_prefix_code);
   if (code->use_prefix_code) {
     code->log_alpha_size = PREFIX_MAX_BITS;
   } else {

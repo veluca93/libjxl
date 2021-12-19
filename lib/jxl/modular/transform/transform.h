@@ -82,6 +82,7 @@ class Transform : public Fields {
         Val((uint32_t)TransformId::kSqueeze),
         Val((uint32_t)TransformId::kInvalid), (uint32_t)TransformId::kRCT,
         reinterpret_cast<uint32_t *>(&id)));
+    fprintf(stderr, "ID: %d\n", id);
     if (id == TransformId::kInvalid) {
       return JXL_FAILURE("Invalid transform ID");
     }
@@ -90,11 +91,13 @@ class Transform : public Fields {
       JXL_QUIET_RETURN_IF_ERROR(
           visitor->U32(Bits(3), BitsOffset(6, 8), BitsOffset(10, 72),
                        BitsOffset(13, 1096), 0, &begin_c));
+      fprintf(stderr, "begin_c: %d\n", begin_c);
     }
     if (visitor->Conditional(id == TransformId::kRCT)) {
       // 0-41, default YCoCg.
       JXL_QUIET_RETURN_IF_ERROR(visitor->U32(Val(6), Bits(2), BitsOffset(4, 2),
                                              BitsOffset(6, 10), 6, &rct_type));
+      fprintf(stderr, "rct_type: %d\n", rct_type);
       if (rct_type >= 42) {
         return JXL_FAILURE("Invalid transform RCT type");
       }

@@ -387,13 +387,21 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
   if (image.channel.empty()) return true;
 
   // decode transforms
+  fprintf(stderr, "read: %zu -- %zu\n", br->TotalBitsConsumed(),
+          br->TotalBytes() * 8);
+  br->Refill();
+  fprintf(stderr, "bits: %zx\n", br->PeekBits(11));
   JXL_RETURN_IF_ERROR(Bundle::Read(br, &header));
   JXL_DEBUG_V(3, "Image data underwent %" PRIuS " transformations: ",
               header.transforms.size());
   image.transform = header.transforms;
   for (Transform &transform : image.transform) {
+    fprintf(stderr, "TRANSFORM: id %d beginc %d rct %d\n", transform.id,
+            transform.begin_c, transform.rct_type);
     JXL_RETURN_IF_ERROR(transform.MetaApply(image));
   }
+  fprintf(stderr, "Image info: x %zu y %zu c %zu\n", image.w, image.h,
+          image.channel.size());
   if (image.error) {
     return JXL_FAILURE("Corrupt file. Aborting.");
   }

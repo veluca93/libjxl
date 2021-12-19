@@ -97,6 +97,7 @@ static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
       (alphabet_size > 1u) ? FloorLog2Nonzero(alphabet_size - 1u) + 1 : 0;
 
   size_t num_symbols = br->ReadFixedBits<2>() + 1;
+  fprintf(stderr, "H: %zu %zu\n", max_bits, num_symbols);
 
   uint16_t symbols[4] = {0};
   for (size_t i = 0; i < num_symbols; ++i) {
@@ -126,11 +127,13 @@ static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
   switch (num_symbols) {
     case 1:
       table[0] = {0, symbols[0]};
+      fprintf(stderr, "singleton: %d\n", symbols[0]);
       break;
     case 2:
       if (symbols[0] > symbols[1]) swap_symbols(0, 1);
       table[0] = {1, symbols[0]};
       table[1] = {1, symbols[1]};
+      fprintf(stderr, "%d %d\n", symbols[0], symbols[1]);
       table_size = 2;
       break;
     case 3:
@@ -191,6 +194,7 @@ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
      1 for simple code;
      0 for no skipping, 2 skips 2 code lengths, 3 skips 3 code lengths */
   uint32_t simple_code_or_skip = br->ReadFixedBits<2>();
+  fprintf(stderr, "simple: %u\n", simple_code_or_skip);
   if (simple_code_or_skip == 1u) {
     table_.resize(1u << kHuffmanTableBits);
     return ReadSimpleCode(alphabet_size, br, table_.data());
@@ -222,6 +226,10 @@ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
   bool ok = (num_codes == 1 || space == 0) &&
             ReadHuffmanCodeLengths(code_length_code_lengths, alphabet_size,
                                    &code_lengths[0], br);
+  for (size_t i = 0; i < alphabet_size; i++) {
+    fprintf(stderr, "%d ", code_lengths[i]);
+  }
+  fprintf(stderr, "\n");
 
   if (!ok) return false;
   uint16_t counts[16] = {0};

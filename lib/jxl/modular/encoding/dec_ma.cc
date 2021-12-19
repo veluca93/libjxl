@@ -50,6 +50,7 @@ Status DecodeTree(BitReader *br, ANSSymbolReader *reader,
     uint32_t prop1 = reader->ReadHybridUint(kPropertyContext, br, context_map);
     if (prop1 > 256) return JXL_FAILURE("Invalid tree property value");
     int property = prop1 - 1;
+    fprintf(stderr, "PROP: %d\n", property);
     if (property == -1) {
       size_t predictor =
           reader->ReadHybridUint(kPredictorContext, br, context_map);
@@ -71,6 +72,8 @@ Status DecodeTree(BitReader *br, ANSSymbolReader *reader,
       uint32_t multiplier = (mul_bits + 1U) << mul_log;
       tree->emplace_back(-1, 0, leaf_id++, 0, static_cast<Predictor>(predictor),
                          predictor_offset, multiplier);
+      fprintf(stderr, "PRED: %zu OFF: %ld MUL: %u\n", predictor,
+              predictor_offset, multiplier);
       continue;
     }
     int splitval =

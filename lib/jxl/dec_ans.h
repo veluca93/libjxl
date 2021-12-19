@@ -289,6 +289,8 @@ class ANSSymbolReader {
       num_to_copy_ =
           ReadHybridUintConfig(lz77_length_uint_, token - lz77_threshold_, br) +
           lz77_min_length_;
+      fprintf(stderr, "%zu -- %u (%u)\n", token, num_to_copy_,
+              lz77_min_length_);
       br->Refill();  // covers ReadSymbolWithoutRefill + PeekBits
       // Distance code.
       size_t token = ReadSymbolWithoutRefill(lz77_ctx_, br);

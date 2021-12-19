@@ -28,6 +28,7 @@ struct Header : public Fields {
 
   Status VisitFields(Visitor *JXL_RESTRICT visitor) override {
     if (visitor->AllDefault(*this, &all_default)) {
+      fprintf(stderr, "WP all default\n");
       // Overwrite all serialized fields, but not any nonserialized_*.
       visitor->SetDefault(this);
       return true;

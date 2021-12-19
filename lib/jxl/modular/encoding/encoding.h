@@ -31,15 +31,19 @@ struct GroupHeader : public Fields {
 
   Status VisitFields(Visitor *JXL_RESTRICT visitor) override {
     JXL_QUIET_RETURN_IF_ERROR(visitor->Bool(false, &use_global_tree));
+    fprintf(stderr, "GT: %d\n", use_global_tree);
     JXL_QUIET_RETURN_IF_ERROR(visitor->VisitNested(&wp_header));
     uint32_t num_transforms = static_cast<uint32_t>(transforms.size());
     JXL_QUIET_RETURN_IF_ERROR(visitor->U32(Val(0), Val(1), BitsOffset(4, 2),
                                            BitsOffset(8, 18), 0,
                                            &num_transforms));
+    fprintf(stderr, "T: %u\n", num_transforms);
     if (visitor->IsReading()) transforms.resize(num_transforms);
     for (size_t i = 0; i < num_transforms; i++) {
+      fprintf(stderr, "TFORM: %zu\n", i);
       JXL_QUIET_RETURN_IF_ERROR(visitor->VisitNested(&transforms[i]));
     }
+    fprintf(stderr, "DONE: %u\n", num_transforms);
     return true;
   }
 
