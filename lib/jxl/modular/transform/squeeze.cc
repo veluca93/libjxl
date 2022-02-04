@@ -12,13 +12,66 @@
 #include "lib/jxl/common.h"
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/transform/transform.h"
-
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "lib/jxl/modular/transform/squeeze.cc"
+#include <hwy/foreach_target.h>
+#include <hwy/highway.h>
+HWY_BEFORE_NAMESPACE();
 namespace jxl {
+namespace HWY_NAMESPACE {
+
+// Equivalent to SmoothTendency(), but without branches
+// Only faster when SIMD can be used
+inline pixel_type SmoothTendencyNoBranch(pixel_type B, pixel_type a,
+                                         pixel_type n) {
+  pixel_type Ba = B - a;
+  pixel_type an = a - n;
+  pixel_type nonmono = Ba ^ an;
+  pixel_type absBa = std::abs(Ba);
+  pixel_type absan = std::abs(an);
+  pixel_type absBn = std::abs(B - n);
+  pixel_type absdiff = (absBa / 3 + absBn + 2) / 4;
+  pixel_type skipdiff = Ba != 0;
+  skipdiff &= an != 0;
+  skipdiff &= nonmono < 0;
+  pixel_type absBa2 = absBa * 2 + (absdiff & 1);
+  absdiff = (absdiff > absBa2 ? absBa * 2 + 1 : absdiff);
+  pixel_type absan2 = absan * 2;
+  absdiff = (absdiff + (absdiff & 1) > absan2 ? absan2 : absdiff);
+  pixel_type diff = (B < n ? -absdiff : absdiff);
+  diff = (skipdiff ? 0 : diff);
+  return diff;
+}
+
+template <size_t count>
+JXL_INLINE void fast_unsqueeze(const pixel_type *p_residual,
+                               const pixel_type *p_avg,
+                               const pixel_type *p_navg,
+                               const pixel_type *p_pout,
+                               pixel_type *JXL_RESTRICT p_out,
+                               pixel_type *JXL_RESTRICT p_nout) {
+#pragma clang loop vectorize(enable)
+  for (size_t x = 0; x < count; x++) {
+    pixel_type avg = p_avg[x];
+    pixel_type next_avg = p_navg[x];
+    pixel_type top = p_pout[x];
+    pixel_type tendency = SmoothTendencyNoBranch(top, avg, next_avg);
+
+    pixel_type diff_minus_tendency = p_residual[x];
+    pixel_type diff = diff_minus_tendency + tendency;
+
+    pixel_type out =
+        ((avg * 2) + diff + (diff < 0 ? (diff & 1) : -(diff & 1))) >> 1;
+
+    p_out[x] = out;
+    p_nout[x] = out - diff;
+  }
+}
 
 Status InvHSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
   JXL_ASSERT(c < input.channel.size());
   JXL_ASSERT(rc < input.channel.size());
-  const Channel &chin = input.channel[c];
+  Channel &chin = input.channel[c];
   const Channel &chin_residual = input.channel[rc];
   // These must be valid since we ran MetaApply already.
   JXL_ASSERT(chin.w == DivCeil(chin.w + chin_residual.w, 2));
@@ -43,8 +96,81 @@ Status InvHSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
     return true;
   }
 
+#if HWY_TARGET != HWY_SCALAR
+
+  // somewhat complicated trickery just to be able to SIMD this
+  intptr_t onerow_in = chin.plane.PixelsPerRow();
+  intptr_t onerow_inr = chin_residual.plane.PixelsPerRow();
+  intptr_t onerow_out = chout.plane.PixelsPerRow();
+  constexpr int kRowsPerThread = 8;
   JXL_RETURN_IF_ERROR(RunOnPool(
-      pool, 0, chin.h, ThreadPool::NoInit,
+      pool, 0, chin.h / kRowsPerThread, ThreadPool::NoInit,
+      [&](const uint32_t task, size_t /* thread */) {
+        const size_t y0 = task * kRowsPerThread;
+        const pixel_type *JXL_RESTRICT p_residual = chin_residual.Row(y0);
+        const pixel_type *JXL_RESTRICT p_avg = chin.Row(y0);
+        pixel_type *JXL_RESTRICT p_out = chout.Row(y0);
+
+        pixel_type b_p_avg[9][kRowsPerThread];
+        pixel_type b_p_residual[8][kRowsPerThread];
+        pixel_type b_p_out_even[8][kRowsPerThread];
+        pixel_type b_p_out_odd[8][kRowsPerThread];
+        size_t x = 0;
+        if (chin_residual.w > 16)
+          for (; x < ((chin_residual.w - 9) & (~7)); x++) {
+            if ((x & 7) == 0) {
+              for (size_t y = 0; y < kRowsPerThread; y++) {
+                for (size_t xx = x; xx < x + 8; xx++) {
+                  b_p_residual[xx & 7][y] = p_residual[xx + onerow_inr * y];
+                  b_p_avg[xx & 7][y] = p_avg[xx + onerow_in * y];
+                }
+                b_p_avg[8][y] = p_avg[x + 8 + onerow_in * y];
+              }
+            }
+            fast_unsqueeze<kRowsPerThread>(
+                b_p_residual[x & 7], b_p_avg[x & 7], b_p_avg[(x & 7) + 1],
+                (x ? b_p_out_odd[(x - 1) & 7] : b_p_avg[x & 7]),
+                b_p_out_even[x & 7], b_p_out_odd[x & 7]);
+
+            if ((x & 7) == 7) {
+              for (size_t y = 0; y < kRowsPerThread; y++) {
+                for (size_t xx = x - 7; xx <= x; xx++) {
+                  p_out[(xx << 1) + onerow_out * y] = b_p_out_even[xx & 7][y];
+                  p_out[(xx << 1) + 1 + onerow_out * y] =
+                      b_p_out_odd[xx & 7][y];
+                }
+              }
+            }
+          }
+        size_t x0 = x;
+        for (size_t y = 0; y < kRowsPerThread; y++) {
+          for (x = x0; x < chin_residual.w; x++) {
+            pixel_type diff_minus_tendency = p_residual[x + onerow_inr * y];
+            pixel_type avg = p_avg[x + onerow_in * y];
+            pixel_type next_avg =
+                (x + 1 < chin.w ? p_avg[x + 1 + onerow_in * y] : avg);
+            pixel_type left = (x ? p_out[(x << 1) - 1 + onerow_out * y] : avg);
+            pixel_type tendency = SmoothTendency(left, avg, next_avg);
+            pixel_type diff = diff_minus_tendency + tendency;
+            pixel_type A =
+                ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
+            p_out[(x << 1) + onerow_out * y] = A;
+            pixel_type B = A - diff;
+            p_out[(x << 1) + 1 + onerow_out * y] = B;
+          }
+          if (chout.w & 1)
+            p_out[chout.w - 1 + onerow_out * y] =
+                p_avg[chin.w - 1 + onerow_in * y];
+        }
+      },
+      "InvHorizontalSqueeze"));
+  size_t firstrow = chin.h / kRowsPerThread * kRowsPerThread;
+#else
+  size_t firstrow = 0;
+#endif
+
+  JXL_RETURN_IF_ERROR(RunOnPool(
+      pool, firstrow, chin.h, ThreadPool::NoInit,
       [&](const uint32_t task, size_t /* thread */) {
         const size_t y = task;
         const pixel_type *JXL_RESTRICT p_residual = chin_residual.Row(y);
@@ -52,27 +178,27 @@ Status InvHSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
         pixel_type *JXL_RESTRICT p_out = chout.Row(y);
 
         // special case for x=0 so we don't have to check x>0
-        pixel_type_w avg = p_avg[0];
-        pixel_type_w next_avg = (1 < chin.w ? p_avg[1] : avg);
-        pixel_type_w tendency = SmoothTendency(avg, avg, next_avg);
-        pixel_type_w diff = p_residual[0] + tendency;
-        pixel_type_w A =
+        pixel_type avg = p_avg[0];
+        pixel_type next_avg = (1 < chin.w ? p_avg[1] : avg);
+        pixel_type tendency = SmoothTendency(avg, avg, next_avg);
+        pixel_type diff = p_residual[0] + tendency;
+        pixel_type A =
             ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
-        pixel_type_w B = A - diff;
+        pixel_type B = A - diff;
         p_out[0] = A;
         p_out[1] = B;
 
         for (size_t x = 1; x < chin_residual.w; x++) {
-          pixel_type_w diff_minus_tendency = p_residual[x];
-          pixel_type_w avg = p_avg[x];
-          pixel_type_w next_avg = (x + 1 < chin.w ? p_avg[x + 1] : avg);
-          pixel_type_w left = p_out[(x << 1) - 1];
-          pixel_type_w tendency = SmoothTendency(left, avg, next_avg);
-          pixel_type_w diff = diff_minus_tendency + tendency;
-          pixel_type_w A =
+          pixel_type diff_minus_tendency = p_residual[x];
+          pixel_type avg = p_avg[x];
+          pixel_type next_avg = (x + 1 < chin.w ? p_avg[x + 1] : avg);
+          pixel_type left = p_out[(x << 1) - 1];
+          pixel_type tendency = SmoothTendency(left, avg, next_avg);
+          pixel_type diff = diff_minus_tendency + tendency;
+          pixel_type A =
               ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
           p_out[x << 1] = A;
-          pixel_type_w B = A - diff;
+          pixel_type B = A - diff;
           p_out[(x << 1) + 1] = B;
         }
         if (chout.w & 1) p_out[chout.w - 1] = p_avg[chin.w - 1];
@@ -111,38 +237,44 @@ Status InvVSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
     return true;
   }
 
-  intptr_t onerow_in = chin.plane.PixelsPerRow();
-  intptr_t onerow_out = chout.plane.PixelsPerRow();
   constexpr int kColsPerThread = 64;
   JXL_RETURN_IF_ERROR(RunOnPool(
       pool, 0, DivCeil(chin.w, kColsPerThread), ThreadPool::NoInit,
       [&](const uint32_t task, size_t /* thread */) {
         const size_t x0 = task * kColsPerThread;
         const size_t x1 = std::min((size_t)(task + 1) * kColsPerThread, chin.w);
+        const size_t w = x1 - x0;
         // We only iterate up to std::min(chin_residual.h, chin.h) which is
         // always chin_residual.h.
         for (size_t y = 0; y < chin_residual.h; y++) {
-          const pixel_type *JXL_RESTRICT p_residual = chin_residual.Row(y);
-          const pixel_type *JXL_RESTRICT p_avg = chin.Row(y);
-          pixel_type *JXL_RESTRICT p_out = chout.Row(y << 1);
-          for (size_t x = x0; x < x1; x++) {
-            pixel_type_w diff_minus_tendency = p_residual[x];
-            pixel_type_w avg = p_avg[x];
-
-            pixel_type_w next_avg = avg;
-            if (y + 1 < chin.h) next_avg = p_avg[x + onerow_in];
-            pixel_type_w top =
-                (y > 0 ? p_out[static_cast<ssize_t>(x) - onerow_out] : avg);
-            pixel_type_w tendency = SmoothTendency(top, avg, next_avg);
-            pixel_type_w diff = diff_minus_tendency + tendency;
-            pixel_type_w out =
-                ((avg * 2) + diff + (diff > 0 ? -(diff & 1) : (diff & 1))) >> 1;
+          const pixel_type *JXL_RESTRICT p_residual = chin_residual.Row(y) + x0;
+          const pixel_type *JXL_RESTRICT p_avg = chin.Row(y) + x0;
+          const pixel_type *JXL_RESTRICT p_navg =
+              chin.Row(y + 1 < chin.h ? y + 1 : y) + x0;
+          pixel_type *JXL_RESTRICT p_out = chout.Row(y << 1) + x0;
+          pixel_type *JXL_RESTRICT p_nout = chout.Row((y << 1) + 1) + x0;
+          const pixel_type *p_pout =
+              y > 0 ? chout.Row((y << 1) - 1) + x0 : p_avg;
+          size_t x = 0;
+          for (; x + 7 < w; x += 8) {
+            fast_unsqueeze<8>(p_residual + x, p_avg + x, p_navg + x, p_pout + x,
+                              p_out + x, p_nout + x);
+          }
+          for (; x < w; x++) {
+            pixel_type avg = p_avg[x];
+            pixel_type next_avg = p_navg[x];
+            pixel_type top = p_pout[x];
+            pixel_type tendency = SmoothTendency(top, avg, next_avg);
+            pixel_type diff_minus_tendency = p_residual[x];
+            pixel_type diff = diff_minus_tendency + tendency;
+            pixel_type out =
+                ((avg * 2) + diff + (diff < 0 ? (diff & 1) : -(diff & 1))) >> 1;
 
             p_out[x] = out;
             // If the chin_residual.h == chin.h, the output has an even number
             // of rows so the next line is fine. Otherwise, this loop won't
             // write to the last output row which is handled separately.
-            p_out[x + onerow_out] = p_out[x] - diff;
+            p_nout[x] = out - diff;
           }
         }
       },
@@ -158,6 +290,62 @@ Status InvVSqueeze(Image &input, uint32_t c, uint32_t rc, ThreadPool *pool) {
   }
   input.channel[c] = std::move(chout);
   return true;
+}
+
+Status InvSqueeze(Image &input, std::vector<SqueezeParams> parameters,
+                  ThreadPool *pool) {
+  for (int i = parameters.size() - 1; i >= 0; i--) {
+    JXL_RETURN_IF_ERROR(
+        CheckMetaSqueezeParams(parameters[i], input.channel.size()));
+    bool horizontal = parameters[i].horizontal;
+    bool in_place = parameters[i].in_place;
+    uint32_t beginc = parameters[i].begin_c;
+    uint32_t endc = parameters[i].begin_c + parameters[i].num_c - 1;
+    uint32_t offset;
+    if (in_place) {
+      offset = endc + 1;
+    } else {
+      offset = input.channel.size() + beginc - endc - 1;
+    }
+    if (beginc < input.nb_meta_channels) {
+      // This is checked in MetaSqueeze.
+      JXL_ASSERT(input.nb_meta_channels > parameters[i].num_c);
+      input.nb_meta_channels -= parameters[i].num_c;
+    }
+
+    for (uint32_t c = beginc; c <= endc; c++) {
+      uint32_t rc = offset + c - beginc;
+      // MetaApply should imply that `rc` is within range, otherwise there's a
+      // programming bug.
+      JXL_ASSERT(rc < input.channel.size());
+      if ((input.channel[c].w < input.channel[rc].w) ||
+          (input.channel[c].h < input.channel[rc].h)) {
+        return JXL_FAILURE("Corrupted squeeze transform");
+      }
+      if (horizontal) {
+        JXL_RETURN_IF_ERROR(InvHSqueeze(input, c, rc, pool));
+      } else {
+        JXL_RETURN_IF_ERROR(InvVSqueeze(input, c, rc, pool));
+      }
+    }
+    input.channel.erase(input.channel.begin() + offset,
+                        input.channel.begin() + offset + (endc - beginc + 1));
+  }
+  return true;
+}
+
+}  // namespace HWY_NAMESPACE
+}  // namespace jxl
+HWY_AFTER_NAMESPACE();
+
+#if HWY_ONCE
+
+namespace jxl {
+
+HWY_EXPORT(InvSqueeze);
+Status InvSqueeze(Image &input, std::vector<SqueezeParams> parameters,
+                  ThreadPool *pool) {
+  return HWY_DYNAMIC_DISPATCH(InvSqueeze)(input, parameters, pool);
 }
 
 void DefaultSqueezeParameters(std::vector<SqueezeParams> *parameters,
@@ -284,46 +472,6 @@ Status MetaSqueeze(Image &image, std::vector<SqueezeParams> *parameters) {
   return true;
 }
 
-Status InvSqueeze(Image &input, std::vector<SqueezeParams> parameters,
-                  ThreadPool *pool) {
-  for (int i = parameters.size() - 1; i >= 0; i--) {
-    JXL_RETURN_IF_ERROR(
-        CheckMetaSqueezeParams(parameters[i], input.channel.size()));
-    bool horizontal = parameters[i].horizontal;
-    bool in_place = parameters[i].in_place;
-    uint32_t beginc = parameters[i].begin_c;
-    uint32_t endc = parameters[i].begin_c + parameters[i].num_c - 1;
-    uint32_t offset;
-    if (in_place) {
-      offset = endc + 1;
-    } else {
-      offset = input.channel.size() + beginc - endc - 1;
-    }
-    if (beginc < input.nb_meta_channels) {
-      // This is checked in MetaSqueeze.
-      JXL_ASSERT(input.nb_meta_channels > parameters[i].num_c);
-      input.nb_meta_channels -= parameters[i].num_c;
-    }
-
-    for (uint32_t c = beginc; c <= endc; c++) {
-      uint32_t rc = offset + c - beginc;
-      // MetaApply should imply that `rc` is within range, otherwise there's a
-      // programming bug.
-      JXL_ASSERT(rc < input.channel.size());
-      if ((input.channel[c].w < input.channel[rc].w) ||
-          (input.channel[c].h < input.channel[rc].h)) {
-        return JXL_FAILURE("Corrupted squeeze transform");
-      }
-      if (horizontal) {
-        JXL_RETURN_IF_ERROR(InvHSqueeze(input, c, rc, pool));
-      } else {
-        JXL_RETURN_IF_ERROR(InvVSqueeze(input, c, rc, pool));
-      }
-    }
-    input.channel.erase(input.channel.begin() + offset,
-                        input.channel.begin() + offset + (endc - beginc + 1));
-  }
-  return true;
-}
-
 }  // namespace jxl
+
+#endif
