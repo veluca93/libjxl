@@ -56,10 +56,10 @@ constexpr size_t kLZ77MinLength = 16;
 
 struct PrefixCode {
   static constexpr size_t kNumLZ77 = 17;
-  static constexpr size_t kNumRaw = 15;
+  static constexpr size_t kNumRaw = 31;
 
-  alignas(32) uint8_t raw_nbits[16] = {};
-  alignas(32) uint8_t raw_bits[16] = {};
+  alignas(32) uint8_t raw_nbits[32] = {};
+  alignas(32) uint16_t raw_bits[32] = {};
   uint8_t lz77_nbits[kNumLZ77] = {};
 
   uint16_t lz77_bits[kNumLZ77] = {};
@@ -79,7 +79,7 @@ struct PrefixCode {
   // Create the prefix codes given the code lengths.
   // Supports the code lengths being split into two halves.
   static void ComputeCanonicalCode(const uint8_t* first_chunk_nbits,
-                                   uint8_t* first_chunk_bits,
+                                   uint16_t* first_chunk_bits,
                                    size_t first_chunk_size,
                                    const uint8_t* second_chunk_nbits,
                                    uint16_t* second_chunk_bits,
@@ -87,7 +87,6 @@ struct PrefixCode {
     uint8_t code_length_counts[16] = {};
     for (size_t i = 0; i < first_chunk_size; i++) {
       code_length_counts[first_chunk_nbits[i]]++;
-      assert(first_chunk_nbits[i] <= 7);
       assert(first_chunk_nbits[i] > 0);
     }
     for (size_t i = 0; i < second_chunk_size; i++) {
@@ -125,7 +124,7 @@ struct PrefixCode {
       level1_counts[numraw] += lz77_counts[i];
     }
     uint8_t level1_nbits[kNumRaw + 1] = {};
-    ComputeCodeLengths(level1_counts, numraw + 1, 7, level1_nbits);
+    ComputeCodeLengths(level1_counts, numraw + 1, 9, level1_nbits);
 
     uint8_t level2_nbits[kNumLZ77] = {};
     ComputeCodeLengths(lz77_counts, kNumLZ77, 15 - level1_nbits[numraw],
@@ -236,16 +235,16 @@ struct PrefixCode {
     while (lz77_nbits[num_lz77 - 1] == 0) {
       num_lz77--;
     }
-    // Encode 0s until 224 (start of LZ77 symbols). This is in total 224-15 =
-    // 209.
+    // Encode 0s until 224 (start of LZ77 symbols). This is in total 224-31 =
+    // 193.
     static_assert(kLZ77Offset == 224, "");
-    static_assert(kNumRaw == 15, "");
+    static_assert(kNumRaw == 31, "");
     writer->Write(code_length_nbits[17], code_length_bits[17]);
-    writer->Write(3, 0b010);  // 5
+    writer->Write(3, 0b001);  // 4
     writer->Write(code_length_nbits[17], code_length_bits[17]);
-    writer->Write(3, 0b000);  // (5-2)*8 + 3 = 27
+    writer->Write(3, 0b110);  // (4-2)*8 + 9 = 25
     writer->Write(code_length_nbits[17], code_length_bits[17]);
-    writer->Write(3, 0b110);  // (27-2)*8 + 9 = 209
+    writer->Write(3, 0b110);  // (25-2)*8 + 9 = 193
     // Encode LZ77 symbols, with values 224+i*16.
     for (size_t i = 0; i < num_lz77; i++) {
       writer->Write(code_length_nbits[lz77_nbits[i]],
@@ -360,7 +359,7 @@ void AssembleFrame(size_t width, size_t height, size_t nb_chans,
     output->Write(2, 0b11);  // 1 + u(6)
     output->Write(6, bitdepth - 1);
   }
-  output->Write(1, 1);  // 16-bit-buffer sufficient
+  output->Write(1, 0);  // 16-bit-buffer not sufficient
   bool have_alpha = (nb_chans == 2 || nb_chans == 4);
   if (have_alpha) {
     output->Write(2, 0b01);  // One extra channel
@@ -723,7 +722,7 @@ struct ChunkEncoder {
         (bits << code.lz77_nbits[token_div16]) | code.lz77_bits[token_div16]);
   }
 
-  inline void Chunk(size_t run, uint16_t* residuals) {
+  inline void Chunk(size_t run, uint32_t* residuals) {
     EncodeRle(run, *code, *output);
 #if defined(FASTLL_ENABLE_AVX2_INTRINSICS) && FASTLL_ENABLE_AVX2_INTRINSICS
     if (bytedepth == 1) {
@@ -739,6 +738,7 @@ struct ChunkEncoder {
       return;
     }
 #endif
+
     for (size_t ix = 0; ix < kChunkSize; ix++) {
       unsigned token, nbits, bits;
       EncodeHybridUint000(residuals[ix], &token, &nbits, &bits);
@@ -762,7 +762,7 @@ struct ChunkSampleCollector {
     lz77_counts[token_div16]++;
   }
 
-  inline void Chunk(size_t run, uint16_t* residuals) {
+  inline void Chunk(size_t run, uint32_t* residuals) {
     // Run is broken. Encode the run and encode the individual vector.
     Rle(run, lz77_counts);
     for (size_t ix = 0; ix < kChunkSize; ix++) {
@@ -779,32 +779,32 @@ struct ChunkSampleCollector {
   uint64_t* lz77_counts;
 };
 
-constexpr uint16_t PackSigned(int16_t value) {
-  return (static_cast<uint16_t>(value) << 1) ^
-         ((static_cast<uint16_t>(~value) >> 15) - 1);
+constexpr uint32_t PackSigned(int32_t value) {
+  return (static_cast<uint32_t>(value) << 1) ^
+         ((static_cast<uint32_t>(~value) >> 31) - 1);
 }
 
 template <typename T>
 struct ChannelRowProcessor {
   T* t;
-  inline void ProcessChunk(const int16_t* row, const int16_t* row_left,
-                           const int16_t* row_top, const int16_t* row_topleft) {
+  inline void ProcessChunk(const int32_t* row, const int32_t* row_left,
+                           const int32_t* row_top, const int32_t* row_topleft) {
     bool continue_rle = true;
-    alignas(32) uint16_t residuals[kChunkSize] = {};
+    alignas(32) uint32_t residuals[kChunkSize] = {};
     for (size_t ix = 0; ix < kChunkSize; ix++) {
-      int16_t px = row[ix];
-      int16_t left = row_left[ix];
-      int16_t top = row_top[ix];
-      int16_t topleft = row_topleft[ix];
-      int16_t ac = left - topleft;
-      int16_t ab = left - top;
-      int16_t bc = top - topleft;
-      int16_t grad = static_cast<int16_t>(static_cast<uint16_t>(ac) +
-                                          static_cast<uint16_t>(top));
-      int16_t d = ab ^ bc;
-      int16_t clamp = d < 0 ? top : left;
-      int16_t s = ac ^ bc;
-      int16_t pred = s < 0 ? grad : clamp;
+      int32_t px = row[ix];
+      int32_t left = row_left[ix];
+      int32_t top = row_top[ix];
+      int32_t topleft = row_topleft[ix];
+      int32_t ac = left - topleft;
+      int32_t ab = left - top;
+      int32_t bc = top - topleft;
+      int32_t grad = static_cast<int32_t>(static_cast<uint32_t>(ac) +
+                                          static_cast<uint32_t>(top));
+      int32_t d = ab ^ bc;
+      int32_t clamp = d < 0 ? top : left;
+      int32_t s = ac ^ bc;
+      int32_t pred = s < 0 ? grad : clamp;
       residuals[ix] = PackSigned(px - pred);
       continue_rle &= residuals[ix] == last;
     }
@@ -818,8 +818,8 @@ struct ChannelRowProcessor {
     }
     last = residuals[kChunkSize - 1];
   }
-  void ProcessRow(const int16_t* row, const int16_t* row_left,
-                  const int16_t* row_top, const int16_t* row_topleft,
+  void ProcessRow(const int32_t* row, const int32_t* row_left,
+                  const int32_t* row_top, const int32_t* row_topleft,
                   size_t xs) {
     for (size_t x = 0; x + kChunkSize <= xs; x += kChunkSize) {
       ProcessChunk(row + x, row_left + x, row_top + x, row_topleft + x);
@@ -828,7 +828,7 @@ struct ChannelRowProcessor {
 
   void Finalize() { t->Finalize(run); }
   size_t run = 0;
-  uint16_t last = 0xFFFF;  // Can never appear
+  uint32_t last = 0xFFFFFFFFu;  // Can never appear
 };
 
 template <typename Processor, size_t nb_chans, size_t bytedepth>
@@ -837,11 +837,11 @@ void ProcessImageArea(const unsigned char* rgba, size_t x0, size_t y0,
                       size_t row_stride, Processor* processors) {
   constexpr size_t kPadding = 16;
 
-  int16_t group_data[nb_chans][2][256 + kPadding * 2] = {};
-  int16_t allzero[nb_chans] = {};
-  int16_t allone[nb_chans];
+  int32_t group_data[nb_chans][2][256 + kPadding * 2] = {};
+  int32_t allzero[nb_chans] = {};
+  int32_t allone[nb_chans];
   auto get_pixel = [&](size_t x, size_t y, size_t channel) {
-    int16_t p = rgba[row_stride * (y0 + y) + (x0 + x) * nb_chans * bytedepth +
+    int32_t p = rgba[row_stride * (y0 + y) + (x0 + x) * nb_chans * bytedepth +
                      channel * bytedepth];
     if (bytedepth == 2) {
       p <<= 8;
@@ -851,32 +851,32 @@ void ProcessImageArea(const unsigned char* rgba, size_t x0, size_t y0,
     return p;
   };
 
-  for (size_t i = 0; i < nb_chans; i++) allone[i] = 0xffff;
+  for (size_t i = 0; i < nb_chans; i++) allone[i] = 0xffffffffu;
   for (size_t y = 0; y < ys; y++) {
     // Pre-fill rows with YCoCg converted pixels.
     for (size_t x = 0; x < oxs; x++) {
       if (nb_chans < 3) {
-        int16_t luma = get_pixel(x, y, 0);
+        int32_t luma = get_pixel(x, y, 0);
         group_data[0][y & 1][x + kPadding] = luma;
         if (nb_chans == 2) {
-          int16_t a = get_pixel(x, y, 1);
+          int32_t a = get_pixel(x, y, 1);
           group_data[1][y & 1][x + kPadding] = a;
         }
       } else {
-        int16_t r = get_pixel(x, y, 0);
-        int16_t g = get_pixel(x, y, 1);
-        int16_t b = get_pixel(x, y, 2);
+        int32_t r = get_pixel(x, y, 0);
+        int32_t g = get_pixel(x, y, 1);
+        int32_t b = get_pixel(x, y, 2);
         if (nb_chans == 4) {
-          int16_t a = get_pixel(x, y, 3);
+          int32_t a = get_pixel(x, y, 3);
           group_data[3][y & 1][x + kPadding] = a;
           group_data[1][y & 1][x + kPadding] = a ? r - b : 0;
-          int16_t tmp = b + (group_data[1][y & 1][x + kPadding] >> 1);
+          int32_t tmp = b + (group_data[1][y & 1][x + kPadding] >> 1);
           group_data[2][y & 1][x + kPadding] = a ? g - tmp : 0;
           group_data[0][y & 1][x + kPadding] =
               a ? tmp + (group_data[2][y & 1][x + kPadding] >> 1) : 0;
         } else {
           group_data[1][y & 1][x + kPadding] = r - b;
-          int16_t tmp = b + (group_data[1][y & 1][x + kPadding] >> 1);
+          int32_t tmp = b + (group_data[1][y & 1][x + kPadding] >> 1);
           group_data[2][y & 1][x + kPadding] = g - tmp;
           group_data[0][y & 1][x + kPadding] =
               tmp + (group_data[2][y & 1][x + kPadding] >> 1);
@@ -910,11 +910,11 @@ void ProcessImageArea(const unsigned char* rgba, size_t x0, size_t y0,
       }
 
       // Get pointers to px/left/top/topleft data to speedup loop.
-      const int16_t* row = &group_data[c][y & 1][kPadding];
-      const int16_t* row_left = &group_data[c][y & 1][kPadding - 1];
-      const int16_t* row_top =
+      const int32_t* row = &group_data[c][y & 1][kPadding];
+      const int32_t* row_left = &group_data[c][y & 1][kPadding - 1];
+      const int32_t* row_top =
           y == 0 ? row_left : &group_data[c][(y - 1) & 1][kPadding];
-      const int16_t* row_topleft =
+      const int32_t* row_topleft =
           y == 0 ? row_left : &group_data[c][(y - 1) & 1][kPadding - 1];
 
       processors[c].ProcessRow(row, row_left, row_top, row_topleft, xs);
@@ -932,7 +932,7 @@ void WriteACSection(const unsigned char* rgba, size_t x0, size_t y0, size_t oxs,
   size_t xs = (oxs + kChunkSize - 1) / kChunkSize * kChunkSize;
   for (size_t i = 0; i < nb_chans; i++) {
     if (is_single_group && i == 0) continue;
-    output[i].Allocate(16 * xs * ys * bytedepth + 4);
+    output[i].Allocate(32 * xs * ys * bytedepth + 4);
   }
   if (!is_single_group) {
     // Group header for modular image.
@@ -971,40 +971,7 @@ void ProcessImageAreaPalette(const unsigned char* rgba, size_t x0, size_t y0,
                              size_t oxs, size_t xs, size_t yskip, size_t ys,
                              size_t row_stride, const int16_t* lookup,
                              Processor* processors) {
-  constexpr size_t kPadding = 16;
-
-  int16_t group_data[2][256 + kPadding * 2] = {};
-  Processor& row_encoder = processors[0];
-
-  for (size_t y = 0; y < ys; y++) {
-    // Pre-fill rows with palette converted pixels.
-    const unsigned char* inrow = rgba + row_stride * (y0 + y) + x0 * nb_chans;
-    for (size_t x = 0; x < oxs; x++) {
-      uint32_t p = 0;
-      memcpy(&p, inrow + x * nb_chans, nb_chans);
-      group_data[y & 1][x + kPadding] = lookup[pixel_hash(p)];
-    }
-    // Deal with x == 0.
-    group_data[y & 1][kPadding - 1] =
-        y > 0 ? group_data[(y - 1) & 1][kPadding] : 0;
-    // Fix topleft.
-    group_data[(y - 1) & 1][kPadding - 1] =
-        y > 0 ? group_data[(y - 1) & 1][kPadding] : 0;
-    // Fill in padding.
-    for (size_t x = oxs; x < xs; x++) {
-      group_data[y & 1][kPadding + x] = group_data[y & 1][kPadding + oxs - 1];
-    }
-    // Get pointers to px/left/top/topleft data to speedup loop.
-    const int16_t* row = &group_data[y & 1][kPadding];
-    const int16_t* row_left = &group_data[y & 1][kPadding - 1];
-    const int16_t* row_top =
-        y == 0 ? row_left : &group_data[(y - 1) & 1][kPadding];
-    const int16_t* row_topleft =
-        y == 0 ? row_left : &group_data[(y - 1) & 1][kPadding - 1];
-
-    row_encoder.ProcessRow(row, row_left, row_top, row_topleft, xs);
-  }
-  row_encoder.Finalize();
+  assert(false);
 }
 
 template <size_t nb_chans>
@@ -1063,6 +1030,7 @@ void PrepareDCGlobalPalette(bool is_single_group, size_t width, size_t height,
                             const PrefixCode& code,
                             const std::vector<uint32_t>& palette,
                             size_t pcolors_real, BitWriter* output) {
+  assert(false);
   PrepareDCGlobalCommon(is_single_group, width, height, code, output);
   output->Write(2, 0b01);     // 1 transform
   output->Write(2, 0b01);     // Palette
@@ -1088,7 +1056,7 @@ void PrepareDCGlobalPalette(bool is_single_group, size_t width, size_t height,
   row_encoder.t = &encoder;
   encoder.output = output;
   encoder.code = &code;
-  int16_t p[4][32 + 1024] = {};
+  int32_t p[4][32 + 1024] = {};
   uint8_t prgba[4];
   size_t i = 0;
   size_t have_zero = 0;
@@ -1234,7 +1202,7 @@ size_t LLEnc(const unsigned char* rgba, size_t width, size_t stride,
   size_t num_dc_groups_x = (width + 2047) / 2048;
   size_t num_dc_groups_y = (height + 2047) / 2048;
 
-  uint64_t raw_counts[16] = {};
+  uint64_t raw_counts[32] = {};
   uint64_t lz77_counts[17] = {};
 
   // sample the middle (effort * 2) rows of every group
@@ -1253,11 +1221,13 @@ size_t LLEnc(const unsigned char* rgba, size_t width, size_t stride,
                                         !collided, lookup);
   }
 
-  uint64_t base_raw_counts[16] = {3843, 852, 1270, 1214, 1014, 727, 481, 300,
-                                  159,  51,  5,    1,    1,    1,   1,   1};
+  uint64_t base_raw_counts[32] = {
+      3843, 852, 1270, 1214, 1014, 727, 481, 300, 159, 51, 5, 1, 1, 1, 1, 1,
+      1,    1,   1,    1,    1,    1,   1,   1,   1,   1,  1, 1, 1, 1, 1, 1,
+  };
 
   bool doing_ycocg = nb_chans > 2 && collided;
-  for (size_t i = bitdepth + 2 + (doing_ycocg ? 1 : 0); i < 16; i++) {
+  for (size_t i = bitdepth + 2 + (doing_ycocg ? 1 : 0); i < 32; i++) {
     base_raw_counts[i] = 0;
   }
   uint64_t base_lz77_counts[17] = {
@@ -1265,7 +1235,7 @@ size_t LLEnc(const unsigned char* rgba, size_t width, size_t stride,
       // near full-group run is quite common (e.g. all-opaque alpha)
       18, 12, 9, 11, 15, 2, 2, 1, 1, 1, 1, 2, 300, 0, 0, 0, 0};
 
-  for (size_t i = 0; i < 16; i++) {
+  for (size_t i = 0; i < 32; i++) {
     raw_counts[i] = (raw_counts[i] << 8) + base_raw_counts[i];
   }
   if (!collided) {
@@ -1338,7 +1308,6 @@ size_t JxlFastLosslessEncode(const unsigned char* rgba, size_t width,
                              size_t stride, size_t height, size_t nb_chans,
                              size_t bitdepth, int effort,
                              unsigned char** output) {
-  assert(bitdepth <= 12);
   assert(bitdepth > 0);
   assert(nb_chans <= 4);
   assert(nb_chans != 0);
