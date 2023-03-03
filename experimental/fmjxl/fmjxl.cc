@@ -501,7 +501,17 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   size_t x0, size_t xs, size_t y0, size_t ys, uint16_t* dc_y,
                   uint16_t* prev_ydct, uint16_t* dc_cb, uint16_t* prev_cbdct,
                   uint16_t* dc_cr, uint16_t* prev_crdct) {
-  //
+  const PrefixCode* nnz_codes = &prefix_codes.nnz_codes[is_delta ? 0 : 1][0];
+  const PrefixCode* ac_codes = &prefix_codes.ac_codes[is_delta ? 0 : 1][0];
+  (void)ac_codes;
+  for (size_t iy = 0; iy < ys; iy += 8) {
+    for (size_t ix = 0; ix < xs; ix += 8) {
+      for (size_t c : {1, 0, 2}) {
+        if (c != 1 && (ix % 16 != 0 || iy % 16 != 0)) continue;
+        writer->Write(nnz_codes[c].nbits[0], nnz_codes[c].bits[0]);
+      }
+    }
+  }
 }
 
 void StoreDCGroup(BitWriter* writer, bool is_delta,
