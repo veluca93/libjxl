@@ -31,6 +31,10 @@ FJXL_INLINE uint32_t FloorLog2(uint32_t v) {
 FJXL_INLINE uint32_t CtzNonZero(uint64_t v) { return __builtin_ctzll(v); }
 #endif
 
+FJXL_INLINE uint32_t CeilLog2(uint32_t v) {
+  return FloorLog2(v) + ((v & v - 1) ? 1 : 0);
+}
+
 // Compiles to a memcpy on little-endian systems.
 FJXL_INLINE void StoreLE64(uint8_t* tgt, uint64_t data) {
 #if (!defined(__BYTE_ORDER__) || (__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__))
@@ -433,10 +437,68 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
   //
 }
 
-void StoreDCGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
-                  size_t w, size_t x0, size_t xs, size_t y0, size_t ys,
-                  uint16_t* dc_y, uint16_t* dc_cb, uint16_t* dc_cr) {
-  //
+void StoreDCGroup(BitWriter* writer, bool is_delta,
+                  const PrefixCodeData& prefix_codes, size_t w, size_t x0,
+                  size_t xs, size_t y0, size_t ys, const uint16_t* dc_y,
+                  const uint16_t* dc_cb, const uint16_t* dc_cr) {
+  // No extra DC precision.
+  writer->Write(2, 0);
+
+  // Group header for DC modular image.
+  writer->Write(1, 1);     // Global tree
+  writer->Write(1, 1);     // All default wp
+  writer->Write(2, 0b00);  // 0 transforms
+
+  // 1 DC sample per 8 image samples.
+  w = w / 8;
+
+  const PrefixCode* codes = &prefix_codes.dc_codes[is_delta ? 0 : 1][0];
+
+  for (size_t c = 0; c < 3; c++) {
+    const uint16_t* dc = c == 0 ? dc_y : c == 1 ? dc_cb : dc_cr;
+    (void)dc;
+    size_t cw = c == 0 ? w : w / 2;
+    size_t ch = c == 0 ? w : w / 2;
+    size_t cx0 = c == 0 ? x0 : x0 / 2;
+    size_t cy0 = c == 0 ? y0 : y0 / 2;
+    size_t cxs = c == 0 ? xs : xs / 2;
+    size_t cys = c == 0 ? ys : ys / 2;
+    (void)cx0;
+    (void)cy0;
+    (void)cw;
+    (void)ch;
+    for (size_t y = 0; y < cys; y++) {
+      for (size_t x = 0; x < cxs; x++) {
+        writer->Write(codes[c].nbits[0], codes[c].bits[0]);
+      }
+    }
+  }
+
+  // AC metadata.
+  size_t metadata_count = xs * ys;
+  writer->Write(CeilLog2(metadata_count), metadata_count - 1);
+  writer->Write(1, 0);     // Custom tree
+  writer->Write(1, 1);     // All default wp
+  writer->Write(2, 0b00);  // 0 transforms
+
+  writer->Write(1, 0);   // no lz77 for the tree.
+  writer->Write(1, 1);   // simple code for the tree's context map
+  writer->Write(2, 0);   // all contexts clustered together
+  writer->Write(1, 1);   // use prefix code for tree
+  writer->Write(4, 15);  // don't do hybriduint for tree - 1 symbol anyway
+
+  writer->Write(1, 0b0);  // Alphabet size is 1: we need 0 only.
+  // tree repr is empty.
+
+  writer->Write(1, 0);  // no lz77 for the main data.
+  // single ctx, so no ctx map for main data.
+
+  writer->Write(1, 1);    // use prefix code
+  writer->Write(4, 15);   // don't do hybriduint
+  writer->Write(1, 0b0);  // Alphabet size is 1: we need 0 only.
+
+  // We don't actually need to encode anything for the AC metadata, as
+  // everything is 0.
 }
 
 }  // namespace
@@ -529,8 +591,8 @@ struct FastMJXLEncoder {
       size_t y0 = iy * 256;
       size_t xs = std::min(w / 8, x0 + 256) - x0;
       size_t ys = std::min(h / 8, y0 + 256) - y0;
-      StoreDCGroup(group_data.data() + acg_off + i, prefix_codes, w, x0, xs, y0,
-                   ys, dc_y.get(), dc_cb.get(), dc_cr.get());
+      StoreDCGroup(group_data.data() + 1 + i, is_delta, prefix_codes, w, x0, xs,
+                   y0, ys, dc_y.get(), dc_cb.get(), dc_cr.get());
     }
 
     for (size_t i = 0; i < group_data.size(); i++) {
@@ -547,7 +609,7 @@ struct FastMJXLEncoder {
     encoded.Write(8, 111);
 
     encoded.Write(1, 1);         // YCbCr
-    encoded.Write(6, 0b010001);  // 420 downsampling
+    encoded.Write(6, 0b000100);  // 420 downsampling
     encoded.Write(2, 0b00);      // no upsampling
     encoded.Write(2, 0b00);      // exactly one pass
     encoded.Write(1, 0);         // no custom size or origin
