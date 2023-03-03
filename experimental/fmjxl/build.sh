@@ -16,7 +16,7 @@ if ! command -v "$CXX" >/dev/null ; then
   exit 1
 fi
 
-"$CXX" -O3 -static \
+"$CXX" -O3 -static -Wall \
   -I. \
   "$DIR"/fmjxl.cc "$DIR"/fmjxl_main.cc \
   -o fmjxl 
