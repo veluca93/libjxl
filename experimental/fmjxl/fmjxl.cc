@@ -32,7 +32,7 @@ FJXL_INLINE uint32_t CtzNonZero(uint64_t v) { return __builtin_ctzll(v); }
 #endif
 
 FJXL_INLINE uint32_t CeilLog2(uint32_t v) {
-  return FloorLog2(v) + ((v & v - 1) ? 1 : 0);
+  return FloorLog2(v) + ((v & (v - 1)) ? 1 : 0);
 }
 
 // Compiles to a memcpy on little-endian systems.
@@ -424,8 +424,75 @@ void StoreDCGlobal(BitWriter* writer, bool is_delta,
   }
 }
 
-void StoreACGlobal(BitWriter* writer, const PrefixCodeData& prefix_codes) {
-  //
+constexpr uint32_t kStandardCoeffOrder[] = {
+    0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+};
+
+void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
+                   const PrefixCodeData& prefix_codes) {
+  // All default quantization tables (TODO(veluca): this is probably not a good
+  // idea).
+  writer->Write(1, 1);
+
+  size_t num_histo_bits = CeilLog2(num_groups);
+  writer->Write(num_histo_bits, 0);  // Only one set of histograms.
+
+  // SIMD-friendly coefficient order. TODO(veluca): see if we can do better
+  // while still being SIMD-friendly.
+  writer->Write(2, 0b11);  // arbitrary mask selector
+  writer->Write(13, 0b0000000000001);
+
+  (void)kStandardCoeffOrder;
+  constexpr uint8_t kCoeffOrderEncoding[] = {
+      0xa6, 0x03, 0x4c, 0xb4, 0x08, 0x11, 0x3a, 0xc6, 0x4a, 0x6f, 0x40, 0x8c,
+      0x35, 0x8c, 0x18, 0x8d, 0x06, 0xda, 0x14, 0x04, 0x00, 0xe8, 0xe4, 0x3e,
+      0x73, 0xae, 0xd1, 0x8c, 0x5f, 0x03, 0xdd, 0x71, 0x1f, 0x7e, 0xdc, 0xb0,
+      0x50, 0xdd, 0xec, 0x28, 0xbd, 0x24, 0x30, 0x8b, 0x41, 0x7b, 0xc4, 0x85,
+      0x82, 0x08, 0xfe, 0xed, 0xdd, 0x5c, 0x7b, 0xa8, 0x2e, 0xc7, 0x29, 0xe8,
+      0x31, 0xca, 0xb4, 0x9d, 0xe4, 0x5c, 0xc5, 0xec, 0x91, 0x11, 0x33, 0x52,
+      0xb9, 0x1d, 0xfe, 0x1c, 0xfe, 0xc9, 0xbf, 0x80, 0xb8, 0x3b, 0x27, 0x51,
+      0xd2, 0x19, 0xe2, 0x03, 0x4a, 0x00};
+  constexpr size_t kCoeffOrderEncodingBitLength = 716;
+  for (size_t i = 0; i < kCoeffOrderEncodingBitLength; i += 8) {
+    size_t nb = std::min(kCoeffOrderEncodingBitLength, i + 8) - i;
+    writer->Write(nb, kCoeffOrderEncoding[i / 8] & ((1 << nb) - 1));
+  }
+
+  writer->Write(1, 0);  // No lz77 for main bitstream.
+  // Context map that maps all non-0 contexts to a single context (per channel)
+  // and all the coefficient contexts to a single context (also per channel).
+  constexpr uint8_t kContextMapEncoding[] = {
+      0x06, 0x48, 0xa1, 0x97, 0x46, 0xdc, 0xd8, 0x2e, 0x9a, 0x52, 0x96,
+      0x27, 0xf3, 0xa9, 0xa5, 0xd5, 0x96, 0xd6, 0x3a, 0x5a, 0x0c,
+  };
+  constexpr size_t kContextMapEncodingBitLength = 165;
+  for (size_t i = 0; i < kContextMapEncodingBitLength; i += 8) {
+    size_t nb = std::min(kContextMapEncodingBitLength, i + 8) - i;
+    writer->Write(nb, kContextMapEncoding[i / 8] & ((1 << nb) - 1));
+  }
+
+  writer->Write(1, 1);  // use prefix codes
+  for (size_t i = 0; i < 6; i++) {
+    writer->Write(4, 0);  // 000 hybrid uint config for symbols
+  }
+
+  // Symbol alphabet size
+  for (size_t i = 0; i < 6; i++) {
+    writer->Write(1, 1);  // > 1
+    writer->Write(4, 3);  // <= 16
+    writer->Write(3, 7);  // == 16
+  }
+
+  // Symbol histograms
+  for (size_t i = 0; i < 3; i++) {
+    prefix_codes.nnz_codes[is_delta ? 1 : 0][i].WriteTo(writer);
+  }
+  for (size_t i = 0; i < 3; i++) {
+    prefix_codes.ac_codes[is_delta ? 1 : 0][i].WriteTo(writer);
+  }
 }
 
 template <bool is_delta>
@@ -561,7 +628,8 @@ struct FastMJXLEncoder {
 
     StoreDCGlobal(group_data.data(), is_delta, prefix_codes);
     size_t acg_off = 2 + num_dc_groups_x * num_dc_groups_y;
-    StoreACGlobal(group_data.data() + acg_off - 1, prefix_codes);
+    StoreACGlobal(group_data.data() + acg_off - 1, num_groups_x * num_groups_y,
+                  is_delta, prefix_codes);
 
     // TODO(veluca): parallelize both of those loops.
     for (size_t i = 0; i < num_groups_x * num_groups_y; i++) {
