@@ -149,16 +149,14 @@ struct PrefixCode {
   }
 
   // Create the prefix codes given the code lengths.
-  static void ComputeCanonicalCode(const uint8_t* first_chunk_nbits,
-                                   uint8_t* first_chunk_bits,
-                                   size_t first_chunk_size) {
+  static void ComputeCanonicalCode(const uint8_t* nbits, uint8_t* bits,
+                                   size_t size) {
     constexpr size_t kMaxCodeLength = 15;
     uint8_t code_length_counts[kMaxCodeLength + 1] = {};
-    for (size_t i = 0; i < first_chunk_size; i++) {
-      code_length_counts[first_chunk_nbits[i]]++;
-      assert(first_chunk_nbits[i] <= kMaxCodeLength);
-      assert(first_chunk_nbits[i] <= 8);
-      assert(first_chunk_nbits[i] > 0);
+    for (size_t i = 0; i < size; i++) {
+      code_length_counts[nbits[i]]++;
+      assert(nbits[i] <= kMaxCodeLength);
+      assert(nbits[i] <= 8);
     }
 
     uint16_t next_code[kMaxCodeLength + 1] = {};
@@ -169,9 +167,8 @@ struct PrefixCode {
       next_code[i] = code;
     }
 
-    for (size_t i = 0; i < first_chunk_size; i++) {
-      first_chunk_bits[i] =
-          BitReverse(first_chunk_nbits[i], next_code[first_chunk_nbits[i]]++);
+    for (size_t i = 0; i < size; i++) {
+      bits[i] = BitReverse(nbits[i], next_code[nbits[i]]++);
     }
   }
 
@@ -251,10 +248,11 @@ struct PrefixCode {
   static void ComputeCodeLengths(const uint64_t* freqs, size_t n,
                                  const uint8_t* min_limit_in,
                                  const uint8_t* max_limit_in, uint8_t* nbits) {
-    assert(n <= kNumSymbols);
-    uint64_t compact_freqs[kNumSymbols];
-    uint8_t min_limit[kNumSymbols];
-    uint8_t max_limit[kNumSymbols];
+    constexpr size_t kMaxSymbolCount = 18;
+    assert(n <= kMaxSymbolCount);
+    uint64_t compact_freqs[kMaxSymbolCount];
+    uint8_t min_limit[kMaxSymbolCount];
+    uint8_t max_limit[kMaxSymbolCount];
     size_t ni = 0;
     for (size_t i = 0; i < n; i++) {
       if (freqs[i]) {
@@ -264,7 +262,7 @@ struct PrefixCode {
         ni++;
       }
     }
-    uint8_t num_bits[kNumSymbols] = {};
+    uint8_t num_bits[kMaxSymbolCount] = {};
     ComputeCodeLengthsNonZero(compact_freqs, ni, min_limit, max_limit,
                               num_bits);
     ni = 0;
@@ -339,8 +337,87 @@ struct PrefixCodeData {
   PrefixCode ac_codes[2][3];
 };
 
-void StoreDCGlobal(BitWriter* writer) {
-  //
+void StoreDCGlobal(BitWriter* writer, bool is_delta,
+                   const PrefixCodeData& prefix_codes) {
+  // Default DC quant weights. TODO(veluca): this is probably not a good idea.
+  writer->Write(1, 1);
+
+  // Quantizer.
+  writer->Write(2, 0b10);   // 4097 +
+  writer->Write(12, 2047);  // 2047, total of 6144 (~d1) for global scale
+  writer->Write(2, 0b00);   // 16 as global scale
+
+  // Non-default block context map (for a smaller / simpler context map later),
+  // which puts all transforms of each channel together.
+  writer->Write(1, 0);
+  writer->Write(16, 0);  // No DC or QF thresholds
+  writer->Write(1, 1);   // Simple ctx map.
+  writer->Write(2, 2);   // 2 bits per entry
+  for (size_t c = 0; c < 3; c++) {
+    for (size_t i = 0; i < 13; i++) {  // # of orders
+      writer->Write(2, c);
+    }
+  }
+
+  // Non-default noop CfL.
+  writer->Write(1, 0);
+  writer->Write(2, 0b00);  // Default color factor
+  writer->Write(16, 0);    // 0 (as f16) base correlation x.
+  writer->Write(16, 0);    // 0 (as f16) base correlation b.
+  writer->Write(8, 128);   // 0 ytox_dc
+  writer->Write(8, 128);   // 0 ytob_dc
+
+  // Modular tree
+  // TODO(veluca): remove data for channel 4.
+  writer->Write(1, 1);         // use global tree
+  writer->Write(1, 0);         // no lz77 for context map
+  writer->Write(1, 1);         // simple code for the tree's context map
+  writer->Write(2, 0);         // all contexts clustered together
+  writer->Write(1, 1);         // use prefix code for tree
+  writer->Write(4, 0);         // 000 hybrid uint
+  writer->Write(6, 0b100011);  // Alphabet size is 4 (var16)
+  writer->Write(2, 1);         // simple prefix code
+  writer->Write(2, 3);         // with 4 symbols
+  writer->Write(2, 0);
+  writer->Write(2, 1);
+  writer->Write(2, 2);
+  writer->Write(2, 3);
+  writer->Write(1, 0);  // First tree encoding option
+  // Huffman table + extra bits for the tree.
+  uint8_t symbol_bits[6] = {0b00, 0b10, 0b001, 0b101, 0b0011, 0b0111};
+  uint8_t symbol_nbits[6] = {2, 2, 3, 3, 4, 4};
+  // Write a tree with a leaf per channel, and gradient predictor for every
+  // leaf.
+  for (auto v : {1, 2, 1, 4, 1, 0, 0, 5, 0, 0, 0, 0, 5,
+                 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0}) {
+    writer->Write(symbol_nbits[v], symbol_bits[v]);
+  }
+
+  writer->Write(1, 0);  // no lz77 for the DC bitstream
+
+  writer->Write(1, 1);  // simple code for the context map
+  writer->Write(2, 2);  // 3 bits per entry
+  writer->Write(2, 2);  // channel 3 (TODO(veluca): remove)
+  writer->Write(2, 2);  // channel 2
+  writer->Write(2, 1);  // channel 1
+  writer->Write(2, 0);  // channel 0
+
+  writer->Write(1, 1);  // use prefix codes
+  for (size_t i = 0; i < 3; i++) {
+    writer->Write(4, 0);  // 000 hybrid uint config for symbols
+  }
+
+  // Symbol alphabet size
+  for (size_t i = 0; i < 3; i++) {
+    writer->Write(1, 1);  // > 1
+    writer->Write(4, 3);  // <= 16
+    writer->Write(3, 7);  // == 16
+  }
+
+  // Symbol histogram
+  for (size_t i = 0; i < 3; i++) {
+    prefix_codes.dc_codes[is_delta ? 1 : 0][i].WriteTo(writer);
+  }
 }
 
 void StoreACGlobal(BitWriter* writer, const PrefixCodeData& prefix_codes) {
@@ -359,7 +436,7 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
 void StoreDCGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   size_t w, size_t x0, size_t xs, size_t y0, size_t ys,
                   uint16_t* dc_y, uint16_t* dc_cb, uint16_t* dc_cr) {
-  // inc. modular tree.
+  //
 }
 
 }  // namespace
@@ -396,8 +473,8 @@ struct FastMJXLEncoder {
     encoded.Allocate(w * h * 32 + 1024);
 
     // TODO(veluca): more sensible prefix codes.
-    uint64_t counts[16] = {3843, 852, 1270, 1214, 1014, 727, 481, 300,
-                           159,  51,  5,    1,    1,    1,   1,   1};
+    uint64_t counts[16] = {3843, 1400, 1270, 1214, 1014, 727, 481, 300,
+                           159,  51,   5,    1,    1,    1,   1,   1};
     for (size_t j = 0; j < 2; j++) {
       for (size_t i = 0; i < 3; i++) {
         prefix_codes.ac_codes[j][i] = PrefixCode(counts);
@@ -420,7 +497,7 @@ struct FastMJXLEncoder {
 
     bool is_delta = frame_count % 8 != 0;
 
-    StoreDCGlobal(group_data.data());
+    StoreDCGlobal(group_data.data(), is_delta, prefix_codes);
     size_t acg_off = 2 + num_dc_groups_x * num_dc_groups_y;
     StoreACGlobal(group_data.data() + acg_off - 1, prefix_codes);
 
@@ -454,6 +531,10 @@ struct FastMJXLEncoder {
       size_t ys = std::min(h / 8, y0 + 256) - y0;
       StoreDCGroup(group_data.data() + acg_off + i, prefix_codes, w, x0, xs, y0,
                    ys, dc_y.get(), dc_cb.get(), dc_cr.get());
+    }
+
+    for (size_t i = 0; i < group_data.size(); i++) {
+      group_data[i].ZeroPadToByte();
     }
 
     // Handcrafted frame header.
