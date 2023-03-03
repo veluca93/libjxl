@@ -121,16 +121,28 @@ void AddImageHeader(BitWriter* output, size_t w, size_t h) {
   wsz(w);
 
   // Hand-crafted ImageMetadata.
-  output->Write(1, 0);     // all_default
-  output->Write(1, 0);     // extra_fields
-  output->Write(1, 0);     // bit_depth.floating_point_sample
-  output->Write(2, 0b01);  // bit_depth.bits_per_sample = 10
-  output->Write(1, 1);     // 16-bit-buffer sufficient
-  output->Write(2, 0b00);  // No extra channel
-  output->Write(1, 0);     // Not XYB
-  output->Write(1, 1);     // color_encoding.all_default (sRGB)
-  output->Write(2, 0b00);  // No extensions.
-  output->Write(1, 1);     // all_default transform data
+  output->Write(1, 0);  // all_default
+  output->Write(1, 1);  // extra_fields
+  output->Write(3, 0);  // orientation
+  output->Write(1, 0);  // no intrinsic size
+  output->Write(1, 0);  // no preview
+  output->Write(1, 1);  // animation
+  // TODO(veluca): allow picking FPS?
+  output->Write(2, 0b10);   // 30 tps numerator (sel)
+  output->Write(10, 29);    // 30 tps numerator
+  output->Write(2, 0b00);   // 1 tps denominator
+  output->Write(2, 0b01);   // 1 loop (sel)
+  output->Write(3, 0b001);  // 1 loop
+  output->Write(1, 0);      // no timecodes
+  output->Write(1, 0);      // bit_depth.floating_point_sample
+  output->Write(2, 0b01);   // bit_depth.bits_per_sample = 10
+  output->Write(1, 1);      // 16-bit-buffer sufficient
+  output->Write(2, 0b00);   // No extra channel
+  output->Write(1, 0);      // Not XYB
+  output->Write(1, 1);      // color_encoding.all_default (sRGB)
+  output->Write(1, 1);      // tone_mapping.all_default
+  output->Write(2, 0b00);   // No extensions.
+  output->Write(1, 1);      // all_default transform data
   // No ICC, no preview. Frame should start at byte boundery.
   output->ZeroPadToByte();
 }
@@ -697,6 +709,7 @@ struct FastMJXLEncoder {
     } else {
       encoded.Write(2, 0b00);  // kReplace blending mode
     }
+    encoded.Write(2, 0b01);     // 1 tick frame
     encoded.Write(1, is_last);  // is_last
     if (!is_last) {
       encoded.Write(2, 0b01);  // Save as frame 1.
