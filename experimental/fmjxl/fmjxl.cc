@@ -355,13 +355,18 @@ struct PrefixCodeData {
 
 void StoreDCGlobal(BitWriter* writer, bool is_delta,
                    const PrefixCodeData& prefix_codes) {
-  // Default DC quant weights. TODO(veluca): this is probably not a good idea.
-  writer->Write(1, 1);
+  // DC quant weights.
+  writer->Write(1, 0);
+  writer->Write(16, 0x3C00);  // 1 as f16
+  writer->Write(16, 0x3800);  // 0.5 as f16
+  writer->Write(16, 0x3C00);  // 1 as f16
 
   // Quantizer.
   writer->Write(2, 0b10);   // 4097 +
   writer->Write(12, 2047);  // 2047, total of 6144 (~d1) for global scale
   writer->Write(2, 0b00);   // 16 as global scale
+
+  // Resulting DC steps: 0.002604, 0.005208, 0.005208
 
   // Non-default block context map (for a smaller / simpler context map later),
   // which puts all transforms of each channel together.
@@ -445,9 +450,27 @@ constexpr uint32_t kStandardCoeffOrder[] = {
 
 void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
                    const PrefixCodeData& prefix_codes) {
-  // All default quantization tables (TODO(veluca): this is probably not a good
-  // idea).
-  writer->Write(1, 1);
+  // Quant tables.
+  writer->Write(1, 0);
+  // Non-default DCT8 table.
+  writer->Write(3, 6);
+  writer->Write(4, 1);  // 2 distance bands.
+
+  // TODO(veluca): probably need to be scaled.
+  // 0.5 -> 1/16 for cb
+  writer->Write(16, 0x3800);
+  writer->Write(16, 0xC700);
+  // 1 -> 0.5 for Y
+  writer->Write(16, 0x3C00);
+  writer->Write(16, 0xBC00);
+  // 0.5 -> 1/16 for cr
+  writer->Write(16, 0x3800);
+  writer->Write(16, 0xC700);
+
+  // Default for all the other tables.
+  for (size_t i = 0; i < 16; i++) {
+    writer->Write(3, 0);
+  }
 
   size_t num_histo_bits = CeilLog2(num_groups);
   writer->Write(num_histo_bits, 0);  // Only one set of histograms.
@@ -507,15 +530,51 @@ void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
   }
 }
 
+// TODO(veluca): adjust.
+constexpr static uint16_t kQuantMatrix[3][64] = {
+    {
+        0x3000, 0x009c, 0x007e, 0x0066, 0x0053, 0x0043, 0x0036, 0x002c,  //
+        0x009c, 0x008f, 0x0078, 0x0063, 0x0051, 0x0042, 0x0036, 0x002b,  //
+        0x007e, 0x0078, 0x006a, 0x005a, 0x004b, 0x003e, 0x0033, 0x002a,  //
+        0x0066, 0x0063, 0x005a, 0x004f, 0x0043, 0x0038, 0x002f, 0x0027,  //
+        0x0053, 0x0051, 0x004b, 0x0043, 0x003b, 0x0032, 0x002a, 0x0023,  //
+        0x0043, 0x0042, 0x003e, 0x0038, 0x0032, 0x002b, 0x0025, 0x0020,  //
+        0x0036, 0x0036, 0x0033, 0x002f, 0x002a, 0x0025, 0x0020, 0x001c,  //
+        0x002c, 0x002b, 0x002a, 0x0027, 0x0023, 0x0020, 0x001c, 0x0018,  //
+    },
+    {
+
+        0x6000, 0x0166, 0x014e, 0x0137, 0x0122, 0x010f, 0x00fc, 0x00eb,  //
+        0x0166, 0x015c, 0x0148, 0x0134, 0x0120, 0x010d, 0x00fb, 0x00ea,  //
+        0x014e, 0x0148, 0x013b, 0x012a, 0x0119, 0x0107, 0x00f7, 0x00e7,  //
+        0x0137, 0x0134, 0x012a, 0x011d, 0x010f, 0x00ff, 0x00f0, 0x00e1,  //
+        0x0122, 0x0120, 0x0119, 0x010f, 0x0102, 0x00f5, 0x00e8, 0x00da,  //
+        0x010f, 0x010d, 0x0107, 0x00ff, 0x00f5, 0x00ea, 0x00de, 0x00d2,  //
+        0x00fc, 0x00fb, 0x00f7, 0x00f0, 0x00e8, 0x00de, 0x00d4, 0x00c9,  //
+        0x00eb, 0x00ea, 0x00e7, 0x00e1, 0x00da, 0x00d2, 0x00c9, 0x00c0,  //
+    },
+    {
+
+        0x3000, 0x009c, 0x007e, 0x0066, 0x0053, 0x0043, 0x0036, 0x002c,  //
+        0x009c, 0x008f, 0x0078, 0x0063, 0x0051, 0x0042, 0x0036, 0x002b,  //
+        0x007e, 0x0078, 0x006a, 0x005a, 0x004b, 0x003e, 0x0033, 0x002a,  //
+        0x0066, 0x0063, 0x005a, 0x004f, 0x0043, 0x0038, 0x002f, 0x0027,  //
+        0x0053, 0x0051, 0x004b, 0x0043, 0x003b, 0x0032, 0x002a, 0x0023,  //
+        0x0043, 0x0042, 0x003e, 0x0038, 0x0032, 0x002b, 0x0025, 0x0020,  //
+        0x0036, 0x0036, 0x0033, 0x002f, 0x002a, 0x0025, 0x0020, 0x001c,  //
+        0x002c, 0x002b, 0x002a, 0x0027, 0x0023, 0x0020, 0x001c, 0x0018,  //
+    }};
+
 template <bool is_delta>
 void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   size_t w, const uint8_t* y_plane, const uint8_t* uv_plane,
-                  size_t x0, size_t xs, size_t y0, size_t ys, uint16_t* dc_y,
-                  uint16_t* prev_ydct, uint16_t* dc_cb, uint16_t* prev_cbdct,
-                  uint16_t* dc_cr, uint16_t* prev_crdct) {
+                  size_t x0, size_t xs, size_t y0, size_t ys, int16_t* dc_y,
+                  int16_t* prev_ydct, int16_t* dc_cb, int16_t* prev_cbdct,
+                  int16_t* dc_cr, int16_t* prev_crdct) {
   const PrefixCode* nnz_codes = &prefix_codes.nnz_codes[is_delta ? 0 : 1][0];
   const PrefixCode* ac_codes = &prefix_codes.ac_codes[is_delta ? 0 : 1][0];
   (void)ac_codes;
+  (void)kQuantMatrix;
   for (size_t iy = 0; iy < ys; iy += 8) {
     for (size_t ix = 0; ix < xs; ix += 8) {
       for (size_t c : {1, 0, 2}) {
@@ -526,10 +585,22 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
   }
 }
 
+constexpr uint32_t PackSigned(int32_t value) {
+  return (static_cast<uint32_t>(value) << 1) ^
+         ((static_cast<uint32_t>(~value) >> 31) - 1);
+}
+void EncodeHybridUint000(uint32_t value, uint32_t* token, uint32_t* nbits,
+                         uint32_t* bits) {
+  uint32_t n = FloorLog2(value);
+  *token = value ? n + 1 : 0;
+  *nbits = value ? n : 0;
+  *bits = value ? value - (1 << n) : 0;
+}
+
 void StoreDCGroup(BitWriter* writer, bool is_delta,
                   const PrefixCodeData& prefix_codes, size_t w, size_t x0,
-                  size_t xs, size_t y0, size_t ys, const uint16_t* dc_y,
-                  const uint16_t* dc_cb, const uint16_t* dc_cr) {
+                  size_t xs, size_t y0, size_t ys, const int16_t* dc_y,
+                  const int16_t* dc_cb, const int16_t* dc_cr) {
   // No extra DC precision.
   writer->Write(2, 0);
 
@@ -544,7 +615,7 @@ void StoreDCGroup(BitWriter* writer, bool is_delta,
   const PrefixCode* codes = &prefix_codes.dc_codes[is_delta ? 0 : 1][0];
 
   for (size_t c = 0; c < 3; c++) {
-    const uint16_t* dc = c == 0 ? dc_y : c == 1 ? dc_cb : dc_cr;
+    const int16_t* dc = c == 0 ? dc_y : c == 1 ? dc_cb : dc_cr;
     (void)dc;
     size_t cw = c == 0 ? w : w / 2;
     size_t ch = c == 0 ? w : w / 2;
@@ -556,9 +627,14 @@ void StoreDCGroup(BitWriter* writer, bool is_delta,
     (void)cy0;
     (void)cw;
     (void)ch;
+
     for (size_t y = 0; y < cys; y++) {
       for (size_t x = 0; x < cxs; x++) {
-        writer->Write(codes[c].nbits[0], codes[c].bits[0]);
+        int val = c == 0 && x == 0 && y == 0 && is_delta ? -192 : 0;
+        uint32_t token, nbits, bits;
+        EncodeHybridUint000(PackSigned(val), &token, &nbits, &bits);
+        writer->Write(codes[c].nbits[token], codes[c].bits[token]);
+        writer->Write(nbits, bits);
       }
     }
   }
@@ -597,15 +673,15 @@ struct FastMJXLEncoder {
     assert(w > 256 || h > 256);
     assert(w % 16 == 0);
     assert(h % 16 == 0);
-    prev_ydct.reset(static_cast<uint16_t*>(malloc(w * h * sizeof(uint16_t))));
+    prev_ydct.reset(static_cast<int16_t*>(malloc(w * h * sizeof(int16_t))));
     prev_cbdct.reset(
-        static_cast<uint16_t*>(malloc(w * h * sizeof(uint16_t) / 4)));
+        static_cast<int16_t*>(malloc(w * h * sizeof(int16_t) / 4)));
     prev_crdct.reset(
-        static_cast<uint16_t*>(malloc(w * h * sizeof(uint16_t) / 4)));
+        static_cast<int16_t*>(malloc(w * h * sizeof(int16_t) / 4)));
 
-    dc_y.reset(static_cast<uint16_t*>(malloc(w * h * sizeof(uint16_t) / 64)));
-    dc_cb.reset(static_cast<uint16_t*>(malloc(w * h * sizeof(uint16_t) / 256)));
-    dc_cr.reset(static_cast<uint16_t*>(malloc(w * h * sizeof(uint16_t) / 256)));
+    dc_y.reset(static_cast<int16_t*>(malloc(w * h * sizeof(int16_t) / 64)));
+    dc_cb.reset(static_cast<int16_t*>(malloc(w * h * sizeof(int16_t) / 256)));
+    dc_cr.reset(static_cast<int16_t*>(malloc(w * h * sizeof(int16_t) / 256)));
 
     num_groups_x = (w + 255) / 256;
     num_groups_y = (h + 255) / 256;
@@ -760,13 +836,13 @@ struct FastMJXLEncoder {
   BitWriter encoded;
   size_t encoded_size = 0;
   size_t frame_count = 0;
-  DataBuf<uint16_t> prev_ydct = {nullptr, free};
-  DataBuf<uint16_t> prev_cbdct = {nullptr, free};
-  DataBuf<uint16_t> prev_crdct = {nullptr, free};
+  DataBuf<int16_t> prev_ydct = {nullptr, free};
+  DataBuf<int16_t> prev_cbdct = {nullptr, free};
+  DataBuf<int16_t> prev_crdct = {nullptr, free};
 
-  DataBuf<uint16_t> dc_y = {nullptr, free};
-  DataBuf<uint16_t> dc_cb = {nullptr, free};
-  DataBuf<uint16_t> dc_cr = {nullptr, free};
+  DataBuf<int16_t> dc_y = {nullptr, free};
+  DataBuf<int16_t> dc_cb = {nullptr, free};
+  DataBuf<int16_t> dc_cr = {nullptr, free};
 
   PrefixCodeData prefix_codes;
 
