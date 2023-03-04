@@ -445,11 +445,11 @@ void StoreDCGlobal(BitWriter* writer, bool is_delta,
   }
 }
 
-constexpr uint32_t kStandardCoeffOrder[] = {
-    0,  1,  8,  16, 9,  2,  3,  10, 17, 24, 32, 25, 18, 11, 4,  5,
-    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,  7,  14, 21, 28,
-    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
-    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+constexpr uint32_t kCoeffOrder[] = {
+    0,  1,  2,  3,  8,  9,  10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
+    4,  5,  6,  7,  12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
+    32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59,
+    36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63,
 };
 
 void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
@@ -462,13 +462,13 @@ void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
 
   // TODO(veluca): probably need to be scaled.
   // 0.5 -> 1/16 for cb
-  writer->Write(16, 0x3800);
+  writer->Write(16, 0x5000);
   writer->Write(16, 0xC700);
   // 1 -> 0.5 for Y
-  writer->Write(16, 0x3C00);
+  writer->Write(16, 0x5400);
   writer->Write(16, 0xBC00);
   // 0.5 -> 1/16 for cr
-  writer->Write(16, 0x3800);
+  writer->Write(16, 0x5000);
   writer->Write(16, 0xC700);
 
   // Default for all the other tables.
@@ -484,7 +484,6 @@ void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
   writer->Write(2, 0b11);  // arbitrary mask selector
   writer->Write(13, 0b0000000000001);
 
-  (void)kStandardCoeffOrder;
   constexpr uint8_t kCoeffOrderEncoding[] = {
       0xa6, 0x03, 0x4c, 0xb4, 0x08, 0x11, 0x3a, 0xc6, 0x4a, 0x6f, 0x40, 0x8c,
       0x35, 0x8c, 0x18, 0x8d, 0x06, 0xda, 0x14, 0x04, 0x00, 0xe8, 0xe4, 0x3e,
@@ -679,36 +678,34 @@ FJXL_INLINE void transpose8(int16x8_t data[8]) {
 // TODO(veluca): adjust.
 constexpr static int16_t kQuantMatrix[3][64] = {
     {
-        0x3000, 0x009c, 0x007e, 0x0066, 0x0053, 0x0043, 0x0036, 0x002c,  //
-        0x009c, 0x008f, 0x0078, 0x0063, 0x0051, 0x0042, 0x0036, 0x002b,  //
-        0x007e, 0x0078, 0x006a, 0x005a, 0x004b, 0x003e, 0x0033, 0x002a,  //
-        0x0066, 0x0063, 0x005a, 0x004f, 0x0043, 0x0038, 0x002f, 0x0027,  //
-        0x0053, 0x0051, 0x004b, 0x0043, 0x003b, 0x0032, 0x002a, 0x0023,  //
-        0x0043, 0x0042, 0x003e, 0x0038, 0x0032, 0x002b, 0x0025, 0x0020,  //
-        0x0036, 0x0036, 0x0033, 0x002f, 0x002a, 0x0025, 0x0020, 0x001c,  //
-        0x002c, 0x002b, 0x002a, 0x0027, 0x0023, 0x0020, 0x001c, 0x0018,  //
+        0x3000, 0x26e8, 0x1f89, 0x198f, 0x14b8, 0x10cb, 0x0d9c, 0x0b08,  //
+        0x26e8, 0x23aa, 0x1e02, 0x18b4, 0x1430, 0x1072, 0x0d60, 0x0ade,  //
+        0x1f89, 0x1e02, 0x1a80, 0x1682, 0x12c3, 0x0f7d, 0x0cb7, 0x0a67,  //
+        0x198f, 0x18b4, 0x1682, 0x13b0, 0x10cb, 0x0e1a, 0x0bbb, 0x09b2,  //
+        0x14b8, 0x1430, 0x12c3, 0x10cb, 0x0ea1, 0x0c81, 0x0a8e, 0x08d3,  //
+        0x10cb, 0x1072, 0x0f7d, 0x0e1a, 0x0c81, 0x0ade, 0x094e, 0x07e1,  //
+        0x0d9c, 0x0d60, 0x0cb7, 0x0bbb, 0x0a8e, 0x094e, 0x0813, 0x06ec,  //
+        0x0b08, 0x0ade, 0x0a67, 0x09b2, 0x08d3, 0x07e1, 0x06ec, 0x0600,  //
     },
     {
-
-        0x6000, 0x0166, 0x014e, 0x0137, 0x0122, 0x010f, 0x00fc, 0x00eb,  //
-        0x0166, 0x015c, 0x0148, 0x0134, 0x0120, 0x010d, 0x00fb, 0x00ea,  //
-        0x014e, 0x0148, 0x013b, 0x012a, 0x0119, 0x0107, 0x00f7, 0x00e7,  //
-        0x0137, 0x0134, 0x012a, 0x011d, 0x010f, 0x00ff, 0x00f0, 0x00e1,  //
-        0x0122, 0x0120, 0x0119, 0x010f, 0x0102, 0x00f5, 0x00e8, 0x00da,  //
-        0x010f, 0x010d, 0x0107, 0x00ff, 0x00f5, 0x00ea, 0x00de, 0x00d2,  //
-        0x00fc, 0x00fb, 0x00f7, 0x00f0, 0x00e8, 0x00de, 0x00d4, 0x00c9,  //
-        0x00eb, 0x00ea, 0x00e7, 0x00e1, 0x00da, 0x00d2, 0x00c9, 0x00c0,  //
+        0x6000, 0x5982, 0x5375, 0x4dd0, 0x488d, 0x43a5, 0x3f12, 0x3ace,  //
+        0x5982, 0x56f3, 0x5216, 0x4cef, 0x47ed, 0x432d, 0x3eb4, 0x3a83,  //
+        0x5375, 0x5216, 0x4ec1, 0x4a95, 0x4631, 0x41d8, 0x3da7, 0x39aa,  //
+        0x4dd0, 0x4cef, 0x4a95, 0x4754, 0x43a5, 0x3fd2, 0x3c05, 0x3853,  //
+        0x488d, 0x47ed, 0x4631, 0x43a5, 0x409a, 0x3d50, 0x39f1, 0x3697,  //
+        0x43a5, 0x432d, 0x41d8, 0x3fd2, 0x3d50, 0x3a83, 0x3790, 0x3490,  //
+        0x3f12, 0x3eb4, 0x3da7, 0x3c05, 0x39f1, 0x3790, 0x34ff, 0x3257,  //
+        0x3ace, 0x3a83, 0x39aa, 0x3853, 0x3697, 0x3490, 0x3257, 0x3000,  //
     },
     {
-
-        0x3000, 0x009c, 0x007e, 0x0066, 0x0053, 0x0043, 0x0036, 0x002c,  //
-        0x009c, 0x008f, 0x0078, 0x0063, 0x0051, 0x0042, 0x0036, 0x002b,  //
-        0x007e, 0x0078, 0x006a, 0x005a, 0x004b, 0x003e, 0x0033, 0x002a,  //
-        0x0066, 0x0063, 0x005a, 0x004f, 0x0043, 0x0038, 0x002f, 0x0027,  //
-        0x0053, 0x0051, 0x004b, 0x0043, 0x003b, 0x0032, 0x002a, 0x0023,  //
-        0x0043, 0x0042, 0x003e, 0x0038, 0x0032, 0x002b, 0x0025, 0x0020,  //
-        0x0036, 0x0036, 0x0033, 0x002f, 0x002a, 0x0025, 0x0020, 0x001c,  //
-        0x002c, 0x002b, 0x002a, 0x0027, 0x0023, 0x0020, 0x001c, 0x0018,  //
+        0x3000, 0x26e8, 0x1f89, 0x198f, 0x14b8, 0x10cb, 0x0d9c, 0x0b08,  //
+        0x26e8, 0x23aa, 0x1e02, 0x18b4, 0x1430, 0x1072, 0x0d60, 0x0ade,  //
+        0x1f89, 0x1e02, 0x1a80, 0x1682, 0x12c3, 0x0f7d, 0x0cb7, 0x0a67,  //
+        0x198f, 0x18b4, 0x1682, 0x13b0, 0x10cb, 0x0e1a, 0x0bbb, 0x09b2,  //
+        0x14b8, 0x1430, 0x12c3, 0x10cb, 0x0ea1, 0x0c81, 0x0a8e, 0x08d3,  //
+        0x10cb, 0x1072, 0x0f7d, 0x0e1a, 0x0c81, 0x0ade, 0x094e, 0x07e1,  //
+        0x0d9c, 0x0d60, 0x0cb7, 0x0bbb, 0x0a8e, 0x094e, 0x0813, 0x06ec,  //
+        0x0b08, 0x0ade, 0x0a67, 0x09b2, 0x08d3, 0x07e1, 0x06ec, 0x0600,  //
     }};
 
 constexpr size_t kInputShift = 2;
@@ -731,6 +728,25 @@ void quantize(int16x8_t data[8], int c) {
   }
 }
 
+constexpr uint32_t PackSigned(int32_t value) {
+  return (static_cast<uint32_t>(value) << 1) ^
+         ((static_cast<uint32_t>(~value) >> 31) - 1);
+}
+void EncodeHybridUint000(uint32_t value, uint32_t* token, uint32_t* nbits,
+                         uint32_t* bits) {
+  uint32_t n = FloorLog2(value);
+  *token = value ? n + 1 : 0;
+  *nbits = value ? n : 0;
+  *bits = value ? value - (1 << n) : 0;
+}
+
+void EncodeU32(uint32_t value, const PrefixCode& code, BitWriter* writer) {
+  uint32_t token, nbits, bits;
+  EncodeHybridUint000(value, &token, &nbits, &bits);
+  writer->Write(code.nbits[token], code.bits[token]);
+  writer->Write(nbits, bits);
+}
+
 template <bool is_delta>
 void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   size_t w, const uint8_t* y_plane, const uint8_t* uv_plane,
@@ -739,7 +755,6 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   int16_t* dc_cr, int16_t* prev_crdct) {
   const PrefixCode* nnz_codes = &prefix_codes.nnz_codes[is_delta ? 0 : 1][0];
   const PrefixCode* ac_codes = &prefix_codes.ac_codes[is_delta ? 0 : 1][0];
-  (void)ac_codes;
 
   auto process_block = [](int16x8_t data[8], int16_t* ptr) {
     scale_inputs(data);
@@ -763,7 +778,24 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
   auto quantize_and_store = [&](int16x8_t data[8], int16_t* dc_ptr, size_t c) {
     quantize(data, c);
     *dc_ptr = data[0][0];
-    writer->Write(nnz_codes[c].nbits[0], nnz_codes[c].bits[0]);
+
+    int16_t buf[64];
+    size_t nnz = 0;
+    for (size_t i = 0; i < 8; i++) {
+      vst1q_s16(buf + i * 8, data[i]);
+    }
+    for (size_t i = 1; i < 64; i++) {
+      nnz += buf[i] != 0;
+    }
+
+    EncodeU32(nnz, nnz_codes[c], writer);
+
+    for (size_t i = 1; i < 64 && nnz > 0; i++) {
+      size_t pos = kCoeffOrder[i];
+      int16_t coeff = buf[pos];
+      nnz -= (coeff != 0);
+      EncodeU32(PackSigned(coeff), ac_codes[c], writer);
+    }
   };
 
   for (size_t iy = 0; iy < ys; iy += 8) {
@@ -804,18 +836,6 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
       }
     }
   }
-}
-
-constexpr uint32_t PackSigned(int32_t value) {
-  return (static_cast<uint32_t>(value) << 1) ^
-         ((static_cast<uint32_t>(~value) >> 31) - 1);
-}
-void EncodeHybridUint000(uint32_t value, uint32_t* token, uint32_t* nbits,
-                         uint32_t* bits) {
-  uint32_t n = FloorLog2(value);
-  *token = value ? n + 1 : 0;
-  *nbits = value ? n : 0;
-  *bits = value ? value - (1 << n) : 0;
 }
 
 void StoreDCGroup(BitWriter* writer, bool is_delta,
@@ -861,10 +881,7 @@ void StoreDCGroup(BitWriter* writer, bool is_delta,
         int16_t s = ac ^ bc;
         int16_t pred = s < 0 ? grad : clamp;
 
-        uint32_t token, nbits, bits;
-        EncodeHybridUint000(PackSigned(px - pred), &token, &nbits, &bits);
-        writer->Write(codes[c].nbits[token], codes[c].bits[token]);
-        writer->Write(nbits, bits);
+        EncodeU32(PackSigned(px - pred), codes[c], writer);
       }
     }
   }
