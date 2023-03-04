@@ -9,6 +9,8 @@
 #include <hwy/aligned_allocator.h>
 #include <vector>
 
+#include "coeff_order_fwd.h"
+#include "enc_bit_writer.h"
 #include "lib/jxl/ans_params.h"
 #include "lib/jxl/base/padded_bytes.h"
 #include "lib/jxl/base/profiler.h"

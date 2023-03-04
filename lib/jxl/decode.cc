@@ -1023,6 +1023,7 @@ JxlDecoderStatus JxlDecoderReadBasicInfo(JxlDecoder* dec) {
   dec->basic_info_size_hint = 0;
   dec->image_metadata = dec->metadata.m;
   JXL_DEBUG_V(2, "Decoded BasicInfo: %s", dec->metadata.DebugString().c_str());
+  fprintf(stderr, "IMETA: %zu\n", total_bits);
 
   if (!CheckSizeLimit(dec, dec->metadata.size.xsize(),
                       dec->metadata.size.ysize())) {

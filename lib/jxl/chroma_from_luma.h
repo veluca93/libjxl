@@ -66,11 +66,14 @@ struct ColorCorrelationMap {
   }
 
   Status DecodeDC(BitReader* br) {
+    fprintf(stderr, "CfL\n");
     if (br->ReadFixedBits<1>() == 1) {
+      fprintf(stderr, "AD\n");
       // All default.
       return true;
     }
     SetColorFactor(U32Coder::Read(kColorFactorDist, br));
+    fprintf(stderr, "%d\n", color_factor_);
     JXL_RETURN_IF_ERROR(F16Coder::Read(br, &base_correlation_x_));
     if (std::abs(base_correlation_x_) > 4.0f) {
       return JXL_FAILURE("Base X correlation is out of range");
@@ -79,10 +82,12 @@ struct ColorCorrelationMap {
     if (std::abs(base_correlation_b_) > 4.0f) {
       return JXL_FAILURE("Base B correlation is out of range");
     }
+    fprintf(stderr, "%f %f\n", base_correlation_x_, base_correlation_b_);
     ytox_dc_ = static_cast<int>(br->ReadFixedBits<kBitsPerByte>()) +
                std::numeric_limits<int8_t>::min();
     ytob_dc_ = static_cast<int>(br->ReadFixedBits<kBitsPerByte>()) +
                std::numeric_limits<int8_t>::min();
+    fprintf(stderr, "%d %d\n", ytox_dc_, ytob_dc_);
     RecomputeDCFactors();
     return true;
   }

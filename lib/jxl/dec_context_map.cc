@@ -61,6 +61,7 @@ Status VerifyContextMap(const std::vector<uint8_t>& context_map,
 Status DecodeContextMap(std::vector<uint8_t>* context_map, size_t* num_htrees,
                         BitReader* input) {
   bool is_simple = input->ReadFixedBits<1>();
+  fprintf(stderr, "simplectx: %d\n", is_simple);
   if (is_simple) {
     int bits_per_entry = input->ReadFixedBits<2>();
     if (bits_per_entry != 0) {

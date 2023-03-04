@@ -1,7 +1,9 @@
 #include "fmjxl.h"
 
+#include <arm_neon.h>
 #include <assert.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -348,7 +350,9 @@ struct PrefixCode {
 };
 
 struct PrefixCodeData {
+  // Y, Cb, Cr
   PrefixCode dc_codes[2][3];
+  // Cb, Y, Cr
   PrefixCode nnz_codes[2][3];
   PrefixCode ac_codes[2][3];
 };
@@ -530,8 +534,150 @@ void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
   }
 }
 
+FJXL_INLINE void idct8(int16x8_t data[8]) {
+  constexpr float kMatrix[8][8] = {
+      {0.125, 0.17337998066526844, 0.16332037060954707, 0.14698445030241986,
+       0.12500000000000003, 0.0982118697983878, 0.06764951251827464,
+       0.03448742241036789},
+      {0.125, 0.14698445030241986, 0.06764951251827464, -0.03448742241036787,
+       -0.125, -0.17337998066526844, -0.1633203706095471, -0.09821186979838777},
+      {0.125, 0.0982118697983878, -0.06764951251827463, -0.17337998066526844,
+       -0.12500000000000003, 0.03448742241036788, 0.16332037060954704,
+       0.14698445030241988},
+      {0.125, 0.03448742241036789, -0.16332037060954707, -0.09821186979838777,
+       0.12499999999999997, 0.14698445030241988, -0.06764951251827465,
+       -0.17337998066526847},
+      {0.125, -0.03448742241036787, -0.1633203706095471, 0.09821186979838771,
+       0.12500000000000003, -0.14698445030241983, -0.06764951251827477,
+       0.17337998066526844},
+      {0.125, -0.09821186979838774, -0.06764951251827472, 0.17337998066526844,
+       -0.12499999999999986, -0.034487422410367834, 0.16332037060954707,
+       -0.1469844503024198},
+      {0.125, -0.14698445030241986, 0.06764951251827467, 0.034487422410367966,
+       -0.12499999999999994, 0.17337998066526847, -0.16332037060954702,
+       0.09821186979838765},
+      {0.125, -0.17337998066526844, 0.16332037060954704, -0.14698445030241983,
+       0.12499999999999985, -0.09821186979838765, 0.06764951251827458,
+       -0.03448742241036793}};
+  float idct[8][8] = {};
+  for (size_t i = 0; i < 8; i++) {
+    for (size_t j = 0; j < 8; j++) {
+      for (size_t k = 0; k < 8; k++) {
+        idct[j][i] += kMatrix[j][k] * data[k][i];
+      }
+    }
+  }
+  for (size_t i = 0; i < 8; i++) {
+    for (size_t j = 0; j < 8; j++) {
+      data[i][j] = std::round(idct[i][j] * 8);
+    }
+  }
+}
+
+// TODO(veluca): validate ranges.
+FJXL_INLINE void dct8(int16x8_t data[8]) {
+  // TODO(veluca): optimize.
+  int16x8_t v0 = data[0];
+  int16x8_t v1 = data[7];
+  int16x8_t v2 = vhaddq_s16(v0, v1);
+  int16x8_t v3 = data[3];
+  int16x8_t v4 = data[4];
+  int16x8_t v5 = vhaddq_s16(v3, v4);
+  int16x8_t v6 = vhaddq_s16(v2, v5);
+  int16x8_t v7 = data[1];
+  int16x8_t v8 = data[6];
+  int16x8_t v9 = vhaddq_s16(v7, v8);
+  int16x8_t v10 = data[2];
+  int16x8_t v11 = data[5];
+  int16x8_t v12 = vhaddq_s16(v10, v11);
+  int16x8_t v13 = vhaddq_s16(v9, v12);
+  int16x8_t v14 = vhaddq_s16(v6, v13);
+  int16x8_t v15 = vhsubq_s16(v0, v1);
+  int16x8_t v16 = vqrdmulhq_n_s16(v15, 16705);
+  int16x8_t v17 = vhsubq_s16(v3, v4);
+  int16x8_t v18_tmp = vqrdmulhq_n_s16(v17, 18446);
+  int16x8_t v18 = vmlaq_n_s16(v18_tmp, v17, 2);
+  int16x8_t v19 = vhaddq_s16(v16, v18);
+  int16x8_t v20 = vhsubq_s16(v7, v8);
+  int16x8_t v21 = vqrdmulhq_n_s16(v20, 19705);
+  int16x8_t v22 = vhsubq_s16(v10, v11);
+  int16x8_t v23 = vqrdmulhq_n_s16(v22, 29490);
+  int16x8_t v24 = vhaddq_s16(v21, v23);
+  int16x8_t v25 = vhaddq_s16(v19, v24);
+  int16x8_t v26_tmp = vqrdmulhq_n_s16(v25, 13573);
+  int16x8_t v26 = vaddq_s16(v26_tmp, v25);
+  int16x8_t v27 = vhsubq_s16(v16, v18);
+  int16x8_t v28 = vqrdmulhq_n_s16(v27, 17734);
+  int16x8_t v29 = vhsubq_s16(v21, v23);
+  int16x8_t v30_tmp = vqrdmulhq_n_s16(v29, 10045);
+  int16x8_t v30 = vaddq_s16(v30_tmp, v29);
+  int16x8_t v31 = vhaddq_s16(v28, v30);
+  int16x8_t v32_tmp = vqrdmulhq_n_s16(v31, 13573);
+  int16x8_t v32 = vaddq_s16(v32_tmp, v31);
+  int16x8_t v33 = vhsubq_s16(v28, v30);
+  int16x8_t v34 = vaddq_s16(v32, v33);
+  int16x8_t v35 = vaddq_s16(v26, v34);
+  int16x8_t v36 = vhsubq_s16(v2, v5);
+  int16x8_t v37 = vqrdmulhq_n_s16(v36, 17734);
+  int16x8_t v38 = vhsubq_s16(v9, v12);
+  int16x8_t v39_tmp = vqrdmulhq_n_s16(v38, 10045);
+  int16x8_t v39 = vaddq_s16(v39_tmp, v38);
+  int16x8_t v40 = vhaddq_s16(v37, v39);
+  int16x8_t v41_tmp = vqrdmulhq_n_s16(v40, 13573);
+  int16x8_t v41 = vaddq_s16(v41_tmp, v40);
+  int16x8_t v42 = vhsubq_s16(v37, v39);
+  int16x8_t v43 = vaddq_s16(v41, v42);
+  int16x8_t v44 = vhsubq_s16(v19, v24);
+  int16x8_t v45 = vaddq_s16(v34, v44);
+  int16x8_t v46 = vhsubq_s16(v6, v13);
+  int16x8_t v47 = vaddq_s16(v44, v33);
+  data[0] = v14;
+  data[1] = v35;
+  data[2] = v43;
+  data[3] = v45;
+  data[4] = v46;
+  data[5] = v47;
+  data[6] = v42;
+  data[7] = v33;
+}
+
+FJXL_INLINE void transpose8(int16x8_t data[8]) {
+  auto t0 = vtrn1q_s16(data[0], data[1]);
+  auto t1 = vtrn2q_s16(data[0], data[1]);
+  auto t2 = vtrn1q_s16(data[2], data[3]);
+  auto t3 = vtrn2q_s16(data[2], data[3]);
+  auto t4 = vtrn1q_s16(data[4], data[5]);
+  auto t5 = vtrn2q_s16(data[4], data[5]);
+  auto t6 = vtrn1q_s16(data[6], data[7]);
+  auto t7 = vtrn2q_s16(data[6], data[7]);
+  auto u0 = vtrn1q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2));
+  auto u1 = vtrn2q_s32(vreinterpretq_s32_s16(t0), vreinterpretq_s32_s16(t2));
+  auto u2 = vtrn1q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3));
+  auto u3 = vtrn2q_s32(vreinterpretq_s32_s16(t1), vreinterpretq_s32_s16(t3));
+  auto u4 = vtrn1q_s32(vreinterpretq_s32_s16(t4), vreinterpretq_s32_s16(t6));
+  auto u5 = vtrn2q_s32(vreinterpretq_s32_s16(t4), vreinterpretq_s32_s16(t6));
+  auto u6 = vtrn1q_s32(vreinterpretq_s32_s16(t5), vreinterpretq_s32_s16(t7));
+  auto u7 = vtrn2q_s32(vreinterpretq_s32_s16(t5), vreinterpretq_s32_s16(t7));
+  auto v0 = vtrn1q_s64(vreinterpretq_s64_s32(u0), vreinterpretq_s64_s32(u4));
+  auto v1 = vtrn2q_s64(vreinterpretq_s64_s32(u0), vreinterpretq_s64_s32(u4));
+  auto v2 = vtrn1q_s64(vreinterpretq_s64_s32(u1), vreinterpretq_s64_s32(u5));
+  auto v3 = vtrn2q_s64(vreinterpretq_s64_s32(u1), vreinterpretq_s64_s32(u5));
+  auto v4 = vtrn1q_s64(vreinterpretq_s64_s32(u2), vreinterpretq_s64_s32(u6));
+  auto v5 = vtrn2q_s64(vreinterpretq_s64_s32(u2), vreinterpretq_s64_s32(u6));
+  auto v6 = vtrn1q_s64(vreinterpretq_s64_s32(u3), vreinterpretq_s64_s32(u7));
+  auto v7 = vtrn2q_s64(vreinterpretq_s64_s32(u3), vreinterpretq_s64_s32(u7));
+  data[0] = vreinterpretq_s16_s64(v0);
+  data[1] = vreinterpretq_s16_s64(v4);
+  data[2] = vreinterpretq_s16_s64(v2);
+  data[3] = vreinterpretq_s16_s64(v6);
+  data[4] = vreinterpretq_s16_s64(v1);
+  data[5] = vreinterpretq_s16_s64(v5);
+  data[6] = vreinterpretq_s16_s64(v3);
+  data[7] = vreinterpretq_s16_s64(v7);
+}
+
 // TODO(veluca): adjust.
-constexpr static uint16_t kQuantMatrix[3][64] = {
+constexpr static int16_t kQuantMatrix[3][64] = {
     {
         0x3000, 0x009c, 0x007e, 0x0066, 0x0053, 0x0043, 0x0036, 0x002c,  //
         0x009c, 0x008f, 0x0078, 0x0063, 0x0051, 0x0042, 0x0036, 0x002b,  //
@@ -565,6 +711,26 @@ constexpr static uint16_t kQuantMatrix[3][64] = {
         0x002c, 0x002b, 0x002a, 0x0027, 0x0023, 0x0020, 0x001c, 0x0018,  //
     }};
 
+constexpr size_t kInputShift = 2;
+constexpr size_t kQuantizeShift = 7 - kInputShift;
+constexpr size_t kChannelCenterOffset = (1 << (16 - kInputShift)) * 128 / 255;
+
+FJXL_INLINE void scale_inputs(int16x8_t data[8]) {
+  for (size_t i = 0; i < 8; i++) {
+    int16x8_t v = data[i];
+    v = vreinterpretq_s16_u16(
+        vrshrq_n_u16(vreinterpretq_u16_s16(v), kInputShift));
+    data[i] = vrsraq_n_s16(v, v, 6);
+  }
+}
+
+void quantize(int16x8_t data[8], int c) {
+  for (size_t i = 0; i < 8; i++) {
+    int16x8_t q = vld1q_s16(&kQuantMatrix[c][i * 8]);
+    data[i] = vrshrq_n_s16(vqrdmulhq_s16(q, data[i]), kQuantizeShift);
+  }
+}
+
 template <bool is_delta>
 void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   size_t w, const uint8_t* y_plane, const uint8_t* uv_plane,
@@ -574,12 +740,67 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
   const PrefixCode* nnz_codes = &prefix_codes.nnz_codes[is_delta ? 0 : 1][0];
   const PrefixCode* ac_codes = &prefix_codes.ac_codes[is_delta ? 0 : 1][0];
   (void)ac_codes;
-  (void)kQuantMatrix;
+
+  auto process_block = [](int16x8_t data[8], int16_t* ptr) {
+    scale_inputs(data);
+    dct8(data);
+    transpose8(data);
+    dct8(data);
+    for (size_t i = 0; i < 8; i++) {
+      if (is_delta) {
+        int16x8_t prev = vld1q_s16(ptr + i * 8);
+        vst1q_s16(ptr + i * 8, data[i]);
+        data[i] = vsubq_s16(data[i], prev);
+      } else {
+        vst1q_s16(ptr + i * 8, data[i]);
+      }
+    }
+    if (!is_delta) {
+      data[0][0] -= kChannelCenterOffset;
+    }
+  };
+
+  auto quantize_and_store = [&](int16x8_t data[8], int16_t* dc_ptr, size_t c) {
+    quantize(data, c);
+    *dc_ptr = data[0][0];
+    writer->Write(nnz_codes[c].nbits[0], nnz_codes[c].bits[0]);
+  };
+
   for (size_t iy = 0; iy < ys; iy += 8) {
     for (size_t ix = 0; ix < xs; ix += 8) {
-      for (size_t c : {1, 0, 2}) {
-        if (c != 1 && (ix % 16 != 0 || iy % 16 != 0)) continue;
-        writer->Write(nnz_codes[c].nbits[0], nnz_codes[c].bits[0]);
+      size_t bx = (ix + x0) / 8;
+      size_t by = (iy + y0) / 8;
+      size_t block_idx = by * w / 8 + bx;
+      const int16_t* y_ptr =
+          reinterpret_cast<const int16_t*>(y_plane) + (y0 + iy) * w + x0 + ix;
+      int16x8_t y_data[8];
+      for (size_t i = 0; i < 8; i++) {
+        y_data[i] = vld1q_s16(y_ptr + w * i);
+      }
+
+      int16_t* yblock_ptr = prev_ydct + block_idx * 64;
+      process_block(y_data, yblock_ptr);
+
+      // Adjust Y channel.
+      yblock_ptr[0] += kChannelCenterOffset;
+
+      quantize_and_store(y_data, dc_y + block_idx, 1);
+
+      if (ix % 16 == 0 && iy % 16 == 0) {
+        size_t cblock_idx = by / 2 * w / 16 + bx / 2;
+        const int16_t* chroma_ptr = reinterpret_cast<const int16_t*>(uv_plane) +
+                                    ((y0 + iy) / 2) * w + x0 + ix;
+        int16x8_t cb_data[8];
+        int16x8_t cr_data[8];
+        for (size_t i = 0; i < 8; i++) {
+          auto v = vld2q_s16(chroma_ptr + w * i);
+          cb_data[i] = v.val[0];
+          cr_data[i] = v.val[1];
+        }
+        process_block(cb_data, prev_cbdct + cblock_idx * 64);
+        process_block(cr_data, prev_crdct + cblock_idx * 64);
+        quantize_and_store(cb_data, dc_cb + cblock_idx, 0);
+        quantize_and_store(cr_data, dc_cr + cblock_idx, 2);
       }
     }
   }
@@ -616,23 +837,32 @@ void StoreDCGroup(BitWriter* writer, bool is_delta,
 
   for (size_t c = 0; c < 3; c++) {
     const int16_t* dc = c == 0 ? dc_y : c == 1 ? dc_cb : dc_cr;
-    (void)dc;
     size_t cw = c == 0 ? w : w / 2;
-    size_t ch = c == 0 ? w : w / 2;
     size_t cx0 = c == 0 ? x0 : x0 / 2;
     size_t cy0 = c == 0 ? y0 : y0 / 2;
     size_t cxs = c == 0 ? xs : xs / 2;
     size_t cys = c == 0 ? ys : ys / 2;
-    (void)cx0;
-    (void)cy0;
-    (void)cw;
-    (void)ch;
+
+    dc = dc + cy0 * cw + cx0;
 
     for (size_t y = 0; y < cys; y++) {
       for (size_t x = 0; x < cxs; x++) {
-        int val = c == 0 && x == 0 && y == 0 && is_delta ? -192 : 0;
+        int16_t px = dc[y * cw + x];
+        int16_t left = x ? dc[y * cw + x - 1] : y ? dc[(y - 1) * cw + x] : 0;
+        int16_t top = y ? dc[(y - 1) * cw + x] : left;
+        int16_t topleft = x && y ? dc[(y - 1) * cw + x - 1] : left;
+        int16_t ac = left - topleft;
+        int16_t ab = left - top;
+        int16_t bc = top - topleft;
+        int16_t grad = static_cast<int16_t>(static_cast<uint16_t>(ac) +
+                                            static_cast<uint16_t>(top));
+        int16_t d = ab ^ bc;
+        int16_t clamp = d < 0 ? top : left;
+        int16_t s = ac ^ bc;
+        int16_t pred = s < 0 ? grad : clamp;
+
         uint32_t token, nbits, bits;
-        EncodeHybridUint000(PackSigned(val), &token, &nbits, &bits);
+        EncodeHybridUint000(PackSigned(px - pred), &token, &nbits, &bits);
         writer->Write(codes[c].nbits[token], codes[c].bits[token]);
         writer->Write(nbits, bits);
       }

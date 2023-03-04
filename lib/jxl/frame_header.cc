@@ -7,6 +7,7 @@
 
 #include <sstream>
 
+#include "frame_header.h"
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/fields.h"
@@ -453,6 +454,10 @@ std::string FrameHeader::DebugString() const {
   os << (color_transform == ColorTransform::kXYB     ? "XYB"
          : color_transform == ColorTransform::kYCbCr ? "YCbCr"
                                                      : "None");
+
+  if (color_transform == ColorTransform::kYCbCr) {
+    os << "," << chroma_subsampling.DebugString();
+  }
 
   if (encoding == FrameEncoding::kModular) {
     os << ",shift=" << group_size_shift;

@@ -122,6 +122,7 @@ Status QuantizerParams::VisitFields(Visitor* JXL_RESTRICT visitor) {
   JXL_QUIET_RETURN_IF_ERROR(visitor->U32(Val(16), BitsOffset(5, 1),
                                          BitsOffset(8, 1), BitsOffset(16, 1), 1,
                                          &quant_dc));
+  fprintf(stderr, "%u %u\n", global_scale, quant_dc);
   return true;
 }
 

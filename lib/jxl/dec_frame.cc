@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <hwy/aligned_allocator.h>
 #include <numeric>
 #include <utility>
@@ -60,11 +61,17 @@ Status DecodeGlobalDCInfo(BitReader* reader, bool is_jpeg,
                           PassesDecoderState* state, ThreadPool* pool) {
   PROFILER_FUNC;
   JXL_RETURN_IF_ERROR(state->shared_storage.quantizer.Decode(reader));
-
+  for (size_t c = 0; c < 3; c++) {
+    fprintf(stderr, "%f\n", state->shared_storage.quantizer.MulDC()[c]);
+  }
   JXL_RETURN_IF_ERROR(
       DecodeBlockCtxMap(reader, &state->shared_storage.block_ctx_map));
 
   JXL_RETURN_IF_ERROR(state->shared_storage.cmap.DecodeDC(reader));
+
+  fprintf(stderr, "cmap: %f %f %f\n", state->shared_storage.cmap.DCFactors()[0],
+          state->shared_storage.cmap.DCFactors()[1],
+          state->shared_storage.cmap.DCFactors()[2]);
 
   // Pre-compute info for decoding a group.
   if (is_jpeg) {
@@ -138,6 +145,8 @@ Status FrameDecoder::InitFrame(BitReader* JXL_RESTRICT br, ImageBundle* decoded,
   JXL_RETURN_IF_ERROR(ReadFrameHeader(br, &frame_header_));
   frame_dim_ = frame_header_.ToFrameDimensions();
   JXL_DEBUG_V(2, "FrameHeader: %s", frame_header_.DebugString().c_str());
+  fprintf(stderr, "FH: %zu %s\n", br->TotalBitsConsumed(),
+          frame_header_.DebugString().c_str());
 
   const size_t num_passes = frame_header_.passes.num_passes;
   const size_t num_groups = frame_dim_.num_groups;
@@ -348,17 +357,47 @@ Status FrameDecoder::AllocateOutput() {
 Status FrameDecoder::ProcessACGlobal(BitReader* br) {
   JXL_CHECK(finalized_dc_);
 
+  fprintf(stderr, "AC GLOBAL START [%zu]\n", br->TotalBitsConsumed());
+
   // Decode AC group.
   if (frame_header_.encoding == FrameEncoding::kVarDCT) {
     JXL_RETURN_IF_ERROR(dec_state_->shared_storage.matrices.Decode(
         br, &modular_frame_decoder_));
     JXL_RETURN_IF_ERROR(dec_state_->shared_storage.matrices.EnsureComputed(
         dec_state_->used_acs));
+    for (size_t c = 0; c < 3; c++) {
+      for (size_t i = 0; i < 64; i++) {
+        fprintf(stderr, "%f ",
+                dec_state_->shared->quantizer.DequantMatrix(0, c)[i] *
+                    dec_state_->shared->quantizer.InvGlobalScale());
+        if (i % 8 == 7) fprintf(stderr, "\n");
+      }
+      fprintf(stderr, "\n");
+    }
+
+    for (size_t c = 0; c < 3; c++) {
+      fprintf(stderr, "{\n");
+      for (size_t i = 0; i < 64; i++) {
+        float val =
+            1.0 / (dec_state_->shared->quantizer.DequantMatrix(0, c)[i] *
+                   dec_state_->shared->quantizer.InvGlobalScale());
+        if (i == 0) {
+          val = 1.0 / dec_state_->shared_storage.quantizer.MulDC()[c];
+        }
+        fprintf(stderr, "0x%04x, ", (uint16_t)std::round(val * (1 << 6)));
+        if (i % 8 == 7) fprintf(stderr, "//\n");
+      }
+      fprintf(stderr, "}, \n");
+    }
+
+    fprintf(stderr, "at line %d: %zu\n", __LINE__, br->TotalBitsConsumed());
 
     size_t num_histo_bits =
         CeilLog2Nonzero(dec_state_->shared->frame_dim.num_groups);
     dec_state_->shared_storage.num_histograms =
         1 + br->ReadBits(num_histo_bits);
+
+    fprintf(stderr, "at line %d: %zu\n", __LINE__, br->TotalBitsConsumed());
 
     dec_state_->code.resize(kMaxNumPasses);
     dec_state_->context_map.resize(kMaxNumPasses);
@@ -366,18 +405,31 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
     size_t max_num_bits_ac = 0;
     for (size_t i = 0;
          i < dec_state_->shared_storage.frame_header.passes.num_passes; i++) {
+      fprintf(stderr, "at line %d: %zu\n", __LINE__, br->TotalBitsConsumed());
       uint16_t used_orders = U32Coder::Read(kOrderEnc, br);
+      fprintf(stderr, "coeff orders: %x\n", used_orders);
       JXL_RETURN_IF_ERROR(DecodeCoeffOrders(
           used_orders, dec_state_->used_acs,
           &dec_state_->shared_storage
                .coeff_orders[i * dec_state_->shared_storage.coeff_order_size],
           br));
+      for (size_t j = 0; j < 64 * 3; j++) {
+        fprintf(
+            stderr, "%d ",
+            dec_state_->shared_storage
+                .coeff_orders[i * dec_state_->shared_storage.coeff_order_size +
+                              j]);
+        if (j % 64 == 63) fprintf(stderr, "\n");
+      }
+      fprintf(stderr, "\n");
       size_t num_contexts =
           dec_state_->shared->num_histograms *
           dec_state_->shared_storage.block_ctx_map.NumACContexts();
+      fprintf(stderr, "# of contexts: %zu\n", num_contexts);
       JXL_RETURN_IF_ERROR(DecodeHistograms(
           br, num_contexts, &dec_state_->code[i], &dec_state_->context_map[i]));
-      // Add extra values to enable the cheat in hot loop of DecodeACVarBlock.
+      // Add extra values to enable the cheat in hot loop of
+      // DecodeACVarBlock.
       dec_state_->context_map[i].resize(
           num_contexts + kZeroDensityContextLimit - kZeroDensityContextCount);
       max_num_bits_ac =
@@ -506,8 +558,8 @@ Status FrameDecoder::ProcessACGroup(size_t ac_group_id,
     PROFILER_ZONE("GenerateNoise");
     size_t noise_c_start =
         3 + frame_header_.nonserialized_metadata->m.num_extra_channels;
-    // When the color channels are downsampled, we need to generate more noise
-    // input for the current group than just the group dimensions.
+    // When the color channels are downsampled, we need to generate more
+    // noise input for the current group than just the group dimensions.
     std::pair<ImageF*, Rect> rects[3];
     for (size_t iy = 0; iy < frame_header_.upsampling; iy++) {
       for (size_t ix = 0; ix < frame_header_.upsampling; ix++) {

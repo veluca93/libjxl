@@ -7,6 +7,7 @@
 
 #include <string.h> /* for memset */
 
+#include <cstddef>
 #include <vector>
 
 #include "lib/jxl/ans_params.h"
@@ -88,6 +89,10 @@ int ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
     return 0;
   }
   memset(&code_lengths[symbol], 0, (size_t)(num_symbols - symbol));
+  for (size_t i = 0; i < (size_t)num_symbols; i++) {
+    fprintf(stderr, "%d ", code_lengths[i]);
+  }
+  fprintf(stderr, "\n");
   return true;
 }
 
@@ -97,15 +102,18 @@ static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
       (alphabet_size > 1u) ? FloorLog2Nonzero(alphabet_size - 1u) + 1 : 0;
 
   size_t num_symbols = br->ReadFixedBits<2>() + 1;
+  fprintf(stderr, "SIMPLE with %zu\n", num_symbols);
 
   uint16_t symbols[4] = {0};
   for (size_t i = 0; i < num_symbols; ++i) {
     uint16_t symbol = br->ReadBits(max_bits);
+    fprintf(stderr, "%d ", symbol);
     if (symbol >= alphabet_size) {
       return false;
     }
     symbols[i] = symbol;
   }
+  fprintf(stderr, "\n");
 
   for (size_t i = 0; i < num_symbols - 1; ++i) {
     for (size_t j = i + 1; j < num_symbols; ++j) {
@@ -205,6 +213,7 @@ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
       {2, 0}, {2, 4}, {2, 3}, {3, 2}, {2, 0}, {2, 4}, {2, 3}, {4, 1},
       {2, 0}, {2, 4}, {2, 3}, {3, 2}, {2, 0}, {2, 4}, {2, 3}, {4, 5},
   };
+  fprintf(stderr, "Code lengths: ");
   for (size_t i = simple_code_or_skip; i < kCodeLengthCodes && space > 0; ++i) {
     const int code_len_idx = kCodeLengthCodeOrder[i];
     const HuffmanCode* p = huff;
@@ -214,11 +223,13 @@ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
     br->Consume(p->bits);
     v = (uint8_t)p->value;
     code_length_code_lengths[code_len_idx] = v;
+    fprintf(stderr, "%d ", v);
     if (v != 0) {
       space -= (32u >> v);
       ++num_codes;
     }
   }
+  fprintf(stderr, "\n");
   bool ok = (num_codes == 1 || space == 0) &&
             ReadHuffmanCodeLengths(code_length_code_lengths, alphabet_size,
                                    &code_lengths[0], br);

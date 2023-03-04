@@ -9,6 +9,7 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -52,6 +53,8 @@ Status DecodeBlockCtxMap(BitReader* br, BlockCtxMap* block_ctx_map) {
     i = U32Coder::Read(kQFThresholdDist, br) + 1;
   }
 
+  fprintf(stderr, "thres: %zu %zu\n", block_ctx_map->num_dc_ctxs, qft.size());
+
   if (block_ctx_map->num_dc_ctxs * (qft.size() + 1) > 64) {
     return JXL_FAILURE("Invalid block context map: too big");
   }
@@ -62,6 +65,10 @@ Status DecodeBlockCtxMap(BitReader* br, BlockCtxMap* block_ctx_map) {
   if (block_ctx_map->num_ctxs > 16) {
     return JXL_FAILURE("Invalid block context map: too many distinct contexts");
   }
+  for (auto v : ctx_map) {
+    fprintf(stderr, "%u ", v);
+  }
+  fprintf(stderr, "\n");
   return true;
 }
 

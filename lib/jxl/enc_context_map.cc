@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "enc_context_map.h"
 #include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/enc_ans.h"
@@ -139,3 +140,51 @@ void EncodeBlockCtxMap(const BlockCtxMap& block_ctx_map, BitWriter* writer,
 }
 
 }  // namespace jxl
+
+/*
+__attribute__((constructor)) void f() {
+  jxl::BlockCtxMap ctxm;
+  for (size_t c = 0; c < 3; c++) {
+    for (size_t i = 0; i < 13; i++) {
+      ctxm.ctx_map[c * 13 + i] = c;
+    }
+  }
+  ctxm.num_ctxs = 3;
+
+  std::vector<uint8_t> ctxmap(ctxm.NumACContexts());
+
+  for (size_t c = 0; c < 3; c++) {
+    size_t block_ctx = ctxm.Context(0, 0, 0, c);
+    for (size_t i = 0; i < 65; i++) {
+      ctxmap[ctxm.NonZeroContext(i, block_ctx)] = c;
+    }
+  }
+  for (size_t c = 0; c < 3; c++) {
+    size_t block_ctx = ctxm.Context(0, 0, 0, c);
+    const size_t histo_offset = ctxm.ZeroDensityContextsOffset(block_ctx);
+    for (size_t prev = 0; prev < 2; prev++) {
+      for (size_t i = 0; i < 63; i++) {
+        for (size_t j = 0; j < 63; j++) {
+          ctxmap[histo_offset + jxl::ZeroDensityContext(j, i, 1, 0, prev)] =
+              c + 3;
+        }
+      }
+    }
+  }
+  fprintf(stderr, "SZ: %zu\n", ctxmap.size());
+  for (size_t i = 0; i < ctxmap.size(); i++) {
+    fprintf(stderr, "%d ", ctxmap[i]);
+  }
+  fprintf(stderr, "\n");
+
+  jxl::BitWriter writer;
+  jxl::BitWriter::Allotment allotment(&writer, 100000);  // safe upper bound
+  jxl::EncodeContextMap(ctxmap, ctxm.NumACContexts(), &writer, 0, nullptr);
+  fprintf(stderr, "%zu\n", writer.BitsWritten());
+  writer.ZeroPadToByte();
+  for (size_t i = 0; i < (writer.BitsWritten() + 7) / 8; i++) {
+    fprintf(stderr, "0x%02x, ", writer.GetSpan().data()[i]);
+  }
+  fprintf(stderr, "\n");
+  exit(1);
+}*/

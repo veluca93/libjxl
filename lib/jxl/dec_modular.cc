@@ -188,6 +188,7 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
   do_color = decode_color;
   size_t nb_extra = metadata.extra_channel_info.size();
   bool has_tree = reader->ReadBits(1);
+  fprintf(stderr, "has_tree: %d\n", has_tree);
   if (!allow_truncated_group ||
       reader->TotalBitsConsumed() < reader->TotalBytes() * kBitsPerByte) {
     if (has_tree) {
@@ -196,6 +197,7 @@ Status ModularFrameDecoder::DecodeGlobalInfo(BitReader* reader,
                    1024 + frame_dim.xsize * frame_dim.ysize *
                               (nb_chans + nb_extra) / 16);
       JXL_RETURN_IF_ERROR(DecodeTree(reader, &tree, tree_size_limit));
+      fprintf(stderr, "tree: %zu\n", tree.size());
       JXL_RETURN_IF_ERROR(
           DecodeHistograms(reader, (tree.size() + 1) / 2, &code, &context_map));
     }
@@ -412,6 +414,7 @@ Status ModularFrameDecoder::DecodeVarDCTDC(size_t group_id, BitReader* reader,
           /*undo_transforms=*/true, &tree, &code, &context_map)) {
     return JXL_FAILURE("Failed to decode modular DC group");
   }
+  fprintf(stderr, "DC done: %zu\n", reader->TotalBitsConsumed());
   DequantDC(r, &dec_state->shared_storage.dc_storage,
             &dec_state->shared_storage.quant_dc, image,
             dec_state->shared->quantizer.MulDC(), mul,

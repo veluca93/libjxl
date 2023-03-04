@@ -453,8 +453,13 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
                      bool allow_truncated_group) {
   if (image.channel.empty()) return true;
 
+  fprintf(stderr, "MG HEADER (%zu %zu)\n", br->TotalBitsConsumed(),
+          br->TotalBytes() * 8);
   // decode transforms
   Status status = Bundle::Read(br, &header);
+  fprintf(stderr, "gt: %d wpd: %d nt: %zu [s: %d]\n", header.use_global_tree,
+          header.wp_header.all_default, header.transforms.size(),
+          status.code());
   if (!allow_truncated_group) JXL_RETURN_IF_ERROR(status);
   if (status.IsFatalError()) return status;
   if (!br->AllReadsWithinBounds()) {
@@ -484,6 +489,7 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
   size_t distance_multiplier = 0;
   for (size_t i = 0; i < nb_channels; i++) {
     Channel &channel = image.channel[i];
+    fprintf(stderr, "ch %zu: %zu %zu\n", i, channel.w, channel.h);
     if (!channel.w || !channel.h) {
       continue;  // skip empty channels
     }
@@ -534,6 +540,8 @@ Status ModularDecode(BitReader *br, Image &image, GroupHeader &header,
     }
     max_tree_size = std::min(static_cast<size_t>(1 << 20), max_tree_size);
     JXL_RETURN_IF_ERROR(DecodeTree(br, &tree_storage, max_tree_size));
+    fprintf(stderr, "local tree size: %zu [%zu]\n", tree_storage.size(),
+            br->TotalBitsConsumed());
     JXL_RETURN_IF_ERROR(DecodeHistograms(br, (tree_storage.size() + 1) / 2,
                                          &code_storage, &context_map_storage));
   } else {

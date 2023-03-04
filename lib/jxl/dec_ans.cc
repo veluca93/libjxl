@@ -197,6 +197,7 @@ Status DecodeANSCodes(const size_t num_histograms,
       if (alphabet_sizes[c] > max_alphabet_size) {
         return JXL_FAILURE("Alphabet size is too long: %u", alphabet_sizes[c]);
       }
+      fprintf(stderr, "alpha size %zu: %u\n", c, alphabet_sizes[c]);
     }
     for (size_t c = 0; c < num_histograms; c++) {
       if (alphabet_sizes[c] > 1) {
@@ -262,11 +263,13 @@ Status DecodeUintConfig(size_t log_alpha_size, HybridUintConfig* uint_config,
                         BitReader* br) {
   br->Refill();
   size_t split_exponent = br->ReadBits(CeilLog2Nonzero(log_alpha_size + 1));
+  fprintf(stderr, "se: %zu\n", split_exponent);
   size_t msb_in_token = 0, lsb_in_token = 0;
   if (split_exponent != log_alpha_size) {
     // otherwise, msb/lsb don't matter.
     size_t nbits = CeilLog2Nonzero(split_exponent + 1);
     msb_in_token = br->ReadBits(nbits);
+    fprintf(stderr, "msb: %zu\n", msb_in_token);
     if (msb_in_token > split_exponent) {
       // This could be invalid here already and we need to check this before
       // we use its value to read more bits.
@@ -274,6 +277,7 @@ Status DecodeUintConfig(size_t log_alpha_size, HybridUintConfig* uint_config,
     }
     nbits = CeilLog2Nonzero(split_exponent - msb_in_token + 1);
     lsb_in_token = br->ReadBits(nbits);
+    fprintf(stderr, "lsb: %zu\n", lsb_in_token);
   }
   if (lsb_in_token + msb_in_token > split_exponent) {
     return JXL_FAILURE("Invalid HybridUintConfig");
@@ -287,6 +291,7 @@ Status DecodeUintConfigs(size_t log_alpha_size,
                          BitReader* br) {
   // TODO(veluca): RLE?
   for (size_t i = 0; i < uint_config->size(); i++) {
+    fprintf(stderr, "UINT config %zu\n", i);
     JXL_RETURN_IF_ERROR(
         DecodeUintConfig(log_alpha_size, &(*uint_config)[i], br));
   }
@@ -330,7 +335,9 @@ void ANSCode::UpdateMaxNumBits(size_t ctx, size_t symbol) {
 Status DecodeHistograms(BitReader* br, size_t num_contexts, ANSCode* code,
                         std::vector<uint8_t>* context_map, bool disallow_lz77) {
   PROFILER_FUNC;
+  fprintf(stderr, "nc: %zu\n", num_contexts);
   JXL_RETURN_IF_ERROR(Bundle::Read(br, &code->lz77));
+  fprintf(stderr, "lz77 %d\n", code->lz77.enabled);
   if (code->lz77.enabled) {
     num_contexts++;
     JXL_RETURN_IF_ERROR(DecodeUintConfig(/*log_alpha_size=*/8,
@@ -344,6 +351,11 @@ Status DecodeHistograms(BitReader* br, size_t num_contexts, ANSCode* code,
   if (num_contexts > 1) {
     JXL_RETURN_IF_ERROR(DecodeContextMap(context_map, &num_histograms, br));
   }
+  fprintf(stderr, "ctxmap: ");
+  for (size_t i = 0; i < context_map->size(); i++) {
+    fprintf(stderr, "%d ", context_map->at(i));
+  }
+  fprintf(stderr, "\n");
   code->lz77.nonserialized_distance_context = context_map->back();
   code->use_prefix_code = br->ReadFixedBits<1>();
   if (code->use_prefix_code) {
