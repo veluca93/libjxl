@@ -308,8 +308,10 @@ struct PrefixCode {
   }
 
   void WriteTo(BitWriter* writer) const {
+    size_t nsym = kNumSymbols;
+    while (nsym > 0 && nbits[nsym - 1] == 0) nsym--;
     uint64_t code_length_counts[18] = {};
-    for (size_t i = 0; i < kNumSymbols; i++) {
+    for (size_t i = 0; i < nsym; i++) {
       code_length_counts[nbits[i]]++;
     }
     uint8_t code_length_nbits[18] = {};
@@ -343,7 +345,7 @@ struct PrefixCode {
     uint8_t code_length_bits[18] = {};
     ComputeCanonicalCode(code_length_nbits, code_length_bits, 18);
     // Encode code lengths.
-    for (size_t i = 0; i < kNumSymbols; i++) {
+    for (size_t i = 0; i < nsym; i++) {
       writer->Write(code_length_nbits[nbits[i]], code_length_bits[nbits[i]]);
     }
   }
@@ -441,7 +443,7 @@ void StoreDCGlobal(BitWriter* writer, bool is_delta,
 
   // Symbol histogram
   for (size_t i = 0; i < 3; i++) {
-    prefix_codes.dc_codes[is_delta ? 1 : 0][i].WriteTo(writer);
+    prefix_codes.dc_codes[is_delta ? 0 : 1][i].WriteTo(writer);
   }
 }
 
@@ -530,10 +532,10 @@ void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
 
   // Symbol histograms
   for (size_t i = 0; i < 3; i++) {
-    prefix_codes.nnz_codes[is_delta ? 1 : 0][i].WriteTo(writer);
+    prefix_codes.nnz_codes[is_delta ? 0 : 1][i].WriteTo(writer);
   }
   for (size_t i = 0; i < 3; i++) {
-    prefix_codes.ac_codes[is_delta ? 1 : 0][i].WriteTo(writer);
+    prefix_codes.ac_codes[is_delta ? 0 : 1][i].WriteTo(writer);
   }
 }
 
@@ -744,9 +746,15 @@ void EncodeHybridUint000(uint32_t value, uint32_t* token, uint32_t* nbits,
   *bits = value ? value - (1 << n) : 0;
 }
 
-void EncodeU32(uint32_t value, const PrefixCode& code, BitWriter* writer) {
+void EncodeU32(uint32_t value, const PrefixCode& code, BitWriter* writer,
+               const char* tag, size_t c, bool is_delta) {
   uint32_t token, nbits, bits;
   EncodeHybridUint000(value, &token, &nbits, &bits);
+  static constexpr bool kPrintSymbols = false;
+  if (kPrintSymbols) {
+    static FILE* symbols = fopen("/tmp/symbols.txt", "w");
+    fprintf(symbols, "%s %zu %d %u\n", tag, c, is_delta, token);
+  }
   writer->Write(code.nbits[token], code.bits[token]);
   writer->Write(nbits, bits);
 }
@@ -777,34 +785,34 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
     }
   };
 
+  auto quantize_and_store = [&](int16x8_t data[8], int16_t* dc_ptr, size_t c) {
+    quantize(data, c);
+    *dc_ptr = data[0][0];
+
+    int16_t buf[64];
+    size_t nnz = 0;
+    for (size_t i = 0; i < 8; i++) {
+      vst1q_s16(buf + i * 8, data[i]);
+    }
+    for (size_t i = 1; i < 64; i++) {
+      nnz += buf[i] != 0;
+    }
+
+    EncodeU32(nnz, nnz_codes[c], writer, "NNZ", c, is_delta);
+
+    for (size_t i = 1; i < 64 && nnz > 0; i++) {
+      size_t pos = kCoeffOrder[i];
+      int16_t coeff = buf[pos];
+      nnz -= (coeff != 0);
+      EncodeU32(PackSigned(coeff), ac_codes[c], writer, "AC", c, is_delta);
+    }
+  };
+
   for (size_t iy = 0; iy < ys; iy += 8) {
     for (size_t ix = 0; ix < xs; ix += 8) {
       size_t bx = (ix + x0) / 8;
       size_t by = (iy + y0) / 8;
       size_t block_idx = by * w / 8 + bx;
-      auto quantize_and_store = [&](int16x8_t data[8], int16_t* dc_ptr,
-                                    size_t c) {
-        quantize(data, c);
-        *dc_ptr = data[0][0];
-
-        int16_t buf[64];
-        size_t nnz = 0;
-        for (size_t i = 0; i < 8; i++) {
-          vst1q_s16(buf + i * 8, data[i]);
-        }
-        for (size_t i = 1; i < 64; i++) {
-          nnz += buf[i] != 0;
-        }
-
-        EncodeU32(nnz, nnz_codes[c], writer);
-
-        for (size_t i = 1; i < 64 && nnz > 0; i++) {
-          size_t pos = kCoeffOrder[i];
-          int16_t coeff = buf[pos];
-          nnz -= (coeff != 0);
-          EncodeU32(PackSigned(coeff), ac_codes[c], writer);
-        }
-      };
       const int16_t* y_ptr =
           reinterpret_cast<const int16_t*>(y_plane) + (y0 + iy) * w + x0 + ix;
       int16x8_t y_data[8];
@@ -883,7 +891,7 @@ void StoreDCGroup(BitWriter* writer, bool is_delta,
         int16_t s = ac ^ bc;
         int16_t pred = s < 0 ? grad : clamp;
 
-        EncodeU32(PackSigned(px - pred), codes[c], writer);
+        EncodeU32(PackSigned(px - pred), codes[c], writer, "DC", c, is_delta);
       }
     }
   }
@@ -949,13 +957,43 @@ struct FastMJXLEncoder {
     encoded.Allocate(w * h * 32 + 1024);
 
     // TODO(veluca): more sensible prefix codes.
-    uint64_t counts[16] = {3843, 1400, 1270, 1214, 1014, 727, 481, 300,
-                           159,  51,   5,    1,    1,    1,   1,   1};
+    uint64_t nnz_counts[2][3][16] = {
+        {{177275, 12727, 5051, 763, 29, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+         {3739, 6057, 31475, 129745, 291193, 250743, 70415, 0, 0, 0, 0, 0, 0, 0,
+          0, 0},
+         {137551, 33873, 20637, 3697, 87, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {{674817, 57525, 40719, 9813, 491, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+         {6477, 1623, 16315, 157505, 840013, 1598263, 513251, 0, 0, 0, 0, 0, 0,
+          0, 0, 0},
+         {390493, 174537, 150723, 64875, 2737, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+          0}}};
+    uint64_t ac_counts[2][3][16] = {
+        {{40795, 11277, 15779, 809, 25, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+         {18534849, 4243219, 5038379, 1550255, 800155, 382091, 121945, 23077,
+          3051, 297, 1, 1, 1, 1, 1, 1},
+         {180205, 48335, 49013, 1291, 79, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}},
+        {{402585, 82053, 115183, 4409, 327, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+         {76143553, 20669389, 27737567, 9438691, 4293707, 2278787, 894093,
+          208333, 29863, 3195, 35, 1, 1, 1, 1, 1},
+         {1678387, 358637, 493099, 12599, 555, 11, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1}}};
+    uint64_t dc_counts[2][3][16] = {
+        {{109251, 92757, 154085, 155425, 85375, 56825, 59299, 47107, 18847,
+          3951, 449, 1, 1, 1, 1, 1},
+         {98691, 35591, 42591, 14305, 3961, 627, 79, 3, 1, 1, 1, 1, 1, 1, 1, 1},
+         {91527, 41027, 49029, 12497, 1597, 167, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1}},
+        {{345091, 308721, 548475, 669509, 437125, 235159, 222595, 210649,
+          120651, 30423, 4761, 293, 1, 1, 1, 1},
+         {367055, 149617, 182073, 65967, 15929, 2319, 389, 19, 1, 1, 1, 1, 1, 1,
+          1, 1},
+         {312839, 171951, 216303, 74307, 7381, 549, 37, 1, 1, 1, 1, 1, 1, 1, 1,
+          1}}};
+
     for (size_t j = 0; j < 2; j++) {
       for (size_t i = 0; i < 3; i++) {
-        prefix_codes.ac_codes[j][i] = PrefixCode(counts);
-        prefix_codes.nnz_codes[j][i] = PrefixCode(counts);
-        prefix_codes.dc_codes[j][i] = PrefixCode(counts);
+        prefix_codes.ac_codes[j][i] = PrefixCode(&ac_counts[j][i][0]);
+        prefix_codes.nnz_codes[j][i] = PrefixCode(&nnz_counts[j][i][0]);
+        prefix_codes.dc_codes[j][i] = PrefixCode(&dc_counts[j][i][0]);
       }
     }
   }
@@ -971,7 +1009,7 @@ struct FastMJXLEncoder {
       AddImageHeader(&encoded, w, h);
     }
 
-    bool is_delta = frame_count % 8 != 0;
+    bool is_delta = frame_count % 1 != 0;
 
     StoreDCGlobal(group_data.data(), is_delta, prefix_codes);
     size_t acg_off = 2 + num_dc_groups_x * num_dc_groups_y;

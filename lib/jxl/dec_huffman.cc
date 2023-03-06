@@ -39,6 +39,7 @@ int ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
   }
   if (!BuildHuffmanTable(table, 5, code_length_code_lengths, kCodeLengthCodes,
                          &counts[0])) {
+    fprintf(stderr, "BUILD FAILED\n");
     return 0;
   }
 
@@ -49,6 +50,7 @@ int ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
     p += br->PeekFixedBits<5>();
     br->Consume(p->bits);
     code_len = (uint8_t)p->value;
+    fprintf(stderr, "%d ", code_len);
     if (code_len < kCodeLengthRepeatCode) {
       repeat = 0;
       code_lengths[symbol++] = code_len;
@@ -76,6 +78,7 @@ int ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
       repeat += (int)br->ReadBits(extra_bits) + 3;
       repeat_delta = repeat - old_repeat;
       if (symbol + repeat_delta > num_symbols) {
+        fprintf(stderr, "delta error: %d %d\n", symbol, repeat_delta);
         return 0;
       }
       memset(&code_lengths[symbol], repeat_code_len, (size_t)repeat_delta);
@@ -85,14 +88,16 @@ int ReadHuffmanCodeLengths(const uint8_t* code_length_code_lengths,
       }
     }
   }
-  if (space != 0) {
-    return 0;
-  }
-  memset(&code_lengths[symbol], 0, (size_t)(num_symbols - symbol));
+  fprintf(stderr, "\n");
   for (size_t i = 0; i < (size_t)num_symbols; i++) {
     fprintf(stderr, "%d ", code_lengths[i]);
   }
   fprintf(stderr, "\n");
+  if (space != 0) {
+    fprintf(stderr, "SPACE is not 0\n");
+    return 0;
+  }
+  memset(&code_lengths[symbol], 0, (size_t)(num_symbols - symbol));
   return true;
 }
 

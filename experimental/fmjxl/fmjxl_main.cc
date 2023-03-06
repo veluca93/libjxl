@@ -79,8 +79,9 @@ int main(int argc, char** argv) {
     size_t pixels = w * h * num_reps * input_data.size();
     float mps = pixels / us;
     fprintf(stderr, "%10.3f MP/s\n", mps);
-    fprintf(stderr, "%10.3f bits/pixel\n",
-            encoded_size * 8.0 / float(w) / float(h));
+    fprintf(
+        stderr, "%10.3f bits/pixel\n",
+        encoded_size * 8.0 / (float(w) * float(h) * float(input_data.size())));
   }
 
   FILE* out = fopen(argv[1], "w");
