@@ -367,9 +367,12 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
         dec_state_->used_acs));
     for (size_t c = 0; c < 3; c++) {
       for (size_t i = 0; i < 64; i++) {
-        fprintf(stderr, "%f ",
-                dec_state_->shared->quantizer.DequantMatrix(0, c)[i] *
-                    dec_state_->shared->quantizer.InvGlobalScale());
+        float val = dec_state_->shared->quantizer.DequantMatrix(0, c)[i] *
+                    dec_state_->shared->quantizer.InvGlobalScale();
+        if (i == 0) {
+          val = dec_state_->shared_storage.quantizer.MulDC()[c];
+        }
+        fprintf(stderr, "%f ", val);
         if (i % 8 == 7) fprintf(stderr, "\n");
       }
       fprintf(stderr, "\n");
@@ -384,7 +387,7 @@ Status FrameDecoder::ProcessACGlobal(BitReader* br) {
         if (i == 0) {
           val = 1.0 / dec_state_->shared_storage.quantizer.MulDC()[c];
         }
-        fprintf(stderr, "0x%04x, ", (uint16_t)std::round(val * (1 << 6)));
+        fprintf(stderr, "0x%04x, ", (uint16_t)std::round(val * (1 << 5)));
         if (i % 8 == 7) fprintf(stderr, "//\n");
       }
       fprintf(stderr, "}, \n");
