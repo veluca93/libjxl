@@ -720,18 +720,15 @@ FJXL_INLINE void scale_inputs(int16x8_t data[8]) {
   for (size_t i = 0; i < 8; i++) {
     int16x8_t v = data[i];
     v = vreinterpretq_s16_u16(
-        vrshrq_n_u16(vreinterpretq_u16_s16(v), kInputShift));
-    data[i] = vrsraq_n_s16(v, v, 6);
+        vrshrq_n_u16(vreinterpretq_u16_s16(v), kInputShift - 1));
+    data[i] = vqrdmulhq_n_s16(v, 16399);
   }
 }
 
 void quantize(int16x8_t data[8], int c) {
   for (size_t i = 0; i < 8; i++) {
     int16x8_t q = vld1q_s16(&kQuantMatrix[c][i * 8]);
-    // Note that vshrq_n_s16 truncates towards -infinity.
-    int16x8_t shifted = vqrdmulhq_s16(q, data[i]);
-    data[i] = vqsubq_s16(vshrq_n_s16(shifted, kQuantizeShift),
-                         vshrq_n_s16(shifted, 15));
+    data[i] = vrshrq_n_s16(vqrdmulhq_s16(q, data[i]), kQuantizeShift);
   }
 }
 
@@ -768,6 +765,7 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
     dct8(data);
     transpose8(data);
     dct8(data);
+    data[0][0] -= kChannelCenterOffset;
     for (size_t i = 0; i < 8; i++) {
       if (is_delta) {
         int16x8_t prev = vld1q_s16(ptr + i * 8);
@@ -776,9 +774,6 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
       } else {
         vst1q_s16(ptr + i * 8, data[i]);
       }
-    }
-    if (!is_delta) {
-      data[0][0] -= kChannelCenterOffset;
     }
   };
 
