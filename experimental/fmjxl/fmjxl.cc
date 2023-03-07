@@ -3,6 +3,7 @@
 #include <arm_neon.h>
 #include <assert.h>
 
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -840,7 +841,7 @@ FJXL_INLINE void SIMDStoreValues(int16x8_t coeffs, uint16x8_t mask,
   writer->WriteMultiple(nbits_s, bits_s, 2);
 }
 
-template <bool is_delta>
+template <bool is_delta, bool store_for_next>
 void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   size_t w, const uint8_t* y_plane, const uint8_t* uv_plane,
                   size_t x0, size_t xs, size_t y0, size_t ys, int16_t* dc_y,
@@ -858,9 +859,11 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
     for (size_t i = 0; i < 8; i++) {
       if (is_delta) {
         int16x8_t prev = vld1q_s16(ptr + i * 8);
-        vst1q_s16(ptr + i * 8, data[i]);
+        if (store_for_next) {
+          vst1q_s16(ptr + i * 8, data[i]);
+        }
         data[i] = vsubq_s16(data[i], prev);
-      } else {
+      } else if (store_for_next) {
         vst1q_s16(ptr + i * 8, data[i]);
       }
     }
@@ -987,6 +990,24 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
         quantize_and_store(cr_data, dc_cr + cblock_idx, 2);
       }
     }
+  }
+}
+
+template <bool is_delta>
+void StoreACGroup(bool store_for_next, BitWriter* writer,
+                  const PrefixCodeData& prefix_codes, size_t w,
+                  const uint8_t* y_plane, const uint8_t* uv_plane, size_t x0,
+                  size_t xs, size_t y0, size_t ys, int16_t* dc_y,
+                  int16_t* prev_ydct, int16_t* dc_cb, int16_t* prev_cbdct,
+                  int16_t* dc_cr, int16_t* prev_crdct) {
+  if (store_for_next) {
+    StoreACGroup<is_delta, true>(writer, prefix_codes, w, y_plane, uv_plane, x0,
+                                 xs, y0, ys, dc_y, prev_ydct, dc_cb, prev_cbdct,
+                                 dc_cr, prev_crdct);
+  } else {
+    StoreACGroup<is_delta, false>(writer, prefix_codes, w, y_plane, uv_plane,
+                                  x0, xs, y0, ys, dc_y, prev_ydct, dc_cb,
+                                  prev_cbdct, dc_cr, prev_crdct);
   }
 }
 
@@ -1151,7 +1172,11 @@ struct FastMJXLEncoder {
       AddImageHeader(&encoded, w, h);
     }
 
-    bool is_delta = frame_count % 1 != 0;
+    constexpr size_t kKeyFrameGap = 1;
+
+    bool is_delta = frame_count % kKeyFrameGap != 0;
+    bool store_for_next =
+        !is_last && (frame_count % kKeyFrameGap != kKeyFrameGap - 1);
 
     StoreDCGlobal(group_data.data(), is_delta, prefix_codes);
     size_t acg_off = 2 + num_dc_groups_x * num_dc_groups_y;
@@ -1167,15 +1192,15 @@ struct FastMJXLEncoder {
       size_t xs = std::min(w, x0 + 256) - x0;
       size_t ys = std::min(h, y0 + 256) - y0;
       if (is_delta) {
-        StoreACGroup<true>(group_data.data() + acg_off + i, prefix_codes, w,
-                           y_plane, uv_plane, x0, xs, y0, ys, dc_y.get(),
-                           prev_ydct.get(), dc_cb.get(), prev_cbdct.get(),
-                           dc_cr.get(), prev_crdct.get());
+        StoreACGroup<true>(store_for_next, group_data.data() + acg_off + i,
+                           prefix_codes, w, y_plane, uv_plane, x0, xs, y0, ys,
+                           dc_y.get(), prev_ydct.get(), dc_cb.get(),
+                           prev_cbdct.get(), dc_cr.get(), prev_crdct.get());
       } else {
-        StoreACGroup<false>(group_data.data() + acg_off + i, prefix_codes, w,
-                            y_plane, uv_plane, x0, xs, y0, ys, dc_y.get(),
-                            prev_ydct.get(), dc_cb.get(), prev_cbdct.get(),
-                            dc_cr.get(), prev_crdct.get());
+        StoreACGroup<false>(store_for_next, group_data.data() + acg_off + i,
+                            prefix_codes, w, y_plane, uv_plane, x0, xs, y0, ys,
+                            dc_y.get(), prev_ydct.get(), dc_cb.get(),
+                            prev_cbdct.get(), dc_cr.get(), prev_crdct.get());
       }
     }
 
@@ -1188,10 +1213,6 @@ struct FastMJXLEncoder {
       size_t ys = std::min(h / 8, y0 + 256) - y0;
       StoreDCGroup(group_data.data() + 1 + i, is_delta, prefix_codes, w, x0, xs,
                    y0, ys, dc_y.get(), dc_cb.get(), dc_cr.get());
-    }
-
-    for (size_t i = 0; i < group_data.size(); i++) {
-      group_data[i].ZeroPadToByte();
     }
 
     // Handcrafted frame header.
@@ -1233,9 +1254,13 @@ struct FastMJXLEncoder {
     encoded.Write(1, 0);      // No TOC permutation
     encoded.ZeroPadToByte();  // TOC is byte-aligned.
 
+    std::vector<size_t> group_offsets(group_data.size() + 1);
+
     for (size_t i = 0; i < group_data.size(); i++) {
+      group_data[i].ZeroPadToByte();
       assert(group_data[i].bits_in_buffer == 0);
       size_t sz = group_data[i].bytes_written;
+      group_offsets[i + 1] = sz + group_offsets[i];
       if (sz < (1 << 10)) {
         encoded.Write(2, 0b00);
         encoded.Write(10, sz);
@@ -1251,11 +1276,13 @@ struct FastMJXLEncoder {
       }
     }
     encoded.ZeroPadToByte();  // Groups are byte-aligned.
+
     for (size_t i = 0; i < group_data.size(); i++) {
-      memcpy(encoded.data.get() + encoded.bytes_written,
+      memcpy(encoded.data.get() + encoded.bytes_written + group_offsets[i],
              group_data[i].data.get(), group_data[i].bytes_written);
-      encoded.bytes_written += group_data[i].bytes_written;
     }
+
+    encoded.bytes_written += group_offsets.back();
 
     frame_count++;
   }
