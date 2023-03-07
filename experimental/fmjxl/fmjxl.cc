@@ -85,6 +85,33 @@ struct BitWriter {
     }
   }
 
+  FJXL_INLINE void WriteMultiple(const uint64_t* nbits, const uint64_t* bits,
+                                 size_t n) {
+    // Necessary because Write() is only guaranteed to work with <=56 bits.
+    // Trying to SIMD-fy this code results in lower speed (and definitely less
+    // clarity).
+    {
+      for (size_t i = 0; i < n; i++) {
+        this->buffer |= bits[i] << this->bits_in_buffer;
+        memcpy(this->data.get() + this->bytes_written, &this->buffer, 8);
+        uint64_t shift = 64 - this->bits_in_buffer;
+        this->bits_in_buffer += nbits[i];
+        // This `if` seems to be faster than using ternaries.
+        if (this->bits_in_buffer >= 64) {
+          uint64_t next_buffer = bits[i] >> shift;
+          this->buffer = next_buffer;
+          this->bits_in_buffer -= 64;
+          this->bytes_written += 8;
+        }
+      }
+      memcpy(this->data.get() + this->bytes_written, &this->buffer, 8);
+      size_t bytes_in_buffer = this->bits_in_buffer / 8;
+      this->bits_in_buffer -= bytes_in_buffer * 8;
+      this->buffer >>= bytes_in_buffer * 8;
+      this->bytes_written += bytes_in_buffer;
+    }
+  }
+
   DataBuf<uint8_t> data = {nullptr, free};
   size_t bytes_written = 0;
   size_t bits_in_buffer = 0;
@@ -301,7 +328,7 @@ struct PrefixCode {
 
     constexpr uint8_t kMinLength[kNumSymbols] = {};
     constexpr uint8_t kMaxLength[kNumSymbols] = {8, 8, 8, 8, 8, 8, 8, 8,
-                                                 8, 8, 8, 8, 8, 8, 8, 8};
+                                                 7, 7, 7, 7, 7, 7, 7, 7};
 
     ComputeCodeLengths(counts, num, kMinLength, kMaxLength, nbits);
     ComputeCanonicalCode(nbits, bits, num);
@@ -446,13 +473,6 @@ void StoreDCGlobal(BitWriter* writer, bool is_delta,
     prefix_codes.dc_codes[is_delta ? 0 : 1][i].WriteTo(writer);
   }
 }
-
-constexpr uint32_t kCoeffOrder[] = {
-    0,  1,  2,  3,  8,  9,  10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
-    4,  5,  6,  7,  12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
-    32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59,
-    36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63,
-};
 
 void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
                    const PrefixCodeData& prefix_codes) {
@@ -746,17 +766,78 @@ void EncodeHybridUint000(uint32_t value, uint32_t* token, uint32_t* nbits,
   *bits = value ? value - (1 << n) : 0;
 }
 
+static constexpr bool kPrintSymbols = false;
+
 void EncodeU32(uint32_t value, const PrefixCode& code, BitWriter* writer,
                const char* tag, size_t c, bool is_delta) {
   uint32_t token, nbits, bits;
   EncodeHybridUint000(value, &token, &nbits, &bits);
-  static constexpr bool kPrintSymbols = false;
   if (kPrintSymbols) {
     static FILE* symbols = fopen("/tmp/symbols.txt", "w");
     fprintf(symbols, "%s %zu %d %u\n", tag, c, is_delta, token);
   }
   writer->Write(code.nbits[token], code.bits[token]);
   writer->Write(nbits, bits);
+}
+
+FJXL_INLINE void SIMDStoreValues(int16x8_t coeffs, uint16x8_t mask,
+                                 const PrefixCode& code, BitWriter* writer) {
+  // coeff to token + extra bits
+  int16x8_t coeffst2 = vaddq_s16(coeffs, coeffs);
+  int16x8_t zero = vdupq_n_s16(0);
+  uint16x8_t ucoeffs = vreinterpretq_u16_s16(vbslq_s16(
+      vcgeq_s16(coeffs, zero), coeffst2, vsubq_s16(vdupq_n_s16(-1), coeffst2)));
+
+  uint16x8_t token = vsubq_u16(vdupq_n_u16(16), vclzq_u16(ucoeffs));
+  int16x8_t nbits = vreinterpretq_s16_u16(vqsubq_u16(token, vdupq_n_u16(1)));
+  uint16x8_t bits = vqsubq_u16(ucoeffs, vshlq_u16(vdupq_n_u16(1), nbits));
+
+  // Prefix code lookup.
+  uint8x16_t token_indices =
+      vreinterpretq_u8_u16(vorrq_u16(token, vdupq_n_u16(0xFF00)));
+  uint8x16_t tbl_nbits = vld1q_u8(code.nbits);
+  uint8x16_t tbl_bits = vld1q_u8(code.bits);
+  int16x8_t tnbits = vreinterpretq_s16_u8(vqtbl1q_u8(tbl_nbits, token_indices));
+  uint16x8_t tbits = vreinterpretq_u16_u8(vqtbl1q_u8(tbl_bits, token_indices));
+
+  // merge bits and token bits
+  bits = vorrq_u16(tbits, vshlq_u16(bits, tnbits));
+  nbits = vaddq_s16(nbits, tnbits);
+
+  // clear out masked out coefficients
+  nbits = vandq_s16(nbits, vreinterpretq_s16_u16(mask));
+  bits = vandq_u16(bits, mask);
+
+  // Merge 16-bits bits to 32-bits
+  int32x4_t nbits_lo16 =
+      vandq_s32(vreinterpretq_s32_s16(nbits), vdupq_n_s32(0xFFFF));
+  uint32x4_t bits_hi16 =
+      vshlq_u32(vshrq_n_u32(vreinterpretq_u32_u16(bits), 16), nbits_lo16);
+  uint32x4_t bits_lo16 =
+      vandq_u32(vreinterpretq_u32_u16(bits), vdupq_n_u32(0xFFFF));
+  int32x4_t nbits32 = vsraq_n_s32(nbits_lo16, vreinterpretq_s32_s16(nbits), 16);
+  uint32x4_t bits32 = vorrq_u32(bits_hi16, bits_lo16);
+
+  // 32 -> 64
+  uint64x2_t nbits_lo32 =
+      vandq_u64(vreinterpretq_u64_s32(nbits32), vdupq_n_u64(0xFFFFFFFF));
+  uint64x2_t bits_hi32 =
+      vshlq_u64(vshrq_n_u64(vreinterpretq_u64_u32(bits32), 32),
+                vreinterpretq_s64_u64(nbits_lo32));
+  uint64x2_t bits_lo32 =
+      vandq_u64(vreinterpretq_u64_u32(bits32), vdupq_n_u64(0xFFFFFFFF));
+  uint64x2_t nbits64 =
+      vsraq_n_u64(nbits_lo32, vreinterpretq_u64_s32(nbits32), 32);
+  uint64x2_t bits64 = vorrq_u64(bits_hi32, bits_lo32);
+
+  // Final write-out
+  uint64_t nbits_s[2];
+  uint64_t bits_s[2];
+
+  vst1q_u64(bits_s, bits64);
+  vst1q_u64(nbits_s, nbits64);
+
+  writer->WriteMultiple(nbits_s, bits_s, 2);
 }
 
 template <bool is_delta>
@@ -789,22 +870,83 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
     quantize(data, c);
     *dc_ptr = data[0][0];
 
-    int16_t buf[64];
+    int16x8_t shuffled_data[8];
+
+    constexpr uint16_t kDCMask[8] = {0x0000, 0xFFFF, 0xFFFF, 0xFFFF,
+                                     0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+
+    /*
+      0,  1,  2,  3,  8,  9,  10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
+      4,  5,  6,  7,  12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
+      32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59,
+      36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63,
+     */
+    shuffled_data[0] = vreinterpretq_s16_s64(vtrn1q_s64(
+        vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
+    shuffled_data[1] = vreinterpretq_s16_s64(vtrn1q_s64(
+        vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
+    shuffled_data[2] = vreinterpretq_s16_s64(vtrn2q_s64(
+        vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
+    shuffled_data[3] = vreinterpretq_s16_s64(vtrn2q_s64(
+        vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
+    shuffled_data[4] = vreinterpretq_s16_s64(vtrn1q_s64(
+        vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
+    shuffled_data[5] = vreinterpretq_s16_s64(vtrn1q_s64(
+        vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
+    shuffled_data[6] = vreinterpretq_s16_s64(vtrn2q_s64(
+        vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
+    shuffled_data[7] = vreinterpretq_s16_s64(vtrn2q_s64(
+        vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
+
+    uint16x8_t dc_mask = vld1q_u16(kDCMask);
+    shuffled_data[0] =
+        vandq_s16(shuffled_data[0], vreinterpretq_s16_u16(dc_mask));
+
+    uint8_t nnz_vec[8];
     size_t nnz = 0;
     for (size_t i = 0; i < 8; i++) {
-      vst1q_s16(buf + i * 8, data[i]);
-    }
-    for (size_t i = 1; i < 64; i++) {
-      nnz += buf[i] != 0;
+      nnz_vec[i] = 8 + vaddvq_s16(vreinterpretq_s16_u16(
+                           vceqq_s16(shuffled_data[i], vdupq_n_s16(0))));
+      nnz += nnz_vec[i];
     }
 
     EncodeU32(nnz, nnz_codes[c], writer, "NNZ", c, is_delta);
 
-    for (size_t i = 1; i < 64 && nnz > 0; i++) {
-      size_t pos = kCoeffOrder[i];
-      int16_t coeff = buf[pos];
-      nnz -= (coeff != 0);
-      EncodeU32(PackSigned(coeff), ac_codes[c], writer, "AC", c, is_delta);
+    constexpr uint16_t kNumGreaterLanes[8] = {7, 6, 5, 4, 3, 2, 1, 0};
+
+    constexpr uint16_t kMask[16] = {
+        0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+        0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
+
+    if (nnz == 0) return;
+    for (size_t i = 0; i < 8; i++) {
+      nnz -= nnz_vec[i];
+
+      uint16x8_t isz = vceqq_s16(shuffled_data[i], vdupq_n_s16(0));
+      uint16x8_t nzloc =
+          vbslq_u16(isz, vdupq_n_u16(8), vld1q_u16(kNumGreaterLanes));
+      uint16_t trailingzeros = vminvq_u16(nzloc);
+      uint16_t maskpos = nnz == 0 ? trailingzeros : 0;
+
+      const uint16_t* maskptr = kMask + maskpos;
+
+      if (kPrintSymbols) {
+        const uint16_t* dc_mask = i == 0 ? kDCMask : kMask;
+        int16_t buf[8];
+        vst1q_s16(buf, shuffled_data[i]);
+        for (size_t j = 0; j < 8; j++) {
+          int16_t coeff = buf[j];
+          if (maskptr[j] & dc_mask[j]) {
+            EncodeU32(PackSigned(coeff), ac_codes[c], writer, "AC", c,
+                      is_delta);
+          }
+        }
+      } else {
+        uint16x8_t mask = vld1q_u16(maskptr);
+        if (i == 0) mask = vandq_u16(mask, dc_mask);
+        SIMDStoreValues(shuffled_data[i], mask, ac_codes[c], writer);
+      }
+      if (nnz == 0) break;
     }
   };
 
@@ -968,26 +1110,26 @@ struct FastMJXLEncoder {
          {390493, 174537, 150723, 64875, 2737, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
           0}}};
     uint64_t ac_counts[2][3][16] = {
-        {{40795, 11277, 15779, 809, 25, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+        {{40795, 11277, 15779, 809, 25, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
          {18534849, 4243219, 5038379, 1550255, 800155, 382091, 121945, 23077,
-          3051, 297, 1, 1, 1, 1, 1, 1},
-         {180205, 48335, 49013, 1291, 79, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}},
-        {{402585, 82053, 115183, 4409, 327, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+          3051, 297, 1, 0, 0, 0, 0, 0},
+         {180205, 48335, 49013, 1291, 79, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0}},
+        {{402585, 82053, 115183, 4409, 327, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
          {76143553, 20669389, 27737567, 9438691, 4293707, 2278787, 894093,
-          208333, 29863, 3195, 35, 1, 1, 1, 1, 1},
-         {1678387, 358637, 493099, 12599, 555, 11, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-          1}}};
+          208333, 29863, 3195, 35, 0, 0, 0, 0, 0},
+         {1678387, 358637, 493099, 12599, 555, 11, 1, 1, 1, 1, 1, 0, 0, 0, 0,
+          0}}};
     uint64_t dc_counts[2][3][16] = {
         {{109251, 92757, 154085, 155425, 85375, 56825, 59299, 47107, 18847,
-          3951, 449, 1, 1, 1, 1, 1},
-         {98691, 35591, 42591, 14305, 3961, 627, 79, 3, 1, 1, 1, 1, 1, 1, 1, 1},
-         {91527, 41027, 49029, 12497, 1597, 167, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1}},
+          3951, 449, 0, 0, 0, 0, 0},
+         {98691, 35591, 42591, 14305, 3961, 627, 79, 3, 1, 1, 1, 0, 0, 0, 0, 0},
+         {91527, 41027, 49029, 12497, 1597, 167, 3, 1, 1, 1, 1, 0, 0, 0, 0, 0}},
         {{345091, 308721, 548475, 669509, 437125, 235159, 222595, 210649,
-          120651, 30423, 4761, 293, 1, 1, 1, 1},
-         {367055, 149617, 182073, 65967, 15929, 2319, 389, 19, 1, 1, 1, 1, 1, 1,
-          1, 1},
-         {312839, 171951, 216303, 74307, 7381, 549, 37, 1, 1, 1, 1, 1, 1, 1, 1,
-          1}}};
+          120651, 30423, 4761, 292, 0, 0, 0, 0},
+         {367055, 149617, 182073, 65967, 15929, 2319, 389, 19, 1, 1, 1, 0, 0, 0,
+          0, 0},
+         {312839, 171951, 216303, 74307, 7381, 549, 37, 1, 1, 1, 1, 0, 0, 0, 0,
+          0}}};
 
     for (size_t j = 0; j < 2; j++) {
       for (size_t i = 0; i < 3; i++) {
