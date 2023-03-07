@@ -11,8 +11,12 @@ extern "C" {
 struct FastMJXLEncoder;
 
 // TODO(veluca): thread functions.
-// width and height must be multiples of 16.
-struct FastMJXLEncoder* FastMJXLCreateEncoder(size_t width, size_t height);
+// width and height must be multiples of 16 and at least 256.
+struct FastMJXLEncoder* FastMJXLCreateEncoder(
+    size_t width, size_t height,
+    void (*run_on_threads)(void*, void (*task)(void*, size_t shard), void*,
+                           size_t count),
+    void* thread_runner_data);
 
 // Calling this function will clear the output buffer in the encoder of any of
 // its current contents.

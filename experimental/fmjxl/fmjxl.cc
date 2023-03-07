@@ -1089,7 +1089,15 @@ void StoreDCGroup(BitWriter* writer, bool is_delta,
 }  // namespace
 
 struct FastMJXLEncoder {
-  FastMJXLEncoder(size_t w, size_t h) : w(w), h(h) {
+  FastMJXLEncoder(size_t w, size_t h,
+                  void (*run_on_threads)(void*,
+                                         void (*task)(void*, size_t shard),
+                                         void*, size_t count),
+                  void* thread_runner_data)
+      : w(w),
+        h(h),
+        run_on_threads(run_on_threads),
+        thread_runner_data(thread_runner_data) {
     assert(w > 256 || h > 256);
     assert(w % 16 == 0);
     assert(h % 16 == 0);
@@ -1183,8 +1191,7 @@ struct FastMJXLEncoder {
     StoreACGlobal(group_data.data() + acg_off - 1, num_groups_x * num_groups_y,
                   is_delta, prefix_codes);
 
-    // TODO(veluca): parallelize both of those loops.
-    for (size_t i = 0; i < num_groups_x * num_groups_y; i++) {
+    auto process_one_ac = [&](size_t i) {
       size_t ix = i % num_groups_x;
       size_t iy = i / num_groups_x;
       size_t x0 = ix * 256;
@@ -1202,9 +1209,16 @@ struct FastMJXLEncoder {
                             dc_y.get(), prev_ydct.get(), dc_cb.get(),
                             prev_cbdct.get(), dc_cr.get(), prev_crdct.get());
       }
-    }
+    };
 
-    for (size_t i = 0; i < num_dc_groups_x * num_dc_groups_y; i++) {
+    run_on_threads(
+        thread_runner_data,
+        +[](void* lambda, size_t i) {
+          (*static_cast<decltype(&process_one_ac)>(lambda))(i);
+        },
+        &process_one_ac, num_groups_x * num_groups_y);
+
+    auto process_one_dc = [&](size_t i) {
       size_t ix = i % num_dc_groups_x;
       size_t iy = i / num_dc_groups_x;
       size_t x0 = ix * 256;
@@ -1213,7 +1227,14 @@ struct FastMJXLEncoder {
       size_t ys = std::min(h / 8, y0 + 256) - y0;
       StoreDCGroup(group_data.data() + 1 + i, is_delta, prefix_codes, w, x0, xs,
                    y0, ys, dc_y.get(), dc_cb.get(), dc_cr.get());
-    }
+    };
+
+    run_on_threads(
+        thread_runner_data,
+        +[](void* lambda, size_t i) {
+          (*static_cast<decltype(&process_one_dc)>(lambda))(i);
+        },
+        &process_one_dc, num_dc_groups_x * num_dc_groups_y);
 
     // Handcrafted frame header.
     encoded.Write(1, 0);     // all_default
@@ -1277,10 +1298,17 @@ struct FastMJXLEncoder {
     }
     encoded.ZeroPadToByte();  // Groups are byte-aligned.
 
-    for (size_t i = 0; i < group_data.size(); i++) {
+    auto join_groups = [&](size_t i) {
       memcpy(encoded.data.get() + encoded.bytes_written + group_offsets[i],
              group_data[i].data.get(), group_data[i].bytes_written);
-    }
+    };
+
+    run_on_threads(
+        thread_runner_data,
+        +[](void* lambda, size_t i) {
+          (*static_cast<decltype(&join_groups)>(lambda))(i);
+        },
+        &join_groups, group_data.size());
 
     encoded.bytes_written += group_offsets.back();
 
@@ -1289,6 +1317,9 @@ struct FastMJXLEncoder {
 
   size_t w;
   size_t h;
+  void (*run_on_threads)(void*, void (*task)(void*, size_t shard), void*,
+                         size_t count);
+  void* thread_runner_data;
   BitWriter encoded;
   size_t encoded_size = 0;
   size_t frame_count = 0;
@@ -1314,8 +1345,12 @@ extern "C" {
 #endif
 
 // TODO(veluca): thread functions.
-struct FastMJXLEncoder* FastMJXLCreateEncoder(size_t width, size_t height) {
-  return new FastMJXLEncoder(width, height);
+struct FastMJXLEncoder* FastMJXLCreateEncoder(
+    size_t width, size_t height,
+    void (*run_on_threads)(void*, void (*task)(void*, size_t shard), void*,
+                           size_t count),
+    void* thread_runner_data) {
+  return new FastMJXLEncoder(width, height, run_on_threads, thread_runner_data);
 }
 
 // Calling this function will clear the output buffer in the encoder of any of

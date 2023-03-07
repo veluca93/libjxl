@@ -11,13 +11,105 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "fmjxl.h"
+
+struct SimpleThreadPool {
+  std::vector<std::thread> threads;
+  std::mutex task_m;
+  std::condition_variable cv;
+  void (*task)(void*, size_t);
+  void* opaque;
+  size_t shard_count;
+  size_t running_tasks;
+  std::atomic<size_t> current_shard;
+
+  explicit SimpleThreadPool(size_t num) {
+    shard_count = 1;
+    task = nullptr;
+    running_tasks = 0;
+    for (size_t i = 0; i < num - 1; i++) {
+      threads.emplace_back([&]() { this->ThreadFn(); });
+    }
+  }
+
+  ~SimpleThreadPool() {
+    {
+      std::unique_lock<std::mutex> lock(task_m);
+      shard_count = 0;
+      task = nullptr;
+      cv.notify_all();
+    }
+    for (std::thread& t : threads) t.join();
+  }
+
+  void ThreadFn() {
+    while (true) {
+      {
+        // Wait for a task to become available.
+        std::unique_lock<std::mutex> lock(task_m);
+        cv.wait(lock);
+        if (task == nullptr) {
+          if (shard_count == 0) return;
+          // Spurious wakeup.
+          continue;
+        }
+        if (current_shard >= shard_count) {
+          continue;
+        }
+        running_tasks += 1;
+      }
+
+      // Run enqueued tasks.
+      while (true) {
+        size_t shard = current_shard++;
+        if (shard >= shard_count) break;
+        task(opaque, shard);
+      }
+
+      // Done running all shards, signal we are not running anymore.
+      {
+        std::unique_lock<std::mutex> lock(task_m);
+        running_tasks -= 1;
+        cv.notify_all();
+      }
+    }
+  }
+
+  void Run(void (*t)(void*, size_t), void* o, size_t n) {
+    {
+      std::unique_lock<std::mutex> lock(task_m);
+      task = t;
+      opaque = o;
+      shard_count = n;
+      current_shard = 0;
+      cv.notify_all();
+    }
+
+    // Main thread participates in running tasks.
+    while (true) {
+      size_t shard = current_shard++;
+      if (shard >= shard_count) break;
+      task(opaque, shard);
+    }
+
+    // Wait for all currently-running tasks to finish.
+    while (true) {
+      std::unique_lock<std::mutex> lock(task_m);
+      if (running_tasks == 0) {
+        break;
+      }
+      cv.wait(lock);
+    }
+  }
+};
 
 int main(int argc, char** argv) {
   if (argc < 7) {
@@ -34,6 +126,9 @@ int main(int argc, char** argv) {
   assert(w > 256 || h > 256);
   size_t num_reps = atoi(argv[4]);
   size_t num_threads = atoi(argv[5]);
+  assert(num_threads > 0);
+
+  SimpleThreadPool thread_pool(num_threads);
 
   assert(num_reps > 0);
 
@@ -58,7 +153,12 @@ int main(int argc, char** argv) {
     free(encoded);
     encoded = nullptr;
     encoded_size = 0;
-    auto encoder = FastMJXLCreateEncoder(w, h);
+    auto encoder = FastMJXLCreateEncoder(
+        w, h,
+        +[](void* runner, void (*tfn)(void*, size_t), void* opaque, size_t n) {
+          static_cast<SimpleThreadPool*>(runner)->Run(tfn, opaque, n);
+        },
+        &thread_pool);
     for (size_t i = 0; i < input_data.size(); i++) {
       FastMJXLAddYCbCrP010Frame(input_data[i].data(),
                                 input_data[i].data() + 2 * w * h,
