@@ -25,6 +25,7 @@ void FastMJXLAddYCbCrP010Frame(const uint8_t* y_plane, const uint8_t* uv_plane,
                                int is_last, struct FastMJXLEncoder* encoder);
 
 const uint8_t* FastMJXLGetOutputBuffer(const struct FastMJXLEncoder* encoder);
+uint8_t* FastMJXLReleaseOutputBuffer(struct FastMJXLEncoder* encoder);
 
 // Returns the number of ready output bytes.
 size_t FastMJXLGetOutputBufferSize(const struct FastMJXLEncoder* encoder);

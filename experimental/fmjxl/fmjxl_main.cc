@@ -14,9 +14,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "fmjxl.h"
@@ -145,13 +147,13 @@ int main(int argc, char** argv) {
     fclose(in);
   }
 
-  uint8_t* encoded = nullptr;
+  std::vector<std::pair<std::unique_ptr<uint8_t[], void (*)(void*)>, size_t>>
+      encoded_chunks;
   size_t encoded_size = 0;
 
   auto start = std::chrono::high_resolution_clock::now();
   for (size_t _ = 0; _ < num_reps; _++) {
-    free(encoded);
-    encoded = nullptr;
+    encoded_chunks.clear();
     encoded_size = 0;
     auto encoder = FastMJXLCreateEncoder(
         w, h,
@@ -163,10 +165,11 @@ int main(int argc, char** argv) {
       FastMJXLAddYCbCrP010Frame(input_data[i].data(),
                                 input_data[i].data() + 2 * w * h,
                                 i + 1 == input_data.size(), encoder);
-      size_t chunk = FastMJXLGetOutputBufferSize(encoder);
-      encoded = (uint8_t*)realloc(encoded, encoded_size + chunk);
-      memcpy(encoded + encoded_size, FastMJXLGetOutputBuffer(encoder), chunk);
-      encoded_size += chunk;
+      size_t chunk_size = FastMJXLGetOutputBufferSize(encoder);
+      std::unique_ptr<uint8_t[], decltype(&free)> chunk{
+          FastMJXLReleaseOutputBuffer(encoder), free};
+      encoded_size += chunk_size;
+      encoded_chunks.emplace_back(std::move(chunk), chunk_size);
     }
     FastMJXLDestroyEncoder(encoder);
   }
@@ -186,7 +189,8 @@ int main(int argc, char** argv) {
 
   FILE* out = fopen(argv[1], "w");
   assert(out);
-  fwrite(encoded, encoded_size, 1, out);
+  for (const auto& v : encoded_chunks) {
+    fwrite(v.first.get(), v.second, 1, out);
+  }
   fclose(out);
-  free(encoded);
 }

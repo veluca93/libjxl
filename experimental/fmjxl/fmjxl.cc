@@ -748,19 +748,19 @@ FJXL_INLINE void scale_inputs(int16x8_t data[8]) {
   }
 }
 
-void quantize(int16x8_t data[8], int c) {
+FJXL_INLINE void quantize(int16x8_t data[8], int c) {
   for (size_t i = 0; i < 8; i++) {
     int16x8_t q = vld1q_s16(&kQuantMatrix[c][i * 8]);
     data[i] = vrshrq_n_s16(vqrdmulhq_s16(q, data[i]), kQuantizeShift);
   }
 }
 
-constexpr uint32_t PackSigned(int32_t value) {
+FJXL_INLINE constexpr uint32_t PackSigned(int32_t value) {
   return (static_cast<uint32_t>(value) << 1) ^
          ((static_cast<uint32_t>(~value) >> 31) - 1);
 }
-void EncodeHybridUint000(uint32_t value, uint32_t* token, uint32_t* nbits,
-                         uint32_t* bits) {
+FJXL_INLINE void EncodeHybridUint000(uint32_t value, uint32_t* token,
+                                     uint32_t* nbits, uint32_t* bits) {
   uint32_t n = FloorLog2(value);
   *token = value ? n + 1 : 0;
   *nbits = value ? n : 0;
@@ -777,12 +777,13 @@ void EncodeU32(uint32_t value, const PrefixCode& code, BitWriter* writer,
     static FILE* symbols = fopen("/tmp/symbols.txt", "w");
     fprintf(symbols, "%s %zu %d %u\n", tag, c, is_delta, token);
   }
-  writer->Write(code.nbits[token], code.bits[token]);
-  writer->Write(nbits, bits);
+  writer->Write(code.nbits[token] + nbits,
+                code.bits[token] | (bits << code.nbits[token]));
 }
 
 FJXL_INLINE void SIMDStoreValues(int16x8_t coeffs, uint16x8_t mask,
-                                 const PrefixCode& code, BitWriter* writer) {
+                                 const PrefixCode& code, uint64_t* nbits_s,
+                                 uint64_t* bits_s) {
   // coeff to token + extra bits
   int16x8_t coeffst2 = vaddq_s16(coeffs, coeffs);
   int16x8_t zero = vdupq_n_s16(0);
@@ -832,13 +833,123 @@ FJXL_INLINE void SIMDStoreValues(int16x8_t coeffs, uint16x8_t mask,
   uint64x2_t bits64 = vorrq_u64(bits_hi32, bits_lo32);
 
   // Final write-out
-  uint64_t nbits_s[2];
-  uint64_t bits_s[2];
-
   vst1q_u64(bits_s, bits64);
   vst1q_u64(nbits_s, nbits64);
+}
 
-  writer->WriteMultiple(nbits_s, bits_s, 2);
+template <bool is_delta, bool store_for_next>
+FJXL_INLINE void ProcessBlock(int16x8_t data[8], int16_t* storage) {
+  scale_inputs(data);
+  dct8(data);
+  transpose8(data);
+  dct8(data);
+  data[0][0] -= kChannelCenterOffset;
+  for (size_t i = 0; i < 8; i++) {
+    if (is_delta) {
+      int16x8_t prev = vld1q_s16(storage + i * 8);
+      if (store_for_next) {
+        vst1q_s16(storage + i * 8, data[i]);
+      }
+      data[i] = vsubq_s16(data[i], prev);
+    } else if (store_for_next) {
+      vst1q_s16(storage + i * 8, data[i]);
+    }
+  }
+}
+
+template <bool is_delta, bool store_for_next>
+FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
+                                  const PrefixCode& nnz_code,
+                                  const PrefixCode& ac_code,
+                                  BitWriter* writer) {
+  quantize(data, c);
+  *dc_ptr = data[0][0];
+
+  int16x8_t shuffled_data[8];
+
+  constexpr uint16_t kDCMask[8] = {0x0000, 0xFFFF, 0xFFFF, 0xFFFF,
+                                   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+
+  /*
+    0,  1,  2,  3,  8,  9,  10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
+    4,  5,  6,  7,  12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
+    32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59,
+    36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63,
+   */
+  shuffled_data[0] = vreinterpretq_s16_s64(vtrn1q_s64(
+      vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
+  shuffled_data[1] = vreinterpretq_s16_s64(vtrn1q_s64(
+      vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
+  shuffled_data[2] = vreinterpretq_s16_s64(vtrn2q_s64(
+      vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
+  shuffled_data[3] = vreinterpretq_s16_s64(vtrn2q_s64(
+      vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
+  shuffled_data[4] = vreinterpretq_s16_s64(vtrn1q_s64(
+      vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
+  shuffled_data[5] = vreinterpretq_s16_s64(vtrn1q_s64(
+      vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
+  shuffled_data[6] = vreinterpretq_s16_s64(vtrn2q_s64(
+      vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
+  shuffled_data[7] = vreinterpretq_s16_s64(vtrn2q_s64(
+      vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
+
+  uint16x8_t dc_mask = vld1q_u16(kDCMask);
+  shuffled_data[0] =
+      vandq_s16(shuffled_data[0], vreinterpretq_s16_u16(dc_mask));
+
+  uint8_t nnz_vec[8];
+  size_t nnz = 0;
+  for (size_t i = 0; i < 8; i++) {
+    nnz_vec[i] = 8 + vaddvq_s16(vreinterpretq_s16_u16(
+                         vceqq_s16(shuffled_data[i], vdupq_n_s16(0))));
+    nnz += nnz_vec[i];
+  }
+
+  EncodeU32(nnz, nnz_code, writer, "NNZ", c, is_delta);
+
+  constexpr uint16_t kNumGreaterLanes[8] = {7, 6, 5, 4, 3, 2, 1, 0};
+
+  constexpr uint16_t kMask[16] = {
+      0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+      0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
+
+  if (nnz == 0) return;
+
+  uint64_t nbits_s[16];
+  uint64_t bits_s[16];
+
+  size_t to_write = 0;
+  for (size_t i = 0; i < 8; i++) {
+    nnz -= nnz_vec[i];
+
+    uint16x8_t isz = vceqq_s16(shuffled_data[i], vdupq_n_s16(0));
+    uint16x8_t nzloc =
+        vbslq_u16(isz, vdupq_n_u16(8), vld1q_u16(kNumGreaterLanes));
+    uint16_t trailingzeros = vminvq_u16(nzloc);
+    uint16_t maskpos = nnz == 0 ? trailingzeros : 0;
+
+    const uint16_t* maskptr = kMask + maskpos;
+
+    if (kPrintSymbols) {
+      const uint16_t* dc_mask = i == 0 ? kDCMask : kMask;
+      int16_t buf[8];
+      vst1q_s16(buf, shuffled_data[i]);
+      for (size_t j = 0; j < 8; j++) {
+        int16_t coeff = buf[j];
+        if (maskptr[j] & dc_mask[j]) {
+          EncodeU32(PackSigned(coeff), ac_code, writer, "AC", c, is_delta);
+        }
+      }
+    } else {
+      uint16x8_t mask = vld1q_u16(maskptr);
+      if (i == 0) mask = vandq_u16(mask, dc_mask);
+      SIMDStoreValues(shuffled_data[i], mask, ac_code, nbits_s + to_write,
+                      bits_s + to_write);
+      to_write += 2;
+    }
+    if (nnz == 0) break;
+  }
+  writer->WriteMultiple(nbits_s, bits_s, to_write);
 }
 
 template <bool is_delta, bool store_for_next>
@@ -849,109 +960,6 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
                   int16_t* dc_cr, int16_t* prev_crdct) {
   const PrefixCode* nnz_codes = &prefix_codes.nnz_codes[is_delta ? 0 : 1][0];
   const PrefixCode* ac_codes = &prefix_codes.ac_codes[is_delta ? 0 : 1][0];
-
-  auto process_block = [](int16x8_t data[8], int16_t* ptr) {
-    scale_inputs(data);
-    dct8(data);
-    transpose8(data);
-    dct8(data);
-    data[0][0] -= kChannelCenterOffset;
-    for (size_t i = 0; i < 8; i++) {
-      if (is_delta) {
-        int16x8_t prev = vld1q_s16(ptr + i * 8);
-        if (store_for_next) {
-          vst1q_s16(ptr + i * 8, data[i]);
-        }
-        data[i] = vsubq_s16(data[i], prev);
-      } else if (store_for_next) {
-        vst1q_s16(ptr + i * 8, data[i]);
-      }
-    }
-  };
-
-  auto quantize_and_store = [&](int16x8_t data[8], int16_t* dc_ptr, size_t c) {
-    quantize(data, c);
-    *dc_ptr = data[0][0];
-
-    int16x8_t shuffled_data[8];
-
-    constexpr uint16_t kDCMask[8] = {0x0000, 0xFFFF, 0xFFFF, 0xFFFF,
-                                     0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
-
-    /*
-      0,  1,  2,  3,  8,  9,  10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
-      4,  5,  6,  7,  12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
-      32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59,
-      36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63,
-     */
-    shuffled_data[0] = vreinterpretq_s16_s64(vtrn1q_s64(
-        vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
-    shuffled_data[1] = vreinterpretq_s16_s64(vtrn1q_s64(
-        vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
-    shuffled_data[2] = vreinterpretq_s16_s64(vtrn2q_s64(
-        vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
-    shuffled_data[3] = vreinterpretq_s16_s64(vtrn2q_s64(
-        vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
-    shuffled_data[4] = vreinterpretq_s16_s64(vtrn1q_s64(
-        vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
-    shuffled_data[5] = vreinterpretq_s16_s64(vtrn1q_s64(
-        vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
-    shuffled_data[6] = vreinterpretq_s16_s64(vtrn2q_s64(
-        vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
-    shuffled_data[7] = vreinterpretq_s16_s64(vtrn2q_s64(
-        vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
-
-    uint16x8_t dc_mask = vld1q_u16(kDCMask);
-    shuffled_data[0] =
-        vandq_s16(shuffled_data[0], vreinterpretq_s16_u16(dc_mask));
-
-    uint8_t nnz_vec[8];
-    size_t nnz = 0;
-    for (size_t i = 0; i < 8; i++) {
-      nnz_vec[i] = 8 + vaddvq_s16(vreinterpretq_s16_u16(
-                           vceqq_s16(shuffled_data[i], vdupq_n_s16(0))));
-      nnz += nnz_vec[i];
-    }
-
-    EncodeU32(nnz, nnz_codes[c], writer, "NNZ", c, is_delta);
-
-    constexpr uint16_t kNumGreaterLanes[8] = {7, 6, 5, 4, 3, 2, 1, 0};
-
-    constexpr uint16_t kMask[16] = {
-        0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-        0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
-
-    if (nnz == 0) return;
-    for (size_t i = 0; i < 8; i++) {
-      nnz -= nnz_vec[i];
-
-      uint16x8_t isz = vceqq_s16(shuffled_data[i], vdupq_n_s16(0));
-      uint16x8_t nzloc =
-          vbslq_u16(isz, vdupq_n_u16(8), vld1q_u16(kNumGreaterLanes));
-      uint16_t trailingzeros = vminvq_u16(nzloc);
-      uint16_t maskpos = nnz == 0 ? trailingzeros : 0;
-
-      const uint16_t* maskptr = kMask + maskpos;
-
-      if (kPrintSymbols) {
-        const uint16_t* dc_mask = i == 0 ? kDCMask : kMask;
-        int16_t buf[8];
-        vst1q_s16(buf, shuffled_data[i]);
-        for (size_t j = 0; j < 8; j++) {
-          int16_t coeff = buf[j];
-          if (maskptr[j] & dc_mask[j]) {
-            EncodeU32(PackSigned(coeff), ac_codes[c], writer, "AC", c,
-                      is_delta);
-          }
-        }
-      } else {
-        uint16x8_t mask = vld1q_u16(maskptr);
-        if (i == 0) mask = vandq_u16(mask, dc_mask);
-        SIMDStoreValues(shuffled_data[i], mask, ac_codes[c], writer);
-      }
-      if (nnz == 0) break;
-    }
-  };
 
   for (size_t iy = 0; iy < ys; iy += 8) {
     for (size_t ix = 0; ix < xs; ix += 8) {
@@ -966,12 +974,13 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
       }
 
       int16_t* yblock_ptr = prev_ydct + block_idx * 64;
-      process_block(y_data, yblock_ptr);
+      ProcessBlock<is_delta, store_for_next>(y_data, yblock_ptr);
 
       // Adjust Y channel.
       yblock_ptr[0] += kChannelCenterOffset;
 
-      quantize_and_store(y_data, dc_y + block_idx, 1);
+      QuantizeAndStore<is_delta, store_for_next>(
+          y_data, dc_y + block_idx, 1, nnz_codes[1], ac_codes[1], writer);
 
       if (ix % 16 == 0 && iy % 16 == 0) {
         size_t cblock_idx = by / 2 * w / 16 + bx / 2;
@@ -984,10 +993,14 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
           cb_data[i] = v.val[0];
           cr_data[i] = v.val[1];
         }
-        process_block(cb_data, prev_cbdct + cblock_idx * 64);
-        process_block(cr_data, prev_crdct + cblock_idx * 64);
-        quantize_and_store(cb_data, dc_cb + cblock_idx, 0);
-        quantize_and_store(cr_data, dc_cr + cblock_idx, 2);
+        ProcessBlock<is_delta, store_for_next>(cb_data,
+                                               prev_cbdct + cblock_idx * 64);
+        QuantizeAndStore<is_delta, store_for_next>(
+            cb_data, dc_cb + cblock_idx, 0, nnz_codes[0], ac_codes[0], writer);
+        ProcessBlock<is_delta, store_for_next>(cr_data,
+                                               prev_crdct + cblock_idx * 64);
+        QuantizeAndStore<is_delta, store_for_next>(
+            cr_data, dc_cr + cblock_idx, 2, nnz_codes[2], ac_codes[2], writer);
       }
     }
   }
@@ -1125,7 +1138,7 @@ struct FastMJXLEncoder {
     for (size_t i = 0; i < group_data.size(); i++) {
       group_data[i].Allocate(256 * 256 * 32 + 1024);
     }
-    encoded.Allocate(w * h * 32 + 1024);
+    AllocateEncoded();
 
     // TODO(veluca): more sensible prefix codes.
     uint64_t nnz_counts[2][3][16] = {
@@ -1168,6 +1181,8 @@ struct FastMJXLEncoder {
       }
     }
   }
+
+  void AllocateEncoded() { encoded.Allocate(w * h * 32 + 1024); }
 
   void AddYCbCrP010Frame(const uint8_t* y_plane, const uint8_t* uv_plane,
                          bool is_last) {
@@ -1365,6 +1380,13 @@ void FastMJXLAddYCbCrP010Frame(const uint8_t* y_plane, const uint8_t* uv_plane,
 const uint8_t* FastMJXLGetOutputBuffer(const struct FastMJXLEncoder* encoder) {
   assert(encoder->encoded.bits_in_buffer == 0);
   return encoder->encoded.data.get();
+}
+
+uint8_t* FastMJXLReleaseOutputBuffer(struct FastMJXLEncoder* encoder) {
+  uint8_t* out = encoder->encoded.data.release();
+  encoder->AllocateEncoded();
+  assert(encoder->encoded.bits_in_buffer == 0);
+  return out;
 }
 
 // Returns the number of ready output bytes.
