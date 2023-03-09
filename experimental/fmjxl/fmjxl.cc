@@ -40,9 +40,9 @@ struct QuantTable {
     QuantTable ret;
 
     // Encoding of the table
-    ret.dc_quants[0] = 0x3606;
+    ret.dc_quants[0] = 0x3442;
     ret.dc_quants[1] = 0x3206;
-    ret.dc_quants[2] = 0x3606;
+    ret.dc_quants[2] = 0x3442;
 
     ret.ac_quants[0][0] = 0x4F86;
     ret.ac_quants[0][1] = 0xBC00;
@@ -62,7 +62,7 @@ struct QuantTable {
     // encoder-side values to multiply by.
     ret.quant_matrix = QM{
         {{
-             0x3fc0, 0x139f, 0x110f, 0x0ed4, 0x0ce4, 0x0b15, 0x07b7, 0x055f,  //
+             0x5a30, 0x139f, 0x110f, 0x0ed4, 0x0ce4, 0x0b15, 0x07b7, 0x055f,  //
              0x139f, 0x1284, 0x1081, 0x0e7f, 0x0cac, 0x0ab1, 0x077d, 0x053c,  //
              0x110f, 0x1081, 0x0f30, 0x0d9f, 0x0c11, 0x09a4, 0x06dc, 0x04db,  //
              0x0ed4, 0x0e7f, 0x0d9f, 0x0c76, 0x0b15, 0x0834, 0x05f9, 0x044d,  //
@@ -82,7 +82,7 @@ struct QuantTable {
              0x326e, 0x31ee, 0x307d, 0x2e43, 0x2b75, 0x284b, 0x24f5, 0x219a,  //
          },
          {
-             0x3fc0, 0x2865, 0x2191, 0x1be5, 0x172e, 0x132c, 0x0e7d, 0x0af3,  //
+             0x5a30, 0x2865, 0x2191, 0x1be5, 0x172e, 0x132c, 0x0e7d, 0x0af3,  //
              0x2865, 0x256a, 0x2022, 0x1b12, 0x16a9, 0x12a6, 0x0e28, 0x0abc,  //
              0x2191, 0x2022, 0x1ccc, 0x18f0, 0x153e, 0x1136, 0x0d3b, 0x0a20,  //
              0x1be5, 0x1b12, 0x18f0, 0x162a, 0x132c, 0x0f31, 0x0be2, 0x0937,  //
@@ -102,21 +102,12 @@ struct QuantTable {
     return ret;
   }
 
-  static QuantTable HigherChromaDC() {
-    QuantTable ret = Deadzone();
-    ret.dc_quants[0] = ret.dc_quants[2] = 0x3442;
-    ret.quant_matrix[0][0] = ret.quant_matrix[2][0] = 0x5a30;
-    return ret;
-  }
-
   static QuantTable FromType(QuantizationType type) {
     switch (type) {
       case DEFAULT:
         return Default();
       case DEADZONE:
         return Deadzone();
-      case HIGHER_CHROMA_DC:
-        return HigherChromaDC();
       default:
         assert(!!!"Invalid qtype");
     }
