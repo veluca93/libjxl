@@ -70,9 +70,9 @@ int main(int argc, char** argv) {
       uint32_t Y = ydata[y * w + x];
       uint32_t cb = cbdata[y / 2 * w / 2 + x / 2];
       uint32_t cr = crdata[y / 2 * w / 2 + x / 2];
-      uint8_t R = c(Y + 1.5748 * (cr - 128.0));
-      uint8_t G = c(Y - 0.1873 * (cb - 128.0) - 0.4681 * (cr - 128.0));
-      uint8_t B = c(Y + 1.8556 * (cb - 128.0));
+      uint8_t R = c(Y + 1.402f * (cr - 128.0));
+      uint8_t G = c(Y - 0.344136f * (cb - 128.0) - 0.714136f * (cr - 128.0));
+      uint8_t B = c(Y + 1.772f * (cb - 128.0));
       rgbdata[y * w * 3 + x * 3] = R;
       rgbdata[y * w * 3 + x * 3 + 1] = G;
       rgbdata[y * w * 3 + x * 3 + 2] = B;
