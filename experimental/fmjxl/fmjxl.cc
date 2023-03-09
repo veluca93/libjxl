@@ -102,12 +102,21 @@ struct QuantTable {
     return ret;
   }
 
+  static QuantTable HigherChromaDC() {
+    QuantTable ret = Deadzone();
+    ret.dc_quants[0] = ret.dc_quants[2] = 0x3442;
+    ret.quant_matrix[0][0] = ret.quant_matrix[2][0] = 0x5a30;
+    return ret;
+  }
+
   static QuantTable FromType(QuantizationType type) {
     switch (type) {
       case DEFAULT:
         return Default();
       case DEADZONE:
         return Deadzone();
+      case HIGHER_CHROMA_DC:
+        return HigherChromaDC();
       default:
         assert(!!!"Invalid qtype");
     }
