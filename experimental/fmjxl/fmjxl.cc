@@ -525,21 +525,21 @@ void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
   size_t num_histo_bits = CeilLog2(num_groups);
   writer->Write(num_histo_bits, 0);  // Only one set of histograms.
 
-  // SIMD-friendly coefficient order. TODO(veluca): see if we can do better
-  // while still being SIMD-friendly.
+  // Not particularly SIMD-friendly coefficient order, but saves ~7% over
+  // almost-raster order and it is not particularly more annoying to permute.
   writer->Write(2, 0b11);  // arbitrary mask selector
   writer->Write(13, 0b0000000000001);
 
   constexpr uint8_t kCoeffOrderEncoding[] = {
-      0xa6, 0x03, 0x4c, 0xb4, 0x08, 0x11, 0x3a, 0xc6, 0x4a, 0x6f, 0x40, 0x8c,
-      0x35, 0x8c, 0x18, 0x8d, 0x06, 0xda, 0x14, 0x04, 0x00, 0xe8, 0xe4, 0x3e,
-      0x73, 0xae, 0xd1, 0x8c, 0x5f, 0x03, 0xdd, 0x71, 0x1f, 0x7e, 0xdc, 0xb0,
-      0x50, 0xdd, 0xec, 0x28, 0xbd, 0x24, 0x30, 0x8b, 0x41, 0x7b, 0xc4, 0x85,
-      0x82, 0x08, 0xfe, 0xed, 0xdd, 0x5c, 0x7b, 0xa8, 0x2e, 0xc7, 0x29, 0xe8,
-      0x31, 0xca, 0xb4, 0x9d, 0xe4, 0x5c, 0xc5, 0xec, 0x91, 0x11, 0x33, 0x52,
-      0xb9, 0x1d, 0xfe, 0x1c, 0xfe, 0xc9, 0xbf, 0x80, 0xb8, 0x3b, 0x27, 0x51,
-      0xd2, 0x19, 0xe2, 0x03, 0x4a, 0x00};
-  constexpr size_t kCoeffOrderEncodingBitLength = 716;
+      0x82, 0x89, 0x66, 0x00, 0x36, 0x1c, 0x8b, 0x18, 0xac, 0x34, 0xcf, 0xb4,
+      0xd2, 0x81, 0xb9, 0xe5, 0xc6, 0x44, 0x86, 0xd5, 0x8e, 0x7d, 0xeb, 0xe6,
+      0xbc, 0x79, 0xaa, 0x20, 0x02, 0x78, 0x0a, 0x4e, 0x16, 0xc0, 0x76, 0x7b,
+      0xc7, 0x56, 0xaa, 0x09, 0xbf, 0x63, 0xfa, 0x16, 0x94, 0xf0, 0xaa, 0x43,
+      0xc1, 0x8e, 0x36, 0x0b, 0xc5, 0xd6, 0x9e, 0x53, 0xe7, 0x5e, 0x5a, 0x31,
+      0xd3, 0x79, 0xfe, 0x1e, 0x4f, 0x0b, 0xee, 0x91, 0xe7, 0x20, 0xc7, 0xc5,
+      0x54, 0x66, 0x48, 0x02, 0x56, 0x00,
+  };
+  constexpr size_t kCoeffOrderEncodingBitLength = 618;
   for (size_t i = 0; i < kCoeffOrderEncodingBitLength; i += 8) {
     size_t nb = std::min(kCoeffOrderEncodingBitLength, i + 8) - i;
     writer->Write(nb, kCoeffOrderEncoding[i / 8] & ((1 << nb) - 1));
@@ -879,35 +879,86 @@ FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
 
   int16x8_t shuffled_data[8];
 
-  constexpr uint16_t kDCMask[8] = {0x0000, 0xFFFF, 0xFFFF, 0xFFFF,
-                                   0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+#define TBL3(tgt, s0, s1, s2, v0, v1, v2, v3, v4, v5, v6, v7)               \
+  {                                                                         \
+    uint8_t indices[16] = {2 * (v0), 2 * (v0) + 1, 2 * (v1), 2 * (v1) + 1,  \
+                           2 * (v2), 2 * (v2) + 1, 2 * (v3), 2 * (v3) + 1,  \
+                           2 * (v4), 2 * (v4) + 1, 2 * (v5), 2 * (v5) + 1,  \
+                           2 * (v6), 2 * (v6) + 1, 2 * (v7), 2 * (v7) + 1}; \
+    int8x16x3_t table = {vreinterpretq_s8_s16(data[s0]),                    \
+                         vreinterpretq_s8_s16(data[s1]),                    \
+                         vreinterpretq_s8_s16(data[s2])};                   \
+    shuffled_data[tgt] =                                                    \
+        vreinterpretq_s16_s8(vqtbl3q_s8(table, vld1q_u8(indices)));         \
+  }
 
-  /*
-    0,  1,  2,  3,  8,  9,  10, 11, 16, 17, 18, 19, 24, 25, 26, 27,
-    4,  5,  6,  7,  12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31,
-    32, 33, 34, 35, 40, 41, 42, 43, 48, 49, 50, 51, 56, 57, 58, 59,
-    36, 37, 38, 39, 44, 45, 46, 47, 52, 53, 54, 55, 60, 61, 62, 63,
+#define TBL4(tgt, s0, s1, s2, s3, v0, v1, v2, v3, v4, v5, v6, v7)           \
+  {                                                                         \
+    uint8_t indices[16] = {2 * (v0), 2 * (v0) + 1, 2 * (v1), 2 * (v1) + 1,  \
+                           2 * (v2), 2 * (v2) + 1, 2 * (v3), 2 * (v3) + 1,  \
+                           2 * (v4), 2 * (v4) + 1, 2 * (v5), 2 * (v5) + 1,  \
+                           2 * (v6), 2 * (v6) + 1, 2 * (v7), 2 * (v7) + 1}; \
+    int8x16x4_t table = {                                                   \
+        vreinterpretq_s8_s16(data[s0]),                                     \
+        vreinterpretq_s8_s16(data[s1]),                                     \
+        vreinterpretq_s8_s16(data[s2]),                                     \
+        vreinterpretq_s8_s16(data[s3]),                                     \
+    };                                                                      \
+    shuffled_data[tgt] =                                                    \
+        vreinterpretq_s16_s8(vqtbl4q_s8(table, vld1q_u8(indices)));         \
+  }
+
+  /* The code below executes this permutation:
+   *   1,  8,  9,  2,  16, 10, 17, 18,
+   *   3,  24, 11, 25, 19, 26, 4,  5,
+   *   32, 12, 33, 27, 20, 34, 28, 13,
+   *   35, 40, 41, 21, 42, 36, 29, 22,
+   *   43, 6,  48, 49, 50, 37, 51, 7,
+   *   14, 44, 30, 56, 15, 45, 57, 31,
+   *   38, 52, 23, 58, 59, 53, 39, 60,
+   *   46, 54, 47, 61, 55, 62, 63, 0,
    */
-  shuffled_data[0] = vreinterpretq_s16_s64(vtrn1q_s64(
-      vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
-  shuffled_data[1] = vreinterpretq_s16_s64(vtrn1q_s64(
-      vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
-  shuffled_data[2] = vreinterpretq_s16_s64(vtrn2q_s64(
-      vreinterpretq_s64_s16(data[0]), vreinterpretq_s64_s16(data[1])));
-  shuffled_data[3] = vreinterpretq_s16_s64(vtrn2q_s64(
-      vreinterpretq_s64_s16(data[2]), vreinterpretq_s64_s16(data[3])));
-  shuffled_data[4] = vreinterpretq_s16_s64(vtrn1q_s64(
-      vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
-  shuffled_data[5] = vreinterpretq_s16_s64(vtrn1q_s64(
-      vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
-  shuffled_data[6] = vreinterpretq_s16_s64(vtrn2q_s64(
-      vreinterpretq_s64_s16(data[4]), vreinterpretq_s64_s16(data[5])));
-  shuffled_data[7] = vreinterpretq_s16_s64(vtrn2q_s64(
-      vreinterpretq_s64_s16(data[6]), vreinterpretq_s64_s16(data[7])));
 
-  uint16x8_t dc_mask = vld1q_u16(kDCMask);
-  shuffled_data[0] =
-      vandq_s16(shuffled_data[0], vreinterpretq_s16_u16(dc_mask));
+  TBL3(0,                          // destination
+       0, 1, 2,                    // source vectors
+       1, 8, 9, 2, 16, 10, 17, 18  // indices in sources
+  );
+
+  TBL4(1,                           // destination
+       0, 1, 2, 3,                  // source vectors
+       3, 24, 11, 25, 19, 26, 4, 5  // indices in sources
+  );
+
+  TBL4(2,                            // destination
+       1, 2, 3, 4,                   // source vectors
+       24, 4, 25, 19, 12, 26, 20, 5  // indices in sources
+  );
+
+  TBL4(3,                            // destination
+       2, 3, 4, 5,                   // source vectors
+       19, 24, 25, 5, 26, 20, 13, 6  // indices in sources
+  );
+
+  TBL4(4,                            // destination
+       0, 4, 5, 6,                   // source vectors
+       19, 6, 24, 25, 26, 13, 27, 7  // indices in sources
+  );
+
+  TBL4(5,                            // destination
+       1, 3, 5, 7,                   // source vectors
+       6, 20, 14, 24, 7, 21, 25, 15  // indices in sources
+  );
+
+  TBL4(6,                            // destination
+       4, 2, 6, 7,                   // source vectors
+       6, 20, 15, 26, 27, 21, 7, 28  // indices in sources
+  );
+
+  TBL3(7,                            // destination
+       5, 6, 7,                      // source vectors
+       6, 14, 7, 21, 15, 22, 23, 32  // indices in sources
+                                     // (32 is out of bounds -> 0)
+  );
 
   uint8_t nnz_vec[8];
   size_t nnz = 0;
@@ -947,18 +998,16 @@ FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
     const uint16_t* maskptr = kMask + maskpos;
 
     if (kPrintSymbols) {
-      const uint16_t* dc_mask = i == 0 ? kDCMask : kMask;
       int16_t buf[8];
       vst1q_s16(buf, shuffled_data[i]);
       for (size_t j = 0; j < 8; j++) {
         int16_t coeff = buf[j];
-        if (maskptr[j] & dc_mask[j]) {
+        if (maskptr[j]) {
           EncodeU32(PackSigned(coeff), ac_code, writer, "AC", c, is_delta);
         }
       }
     } else {
       uint16x8_t mask = vld1q_u16(maskptr);
-      if (i == 0) mask = vandq_u16(mask, dc_mask);
       SIMDStoreValues(shuffled_data[i], mask, ac_code, nbits_s + to_write,
                       bits_s + to_write);
       to_write += 2;
@@ -966,7 +1015,7 @@ FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
     if (nnz == 0) break;
   }
   writer->WriteMultiple(nbits_s, bits_s, to_write);
-}
+}  // namespace
 
 template <bool is_delta, bool store_for_next>
 void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
@@ -1156,37 +1205,34 @@ struct FastMJXLEncoder {
     }
     AllocateEncoded();
 
-    // TODO(veluca): more sensible prefix codes.
+    // TODO(veluca): these prefix codes are for keyframe-only, fairly high
+    // quality. Change them if that changes.
     uint64_t nnz_counts[2][3][16] = {
-        {{177275, 12727, 5051, 763, 29, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-         {3739, 6057, 31475, 129745, 291193, 250743, 70415, 0, 0, 0, 0, 0, 0, 0,
-          0, 0},
-         {137551, 33873, 20637, 3697, 87, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-        {{674817, 57525, 40719, 9813, 491, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-         {6477, 1623, 16315, 157505, 840013, 1598263, 513251, 0, 0, 0, 0, 0, 0,
-          0, 0, 0},
-         {390493, 174537, 150723, 64875, 2737, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        {{1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+         {1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+         {1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+        {{887591, 63131, 24503, 3825, 155, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+         {17841, 29183, 147763, 621125, 1460341, 1289445, 351109, 0, 0, 0, 0, 0,
+          0, 0, 0, 0},
+         {683507, 173191, 104041, 18033, 433, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
           0}}};
     uint64_t ac_counts[2][3][16] = {
-        {{40795, 11277, 15779, 809, 25, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
-         {18534849, 4243219, 5038379, 1550255, 800155, 382091, 121945, 23077,
-          3051, 297, 1, 0, 0, 0, 0, 0},
-         {180205, 48335, 49013, 1291, 79, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0}},
-        {{402585, 82053, 115183, 4409, 327, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
-         {76143553, 20669389, 27737567, 9438691, 4293707, 2278787, 894093,
-          208333, 29863, 3195, 35, 0, 0, 0, 0, 0},
-         {1678387, 358637, 493099, 12599, 555, 11, 1, 1, 1, 1, 1, 0, 0, 0, 0,
-          0}}};
+        {{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+         {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+         {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0}},
+        {{156907, 55689, 77661, 3933, 93, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+         {76296849, 21486399, 25513509, 7815543, 4003927, 1900003, 605055,
+          113681, 15493, 1303, 1, 0, 0, 0, 0, 0},
+         {750597, 243001, 247275, 6303, 365, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0}}};
     uint64_t dc_counts[2][3][16] = {
-        {{109251, 92757, 154085, 155425, 85375, 56825, 59299, 47107, 18847,
-          3951, 449, 0, 0, 0, 0, 0},
-         {98691, 35591, 42591, 14305, 3961, 627, 79, 3, 1, 1, 1, 0, 0, 0, 0, 0},
-         {91527, 41027, 49029, 12497, 1597, 167, 3, 1, 1, 1, 1, 0, 0, 0, 0, 0}},
-        {{345091, 308721, 548475, 669509, 437125, 235159, 222595, 210649,
-          120651, 30423, 4761, 292, 0, 0, 0, 0},
-         {367055, 149617, 182073, 65967, 15929, 2319, 389, 19, 1, 1, 1, 0, 0, 0,
+        {{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+         {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0},
+         {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0}},
+        {{542187, 463353, 770937, 775859, 430501, 284261, 299593, 234783, 93359,
+          19495, 2473, 10, 0, 0, 0, 0},
+         {489681, 179249, 215765, 71837, 19265, 2929, 477, 5, 1, 1, 1, 0, 0, 0,
           0, 0},
-         {312839, 171951, 216303, 74307, 7381, 549, 37, 1, 1, 1, 1, 0, 0, 0, 0,
+         {454039, 206065, 247171, 63245, 7837, 843, 7, 1, 1, 1, 1, 0, 0, 0, 0,
           0}}};
 
     for (size_t j = 0; j < 2; j++) {
