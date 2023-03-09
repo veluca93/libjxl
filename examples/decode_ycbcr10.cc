@@ -106,9 +106,9 @@ YUVP010Video DecodeJpegXlOneShot(const uint8_t* jxl, size_t size) {
             Cr[i] = 0.5 * r - 0.418688 * g - 0.081312 * b;
           }
           float Cb420 =
-              (Cb[0] + Cb[1] + Cb[2] + Cb[3]) * 0.25 + (128.0 / 255.0);
+              (Cb[0] + Cb[1] + Cb[2] + Cb[3]) * 0.25 + (1024.0 / 2047.0);
           float Cr420 =
-              (Cr[0] + Cr[1] + Cr[2] + Cr[3]) * 0.25 + (128.0 / 255.0);
+              (Cr[0] + Cr[1] + Cr[2] + Cr[3]) * 0.25 + (1024.0 / 2047.0);
           for (size_t i = 0; i < 4; i++) {
             size_t yy = y + (i % 2);
             size_t xx = x + (i / 2);

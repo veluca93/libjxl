@@ -756,7 +756,8 @@ constexpr static int16_t kQuantMatrix[3][64] = {
 
 constexpr size_t kInputShift = 2;
 constexpr size_t kQuantizeShift = 6 - kInputShift;
-constexpr size_t kChannelCenterOffset = (1 << (16 - kInputShift)) * 128 / 255;
+constexpr size_t kYZeroOffset = (1 << (16 - kInputShift)) * 128 / 255;
+constexpr size_t kChromaZeroOffset = 0x8000 >> kInputShift;
 
 FJXL_INLINE void scale_inputs(int16x8_t data[8]) {
   for (size_t i = 0; i < 8; i++) {
@@ -850,12 +851,13 @@ FJXL_INLINE void SIMDStoreValues(int16x8_t coeffs, uint16x8_t mask,
 }
 
 template <bool is_delta, bool store_for_next>
-FJXL_INLINE void ProcessBlock(int16x8_t data[8], int16_t* storage) {
+FJXL_INLINE void ProcessBlock(int16x8_t data[8], int16_t* storage,
+                              int16_t dc_offset) {
   scale_inputs(data);
   dct8(data);
   transpose8(data);
   dct8(data);
-  data[0][0] -= kChannelCenterOffset;
+  data[0][0] -= dc_offset;
   for (size_t i = 0; i < 8; i++) {
     if (is_delta) {
       int16x8_t prev = vld1q_s16(storage + i * 8);
@@ -1039,10 +1041,12 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
       }
 
       int16_t* yblock_ptr = prev_ydct + block_idx * 64;
-      ProcessBlock<is_delta, store_for_next>(y_data, yblock_ptr);
+      ProcessBlock<is_delta, store_for_next>(y_data, yblock_ptr, kYZeroOffset);
 
-      // Adjust Y channel.
-      yblock_ptr[0] += kChannelCenterOffset;
+      if (store_for_next) {
+        // Adjust Y channel.
+        yblock_ptr[0] += kYZeroOffset;
+      }
 
       QuantizeAndStore<is_delta, store_for_next>(
           y_data, dc_y + block_idx, 1, nnz_codes[1], ac_codes[1], writer);
@@ -1058,12 +1062,12 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
           cb_data[i] = v.val[0];
           cr_data[i] = v.val[1];
         }
-        ProcessBlock<is_delta, store_for_next>(cb_data,
-                                               prev_cbdct + cblock_idx * 64);
+        ProcessBlock<is_delta, store_for_next>(
+            cb_data, prev_cbdct + cblock_idx * 64, kChromaZeroOffset);
         QuantizeAndStore<is_delta, store_for_next>(
             cb_data, dc_cb + cblock_idx, 0, nnz_codes[0], ac_codes[0], writer);
-        ProcessBlock<is_delta, store_for_next>(cr_data,
-                                               prev_crdct + cblock_idx * 64);
+        ProcessBlock<is_delta, store_for_next>(
+            cr_data, prev_crdct + cblock_idx * 64, kChromaZeroOffset);
         QuantizeAndStore<is_delta, store_for_next>(
             cr_data, dc_cr + cblock_idx, 2, nnz_codes[2], ac_codes[2], writer);
       }
