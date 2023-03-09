@@ -14,6 +14,7 @@ enum QuantizationType {
   DEFAULT,   // Roughly equivalent to JPEG Q93
   DEADZONE,  // Same as DEFAULT, but also uses a mild deadzone quantizer.
              // About 10% smaller file size.
+  LOWER_AC_QUALITY,  // About 25% smaller file size than DEADZONE.
 };
 
 // TODO(veluca): thread functions.
