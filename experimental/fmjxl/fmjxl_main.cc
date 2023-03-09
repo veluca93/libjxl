@@ -116,7 +116,7 @@ struct SimpleThreadPool {
 int main(int argc, char** argv) {
   if (argc < 7) {
     fprintf(stderr,
-            "Usage: %s out.jxl w h num_reps num_threads f1_ycbcr10.bin "
+            "Usage: %s out.jxl w h num_reps num_threads qtype f1_ycbcr10.bin "
             "[f2_ycbcr10.bin [...]] \n",
             argv[0]);
     return 1;
@@ -128,6 +128,7 @@ int main(int argc, char** argv) {
   assert(w > 256 || h > 256);
   size_t num_reps = atoi(argv[4]);
   size_t num_threads = atoi(argv[5]);
+  QuantizationType qtype = (QuantizationType)atoi(argv[6]);
   assert(num_threads > 0);
 
   SimpleThreadPool thread_pool(num_threads);
@@ -136,8 +137,8 @@ int main(int argc, char** argv) {
 
   std::vector<std::vector<uint8_t>> input_data;
 
-  for (size_t f = 0; f + 6 < (size_t)argc; f++) {
-    FILE* in = fopen(argv[6 + f], "r");
+  for (size_t f = 0; f + 7 < (size_t)argc; f++) {
+    FILE* in = fopen(argv[7 + f], "r");
     assert(in);
     fseek(in, 0, SEEK_END);
     ssize_t size = ftell(in);
@@ -163,7 +164,7 @@ int main(int argc, char** argv) {
         &thread_pool);
     for (size_t i = 0; i < input_data.size(); i++) {
       FastMJXLAddYCbCrP010Frame(input_data[i].data(),
-                                input_data[i].data() + 2 * w * h,
+                                input_data[i].data() + 2 * w * h, qtype,
                                 i + 1 == input_data.size(), encoder);
       size_t chunk_size = FastMJXLGetOutputBufferSize(encoder);
       std::unique_ptr<uint8_t[], decltype(&free)> chunk{

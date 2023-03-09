@@ -10,6 +10,10 @@ extern "C" {
 
 struct FastMJXLEncoder;
 
+enum QuantizationType {
+  DEFAULT,  // Roughly equivalent to JPEG Q93
+};
+
 // TODO(veluca): thread functions.
 // width and height must be multiples of 16 and at least 256.
 struct FastMJXLEncoder* FastMJXLCreateEncoder(
@@ -22,7 +26,8 @@ struct FastMJXLEncoder* FastMJXLCreateEncoder(
 // its current contents.
 // It is invalid to call this function after a call with `is_last = 1`.
 void FastMJXLAddYCbCrP010Frame(const uint8_t* y_plane, const uint8_t* uv_plane,
-                               int is_last, struct FastMJXLEncoder* encoder);
+                               QuantizationType quantization_type, int is_last,
+                               struct FastMJXLEncoder* encoder);
 
 const uint8_t* FastMJXLGetOutputBuffer(const struct FastMJXLEncoder* encoder);
 uint8_t* FastMJXLReleaseOutputBuffer(struct FastMJXLEncoder* encoder);

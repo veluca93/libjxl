@@ -3,6 +3,7 @@
 #include <arm_neon.h>
 #include <assert.h>
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -14,6 +15,95 @@
 #include <vector>
 
 namespace {
+
+constexpr size_t kInputShift = 2;
+constexpr size_t kQuantizeShift = 6 - kInputShift;
+
+struct QuantTable {
+  using QM = std::array<std::array<int16_t, 64>, 3>;
+  constexpr static size_t kNumBands = 3;
+  uint16_t dc_quants[3];
+  uint16_t ac_quants[3][kNumBands];
+  uint16_t deadzones[3][2][8];
+  QM quant_matrix;
+
+  void FillDeadzones(uint16_t dzcb, uint16_t dzy, uint16_t dzcr) {
+    for (size_t i = 0; i < 8; i++) {
+      deadzones[0][0][i] = deadzones[0][1][i] = dzcb;
+      deadzones[1][0][i] = deadzones[1][1][i] = dzy;
+      deadzones[2][0][i] = deadzones[2][1][i] = dzcr;
+    }
+    deadzones[0][0][0] = deadzones[1][0][0] = deadzones[2][0][0] = 0;
+  }
+
+  static QuantTable Default() {
+    QuantTable ret;
+
+    // Encoding of the table
+    ret.dc_quants[0] = 0x3606;
+    ret.dc_quants[1] = 0x3206;
+    ret.dc_quants[2] = 0x3606;
+
+    ret.ac_quants[0][0] = 0x4F86;
+    ret.ac_quants[0][1] = 0xBC00;
+    ret.ac_quants[0][2] = 0xC500;
+
+    ret.ac_quants[1][0] = 0x5700;
+    ret.ac_quants[1][1] = 0xB400;
+    ret.ac_quants[1][2] = 0xBC00;
+
+    ret.ac_quants[2][0] = 0x540D;
+    ret.ac_quants[2][1] = 0xBE00;
+    ret.ac_quants[2][2] = 0xC200;
+
+    ret.FillDeadzones((1 << kQuantizeShift) / 2, (1 << kQuantizeShift) / 2,
+                      (1 << kQuantizeShift) / 2);
+
+    // encoder-side values to multiply by.
+    ret.quant_matrix = QM{
+        {{
+             0x3fc0, 0x139f, 0x110f, 0x0ed4, 0x0ce4, 0x0b15, 0x07b7, 0x055f,  //
+             0x139f, 0x1284, 0x1081, 0x0e7f, 0x0cac, 0x0ab1, 0x077d, 0x053c,  //
+             0x110f, 0x1081, 0x0f30, 0x0d9f, 0x0c11, 0x09a4, 0x06dc, 0x04db,  //
+             0x0ed4, 0x0e7f, 0x0d9f, 0x0c76, 0x0b15, 0x0834, 0x05f9, 0x044d,  //
+             0x0ce4, 0x0cac, 0x0c11, 0x0b15, 0x08bd, 0x06ab, 0x04fa, 0x03a8,  //
+             0x0b15, 0x0ab1, 0x09a4, 0x0834, 0x06ab, 0x053c, 0x0402, 0x0302,  //
+             0x07b7, 0x077d, 0x06dc, 0x05f9, 0x04fa, 0x0402, 0x0323, 0x0268,  //
+             0x055f, 0x053c, 0x04db, 0x044d, 0x03a8, 0x0302, 0x0268, 0x01e2,  //
+         },
+         {
+             0x7f80, 0x504c, 0x4cc2, 0x4960, 0x4624, 0x42bb, 0x3a02, 0x326e,  //
+             0x504c, 0x4ed0, 0x4bf2, 0x48d7, 0x45c0, 0x41cf, 0x3957, 0x31ee,  //
+             0x4cc2, 0x4bf2, 0x49f2, 0x4766, 0x44aa, 0x3f3a, 0x376e, 0x307d,  //
+             0x4960, 0x48d7, 0x4766, 0x4560, 0x42bb, 0x3b66, 0x3488, 0x2e43,  //
+             0x4624, 0x45c0, 0x44aa, 0x42bb, 0x3cdd, 0x36d3, 0x30f6, 0x2b75,  //
+             0x42bb, 0x41cf, 0x3f3a, 0x3b66, 0x36d3, 0x31ee, 0x2d05, 0x284b,  //
+             0x3a02, 0x3957, 0x376e, 0x3488, 0x30f6, 0x2d05, 0x28f5, 0x24f5,  //
+             0x326e, 0x31ee, 0x307d, 0x2e43, 0x2b75, 0x284b, 0x24f5, 0x219a,  //
+         },
+         {
+             0x3fc0, 0x2865, 0x2191, 0x1be5, 0x172e, 0x132c, 0x0e7d, 0x0af3,  //
+             0x2865, 0x256a, 0x2022, 0x1b12, 0x16a9, 0x12a6, 0x0e28, 0x0abc,  //
+             0x2191, 0x2022, 0x1ccc, 0x18f0, 0x153e, 0x1136, 0x0d3b, 0x0a20,  //
+             0x1be5, 0x1b12, 0x18f0, 0x162a, 0x132c, 0x0f31, 0x0be2, 0x0937,  //
+             0x172e, 0x16a9, 0x153e, 0x132c, 0x0ff3, 0x0cf1, 0x0a52, 0x0822,  //
+             0x132c, 0x12a6, 0x1136, 0x0f31, 0x0cf1, 0x0abc, 0x08ba, 0x06fe,  //
+             0x0e7d, 0x0e28, 0x0d3b, 0x0be2, 0x0a52, 0x08ba, 0x0739, 0x05e1,  //
+             0x0af3, 0x0abc, 0x0a20, 0x0937, 0x0822, 0x06fe, 0x05e1, 0x04dc,  //
+         }}};
+    return ret;
+  }
+
+  static QuantTable FromType(QuantizationType type) {
+    switch (type) {
+      case DEFAULT:
+        return Default();
+      default:
+        assert(!!!"Invalid qtype");
+    }
+  }
+};
+
 #if defined(_MSC_VER) && !defined(__clang__)
 #define FJXL_INLINE __forceinline
 FJXL_INLINE uint32_t FloorLog2(uint32_t v) {
@@ -401,12 +491,13 @@ struct PrefixCodeData {
 };
 
 void StoreDCGlobal(BitWriter* writer, bool is_delta,
-                   const PrefixCodeData& prefix_codes) {
+                   const PrefixCodeData& prefix_codes,
+                   const QuantTable& qtable) {
   // DC quant weights.
   writer->Write(1, 0);
-  writer->Write(16, 0x3606);  // 1 as f16
-  writer->Write(16, 0x3206);  // 0.5 as f16
-  writer->Write(16, 0x3606);  // 1 as f16
+  writer->Write(16, qtable.dc_quants[0]);
+  writer->Write(16, qtable.dc_quants[1]);
+  writer->Write(16, qtable.dc_quants[2]);
 
   // Quantizer.
   writer->Write(2, 0b10);   // 4097 +
@@ -489,27 +580,26 @@ void StoreDCGlobal(BitWriter* writer, bool is_delta,
 }
 
 void StoreACGlobal(BitWriter* writer, size_t num_groups, bool is_delta,
-                   const PrefixCodeData& prefix_codes) {
+                   const PrefixCodeData& prefix_codes,
+                   const QuantTable& qtable) {
   // Quant tables.
   writer->Write(1, 0);
   // Non-default DCT8 table.
   writer->Write(3, 6);
-  writer->Write(4, 2);  // 3 distance bands.
-
-  // TODO(veluca): these tables likely still need some tweaking.
+  writer->Write(4, QuantTable::kNumBands - 1);
 
   // cb
-  writer->Write(16, 0x4F86);
-  writer->Write(16, 0xBC00);
-  writer->Write(16, 0xC500);
+  writer->Write(16, qtable.ac_quants[0][0]);
+  writer->Write(16, qtable.ac_quants[0][1]);
+  writer->Write(16, qtable.ac_quants[0][2]);
   // Y
-  writer->Write(16, 0x5700);
-  writer->Write(16, 0xB400);
-  writer->Write(16, 0xBC00);
+  writer->Write(16, qtable.ac_quants[1][0]);
+  writer->Write(16, qtable.ac_quants[1][1]);
+  writer->Write(16, qtable.ac_quants[1][2]);
   // cr
-  writer->Write(16, 0x540D);
-  writer->Write(16, 0xBE00);
-  writer->Write(16, 0xC200);
+  writer->Write(16, qtable.ac_quants[2][0]);
+  writer->Write(16, qtable.ac_quants[2][1]);
+  writer->Write(16, qtable.ac_quants[2][2]);
 
   // Default for all the other tables.
   for (size_t i = 0; i < 16; i++) {
@@ -675,41 +765,6 @@ FJXL_INLINE void transpose8(int16x8_t data[8]) {
   data[7] = vreinterpretq_s16_s64(v7);
 }
 
-// TODO(veluca): adjust.
-constexpr static int16_t kQuantMatrix[3][64] = {
-    {
-        0x3fc0, 0x139f, 0x110f, 0x0ed4, 0x0ce4, 0x0b15, 0x07b7, 0x055f,  //
-        0x139f, 0x1284, 0x1081, 0x0e7f, 0x0cac, 0x0ab1, 0x077d, 0x053c,  //
-        0x110f, 0x1081, 0x0f30, 0x0d9f, 0x0c11, 0x09a4, 0x06dc, 0x04db,  //
-        0x0ed4, 0x0e7f, 0x0d9f, 0x0c76, 0x0b15, 0x0834, 0x05f9, 0x044d,  //
-        0x0ce4, 0x0cac, 0x0c11, 0x0b15, 0x08bd, 0x06ab, 0x04fa, 0x03a8,  //
-        0x0b15, 0x0ab1, 0x09a4, 0x0834, 0x06ab, 0x053c, 0x0402, 0x0302,  //
-        0x07b7, 0x077d, 0x06dc, 0x05f9, 0x04fa, 0x0402, 0x0323, 0x0268,  //
-        0x055f, 0x053c, 0x04db, 0x044d, 0x03a8, 0x0302, 0x0268, 0x01e2,  //
-    },
-    {
-        0x7f80, 0x504c, 0x4cc2, 0x4960, 0x4624, 0x42bb, 0x3a02, 0x326e,  //
-        0x504c, 0x4ed0, 0x4bf2, 0x48d7, 0x45c0, 0x41cf, 0x3957, 0x31ee,  //
-        0x4cc2, 0x4bf2, 0x49f2, 0x4766, 0x44aa, 0x3f3a, 0x376e, 0x307d,  //
-        0x4960, 0x48d7, 0x4766, 0x4560, 0x42bb, 0x3b66, 0x3488, 0x2e43,  //
-        0x4624, 0x45c0, 0x44aa, 0x42bb, 0x3cdd, 0x36d3, 0x30f6, 0x2b75,  //
-        0x42bb, 0x41cf, 0x3f3a, 0x3b66, 0x36d3, 0x31ee, 0x2d05, 0x284b,  //
-        0x3a02, 0x3957, 0x376e, 0x3488, 0x30f6, 0x2d05, 0x28f5, 0x24f5,  //
-        0x326e, 0x31ee, 0x307d, 0x2e43, 0x2b75, 0x284b, 0x24f5, 0x219a,  //
-    },
-    {
-        0x3fc0, 0x2865, 0x2191, 0x1be5, 0x172e, 0x132c, 0x0e7d, 0x0af3,  //
-        0x2865, 0x256a, 0x2022, 0x1b12, 0x16a9, 0x12a6, 0x0e28, 0x0abc,  //
-        0x2191, 0x2022, 0x1ccc, 0x18f0, 0x153e, 0x1136, 0x0d3b, 0x0a20,  //
-        0x1be5, 0x1b12, 0x18f0, 0x162a, 0x132c, 0x0f31, 0x0be2, 0x0937,  //
-        0x172e, 0x16a9, 0x153e, 0x132c, 0x0ff3, 0x0cf1, 0x0a52, 0x0822,  //
-        0x132c, 0x12a6, 0x1136, 0x0f31, 0x0cf1, 0x0abc, 0x08ba, 0x06fe,  //
-        0x0e7d, 0x0e28, 0x0d3b, 0x0be2, 0x0a52, 0x08ba, 0x0739, 0x05e1,  //
-        0x0af3, 0x0abc, 0x0a20, 0x0937, 0x0822, 0x06fe, 0x05e1, 0x04dc,  //
-    }};
-
-constexpr size_t kInputShift = 2;
-constexpr size_t kQuantizeShift = 6 - kInputShift;
 constexpr size_t kYZeroOffset = (1 << (16 - kInputShift)) * 128 / 255;
 constexpr size_t kChromaZeroOffset = 0x8000 >> kInputShift;
 
@@ -722,10 +777,15 @@ FJXL_INLINE void scale_inputs(int16x8_t data[8]) {
   }
 }
 
-FJXL_INLINE void quantize(int16x8_t data[8], int c) {
+FJXL_INLINE void quantize(int16x8_t data[8], const int16_t* qtable,
+                          const uint16_t* deadzones) {
   for (size_t i = 0; i < 8; i++) {
-    int16x8_t q = vld1q_s16(&kQuantMatrix[c][i * 8]);
-    data[i] = vrshrq_n_s16(vqrdmulhq_s16(q, data[i]), kQuantizeShift);
+    int16x8_t q = vld1q_s16(qtable + i * 8);
+    uint16x8_t dz = vld1q_u16(deadzones + (i ? 8 : 0));
+    int16x8_t scaled = vqrdmulhq_s16(q, data[i]);
+    int16x8_t dzmask = vreinterpretq_s16_u16(
+        vcgeq_u16(vreinterpretq_u16_s16(vabsq_s16(scaled)), dz));
+    data[i] = vandq_s16(vrshrq_n_s16(scaled, kQuantizeShift), dzmask);
   }
 }
 
@@ -827,10 +887,11 @@ FJXL_INLINE void ProcessBlock(int16x8_t data[8], int16_t* storage,
 
 template <bool is_delta, bool store_for_next>
 FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
+                                  const QuantTable& qtable,
                                   const PrefixCode& nnz_code,
                                   const PrefixCode& ac_code,
                                   BitWriter* writer) {
-  quantize(data, c);
+  quantize(data, qtable.quant_matrix[c].data(), &qtable.deadzones[c][0][0]);
   *dc_ptr = data[0][0];
 
   int16x8_t shuffled_data[8];
@@ -975,10 +1036,10 @@ FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
 
 template <bool is_delta, bool store_for_next>
 void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
-                  size_t w, const uint8_t* y_plane, const uint8_t* uv_plane,
-                  size_t x0, size_t xs, size_t y0, size_t ys, int16_t* dc_y,
-                  int16_t* prev_ydct, int16_t* dc_cb, int16_t* prev_cbdct,
-                  int16_t* dc_cr, int16_t* prev_crdct) {
+                  const QuantTable& qtable, size_t w, const uint8_t* y_plane,
+                  const uint8_t* uv_plane, size_t x0, size_t xs, size_t y0,
+                  size_t ys, int16_t* dc_y, int16_t* prev_ydct, int16_t* dc_cb,
+                  int16_t* prev_cbdct, int16_t* dc_cr, int16_t* prev_crdct) {
   const PrefixCode* nnz_codes = &prefix_codes.nnz_codes[is_delta ? 0 : 1][0];
   const PrefixCode* ac_codes = &prefix_codes.ac_codes[is_delta ? 0 : 1][0];
 
@@ -1002,8 +1063,9 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
         yblock_ptr[0] += kYZeroOffset;
       }
 
-      QuantizeAndStore<is_delta, store_for_next>(
-          y_data, dc_y + block_idx, 1, nnz_codes[1], ac_codes[1], writer);
+      QuantizeAndStore<is_delta, store_for_next>(y_data, dc_y + block_idx, 1,
+                                                 qtable, nnz_codes[1],
+                                                 ac_codes[1], writer);
 
       if (ix % 16 == 0 && iy % 16 == 0) {
         size_t cblock_idx = by / 2 * w / 16 + bx / 2;
@@ -1018,12 +1080,14 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
         }
         ProcessBlock<is_delta, store_for_next>(
             cb_data, prev_cbdct + cblock_idx * 64, kChromaZeroOffset);
-        QuantizeAndStore<is_delta, store_for_next>(
-            cb_data, dc_cb + cblock_idx, 0, nnz_codes[0], ac_codes[0], writer);
+        QuantizeAndStore<is_delta, store_for_next>(cb_data, dc_cb + cblock_idx,
+                                                   0, qtable, nnz_codes[0],
+                                                   ac_codes[0], writer);
         ProcessBlock<is_delta, store_for_next>(
             cr_data, prev_crdct + cblock_idx * 64, kChromaZeroOffset);
-        QuantizeAndStore<is_delta, store_for_next>(
-            cr_data, dc_cr + cblock_idx, 2, nnz_codes[2], ac_codes[2], writer);
+        QuantizeAndStore<is_delta, store_for_next>(cr_data, dc_cr + cblock_idx,
+                                                   2, qtable, nnz_codes[2],
+                                                   ac_codes[2], writer);
       }
     }
   }
@@ -1031,19 +1095,19 @@ void StoreACGroup(BitWriter* writer, const PrefixCodeData& prefix_codes,
 
 template <bool is_delta>
 void StoreACGroup(bool store_for_next, BitWriter* writer,
-                  const PrefixCodeData& prefix_codes, size_t w,
-                  const uint8_t* y_plane, const uint8_t* uv_plane, size_t x0,
-                  size_t xs, size_t y0, size_t ys, int16_t* dc_y,
+                  const PrefixCodeData& prefix_codes, const QuantTable& qtable,
+                  size_t w, const uint8_t* y_plane, const uint8_t* uv_plane,
+                  size_t x0, size_t xs, size_t y0, size_t ys, int16_t* dc_y,
                   int16_t* prev_ydct, int16_t* dc_cb, int16_t* prev_cbdct,
                   int16_t* dc_cr, int16_t* prev_crdct) {
   if (store_for_next) {
-    StoreACGroup<is_delta, true>(writer, prefix_codes, w, y_plane, uv_plane, x0,
-                                 xs, y0, ys, dc_y, prev_ydct, dc_cb, prev_cbdct,
-                                 dc_cr, prev_crdct);
+    StoreACGroup<is_delta, true>(writer, prefix_codes, qtable, w, y_plane,
+                                 uv_plane, x0, xs, y0, ys, dc_y, prev_ydct,
+                                 dc_cb, prev_cbdct, dc_cr, prev_crdct);
   } else {
-    StoreACGroup<is_delta, false>(writer, prefix_codes, w, y_plane, uv_plane,
-                                  x0, xs, y0, ys, dc_y, prev_ydct, dc_cb,
-                                  prev_cbdct, dc_cr, prev_crdct);
+    StoreACGroup<is_delta, false>(writer, prefix_codes, qtable, w, y_plane,
+                                  uv_plane, x0, xs, y0, ys, dc_y, prev_ydct,
+                                  dc_cb, prev_cbdct, dc_cr, prev_crdct);
   }
 }
 
@@ -1205,7 +1269,7 @@ struct FastMJXLEncoder {
   void AllocateEncoded() { encoded.Allocate(w * h * 32 + 1024); }
 
   void AddYCbCrP010Frame(const uint8_t* y_plane, const uint8_t* uv_plane,
-                         bool is_last) {
+                         QuantizationType quantization_type, bool is_last) {
     for (size_t i = 0; i < group_data.size(); i++) {
       group_data[i].Rewind();
     }
@@ -1221,10 +1285,12 @@ struct FastMJXLEncoder {
     bool store_for_next =
         !is_last && (frame_count % kKeyFrameGap != kKeyFrameGap - 1);
 
-    StoreDCGlobal(group_data.data(), is_delta, prefix_codes);
+    QuantTable qtable = QuantTable::FromType(quantization_type);
+
+    StoreDCGlobal(group_data.data(), is_delta, prefix_codes, qtable);
     size_t acg_off = 2 + num_dc_groups_x * num_dc_groups_y;
     StoreACGlobal(group_data.data() + acg_off - 1, num_groups_x * num_groups_y,
-                  is_delta, prefix_codes);
+                  is_delta, prefix_codes, qtable);
 
     auto process_one_ac = [&](size_t i) {
       size_t ix = i % num_groups_x;
@@ -1235,13 +1301,13 @@ struct FastMJXLEncoder {
       size_t ys = std::min(h, y0 + 256) - y0;
       if (is_delta) {
         StoreACGroup<true>(store_for_next, group_data.data() + acg_off + i,
-                           prefix_codes, w, y_plane, uv_plane, x0, xs, y0, ys,
-                           dc_y.get(), prev_ydct.get(), dc_cb.get(),
+                           prefix_codes, qtable, w, y_plane, uv_plane, x0, xs,
+                           y0, ys, dc_y.get(), prev_ydct.get(), dc_cb.get(),
                            prev_cbdct.get(), dc_cr.get(), prev_crdct.get());
       } else {
         StoreACGroup<false>(store_for_next, group_data.data() + acg_off + i,
-                            prefix_codes, w, y_plane, uv_plane, x0, xs, y0, ys,
-                            dc_y.get(), prev_ydct.get(), dc_cb.get(),
+                            prefix_codes, qtable, w, y_plane, uv_plane, x0, xs,
+                            y0, ys, dc_y.get(), prev_ydct.get(), dc_cb.get(),
                             prev_cbdct.get(), dc_cr.get(), prev_crdct.get());
       }
     };
@@ -1393,8 +1459,9 @@ struct FastMJXLEncoder* FastMJXLCreateEncoder(
 // buffer!
 // It is invalid to call this function after a call with `is_last = 1`.
 void FastMJXLAddYCbCrP010Frame(const uint8_t* y_plane, const uint8_t* uv_plane,
-                               int is_last, struct FastMJXLEncoder* encoder) {
-  encoder->AddYCbCrP010Frame(y_plane, uv_plane, is_last);
+                               QuantizationType quantization_type, int is_last,
+                               struct FastMJXLEncoder* encoder) {
+  encoder->AddYCbCrP010Frame(y_plane, uv_plane, quantization_type, is_last);
 }
 
 const uint8_t* FastMJXLGetOutputBuffer(const struct FastMJXLEncoder* encoder) {
