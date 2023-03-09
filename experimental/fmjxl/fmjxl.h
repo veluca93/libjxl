@@ -11,7 +11,9 @@ extern "C" {
 struct FastMJXLEncoder;
 
 enum QuantizationType {
-  DEFAULT,  // Roughly equivalent to JPEG Q93
+  DEFAULT,   // Roughly equivalent to JPEG Q93
+  DEADZONE,  // Same as DEFAULT, but also uses a mild deadzone quantizer.
+             // About 10% smaller file size.
 };
 
 // TODO(veluca): thread functions.

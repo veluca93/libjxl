@@ -94,10 +94,20 @@ struct QuantTable {
     return ret;
   }
 
+  static QuantTable Deadzone() {
+    QuantTable ret = Default();
+    ret.FillDeadzones((1 << kQuantizeShift) * 2 / 3,
+                      (1 << kQuantizeShift) * 2 / 3,
+                      (1 << kQuantizeShift) * 2 / 3);
+    return ret;
+  }
+
   static QuantTable FromType(QuantizationType type) {
     switch (type) {
       case DEFAULT:
         return Default();
+      case DEADZONE:
+        return Deadzone();
       default:
         assert(!!!"Invalid qtype");
     }
