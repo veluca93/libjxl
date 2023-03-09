@@ -177,10 +177,22 @@ void AddImageHeader(BitWriter* output, size_t w, size_t h) {
   output->ZeroPadToByte();
 }
 
+FJXL_INLINE void EncodeHybridUint000(uint32_t value, uint32_t* token,
+                                     uint32_t* nbits, uint32_t* bits) {
+  uint32_t n = FloorLog2(value);
+  *token = value ? n + 1 : 0;
+  *nbits = value ? n : 0;
+  *bits = value ? value - (1 << n) : 0;
+}
+
 struct PrefixCode {
   constexpr static size_t kNumSymbols = 16;
   uint8_t nbits[kNumSymbols] = {};
   uint8_t bits[kNumSymbols] = {};
+
+  constexpr static size_t kTokRawCacheSize = 64;
+  uint32_t tokraw_nbits[kTokRawCacheSize];
+  uint32_t tokraw_bits[kTokRawCacheSize];
 
   static uint16_t BitReverse(size_t nbits, uint16_t bits) {
     constexpr uint16_t kNibbleLookup[16] = {
@@ -333,6 +345,13 @@ struct PrefixCode {
 
     ComputeCodeLengths(counts, num, kMinLength, kMaxLength, nbits);
     ComputeCanonicalCode(nbits, bits, num);
+
+    for (size_t i = 0; i < kTokRawCacheSize; i++) {
+      uint32_t token, n, b;
+      EncodeHybridUint000(i, &token, &n, &b);
+      tokraw_bits[i] = bits[token] | (b << nbits[token]);
+      tokraw_nbits[i] = nbits[token] + n;
+    }
   }
 
   void WriteTo(BitWriter* writer) const {
@@ -759,13 +778,6 @@ FJXL_INLINE constexpr uint32_t PackSigned(int32_t value) {
   return (static_cast<uint32_t>(value) << 1) ^
          ((static_cast<uint32_t>(~value) >> 31) - 1);
 }
-FJXL_INLINE void EncodeHybridUint000(uint32_t value, uint32_t* token,
-                                     uint32_t* nbits, uint32_t* bits) {
-  uint32_t n = FloorLog2(value);
-  *token = value ? n + 1 : 0;
-  *nbits = value ? n : 0;
-  *bits = value ? value - (1 << n) : 0;
-}
 
 static constexpr bool kPrintSymbols = false;
 
@@ -905,7 +917,11 @@ FJXL_INLINE void QuantizeAndStore(int16x8_t data[8], int16_t* dc_ptr, size_t c,
     nnz += nnz_vec[i];
   }
 
-  EncodeU32(nnz, nnz_code, writer, "NNZ", c, is_delta);
+  if (kPrintSymbols) {
+    EncodeU32(nnz, nnz_code, writer, "NNZ", c, is_delta);
+  } else {
+    writer->Write(nnz_code.tokraw_nbits[nnz], nnz_code.tokraw_bits[nnz]);
+  }
 
   constexpr uint16_t kNumGreaterLanes[8] = {7, 6, 5, 4, 3, 2, 1, 0};
 
