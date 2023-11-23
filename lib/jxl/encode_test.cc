@@ -25,6 +25,7 @@
 #include "lib/extras/dec/jxl.h"
 #include "lib/extras/metrics.h"
 #include "lib/extras/packed_image.h"
+#include "lib/jxl/base/c_callback_support.h"
 #include "lib/jxl/cms/jxl_cms.h"
 #include "lib/jxl/common.h"  // JXL_HIGH_PRECISION
 #include "lib/jxl/encode_internal.h"
@@ -1544,25 +1545,17 @@ class JxlStreamingAdapter {
       : return_large_buffers_(return_large_buffers) {
     struct JxlEncoderOutputProcessor output_processor;
     output_processor.opaque = this;
-    output_processor.get_buffer = [](void* opaque, size_t* size) {
-      return static_cast<JxlStreamingAdapter*>(opaque)->GetBuffer(size);
-    };
+    output_processor.get_buffer =
+        METHOD_TO_C_CALLBACK(&JxlStreamingAdapter::GetBuffer);
     if (can_seek) {
-      output_processor.seek = [](void* opaque, uint64_t position) {
-        return static_cast<JxlStreamingAdapter*>(opaque)->Seek(position);
-      };
+      output_processor.seek = METHOD_TO_C_CALLBACK(&JxlStreamingAdapter::Seek);
     } else {
       output_processor.seek = nullptr;
     }
-    output_processor.set_finalized_position = [](void* opaque,
-                                                 uint64_t finalized_position) {
-      return static_cast<JxlStreamingAdapter*>(opaque)->SetFinalizedPosition(
-          finalized_position);
-    };
-    output_processor.release_buffer = [](void* opaque, size_t written_bytes) {
-      return static_cast<JxlStreamingAdapter*>(opaque)->ReleaseBuffer(
-          written_bytes);
-    };
+    output_processor.set_finalized_position =
+        METHOD_TO_C_CALLBACK(&JxlStreamingAdapter::SetFinalizedPosition);
+    output_processor.release_buffer =
+        METHOD_TO_C_CALLBACK(&JxlStreamingAdapter::ReleaseBuffer);
     EXPECT_EQ(JxlEncoderSetOutputProcessor(encoder, output_processor),
               JXL_ENC_SUCCESS);
   }
@@ -1612,63 +1605,53 @@ class JxlStreamingAdapter {
   bool return_large_buffers_;
 };
 
+
 class JxlChunkedFrameInputSourceAdapter {
  private:
-  static const void* GetDataAt(const jxl::extras::PackedImage& image,
+  static const void* GetDataAt(const jxl::extras::PackedPixelFile& ppf,
                                size_t xpos, size_t ypos, size_t* row_offset) {
-    JxlDataType data_type = image.format.data_type;
-    size_t num_channels = image.format.num_channels;
+    JxlDataType data_type = ppf.frames[0].color.format.data_type;
+    size_t num_channels = ppf.frames[0].color.format.num_channels;
     size_t bytes_per_pixel =
         num_channels * jxl::extras::PackedImage::BitsPerChannel(data_type) / 8;
-    *row_offset = image.stride;
-    return static_cast<uint8_t*>(image.pixels()) + bytes_per_pixel * xpos +
-           ypos * image.stride;
+    *row_offset = ppf.frames[0].color.stride;
+    return static_cast<uint8_t*>(ppf.frames[0].color.pixels()) +
+           bytes_per_pixel * xpos + ypos * ppf.frames[0].color.stride;
   }
 
  public:
   // Constructor to wrap the image data or any other state
   explicit JxlChunkedFrameInputSourceAdapter(
-      jxl::extras::PackedImage color_channel,
-      jxl::extras::PackedImage extra_channel)
+      jxl::extras::PackedPixelFile color_channel,
+      jxl::extras::PackedPixelFile extra_channel)
       : colorchannel_(std::move(color_channel)),
         extra_channel_(std::move(extra_channel)) {}
 
-  static void GetColorChannelsPixelFormat(void* opaque,
-                                          JxlPixelFormat* pixel_format) {
-    JxlChunkedFrameInputSourceAdapter* self =
-        static_cast<JxlChunkedFrameInputSourceAdapter*>(opaque);
-    *pixel_format = self->colorchannel_.format;
+  void GetColorChannelsPixelFormat(JxlPixelFormat* pixel_format) {
+    *pixel_format = colorchannel_.frames[0].color.format;
   }
 
-  static const void* GetColorChannelDataAt(void* opaque, size_t xpos,
-                                           size_t ypos, size_t xsize,
-                                           size_t ysize, size_t* row_offset) {
-    JxlChunkedFrameInputSourceAdapter* self =
-        static_cast<JxlChunkedFrameInputSourceAdapter*>(opaque);
-    return GetDataAt(self->colorchannel_, xpos, ypos, row_offset);
+  const void* GetColorChannelDataAt(size_t xpos, size_t ypos, size_t xsize,
+                                    size_t ysize, size_t* row_offset) {
+    return GetDataAt(colorchannel_, xpos, ypos, row_offset);
   }
 
-  static void GetExtraChannelPixelFormat(void* opaque, size_t ec_index,
-                                         JxlPixelFormat* pixel_format) {
+  void GetExtraChannelPixelFormat(size_t ec_index,
+                                  JxlPixelFormat* pixel_format) {
     // In this test, we we the same color channel data, so `ec_index` is never
     // used
-    JxlChunkedFrameInputSourceAdapter* self =
-        static_cast<JxlChunkedFrameInputSourceAdapter*>(opaque);
-    *pixel_format = self->extra_channel_.format;
+    *pixel_format = extra_channel_.frames[0].color.format;
   }
 
-  static const void* GetExtraChannelDataAt(void* opaque, size_t ec_index,
-                                           size_t xpos, size_t ypos,
-                                           size_t xsize, size_t ysize,
-                                           size_t* row_offset) {
+  const void* GetExtraChannelDataAt(size_t ec_index, size_t xpos, size_t ypos,
+                                    size_t xsize, size_t ysize,
+                                    size_t* row_offset) {
     // In this test, we we the same color channel data, so `ec_index` is never
     // used
-    JxlChunkedFrameInputSourceAdapter* self =
-        static_cast<JxlChunkedFrameInputSourceAdapter*>(opaque);
-    return GetDataAt(self->extra_channel_, xpos, ypos, row_offset);
+    return GetDataAt(extra_channel_, xpos, ypos, row_offset);
   }
 
-  static void ReleaseCurrentData(void* opaque, const void* buffer) {
+  void ReleaseCurrentData(const void* buffer) {
     // No dynamic memory is allocated in GetColorChannelDataAt or
     // GetExtraChannelDataAt. Therefore, no cleanup is required here.
   }
@@ -1676,16 +1659,21 @@ class JxlChunkedFrameInputSourceAdapter {
   JxlChunkedFrameInputSource GetInputSource() {
     return JxlChunkedFrameInputSource{
         this,
-        JxlChunkedFrameInputSourceAdapter::GetColorChannelsPixelFormat,
-        JxlChunkedFrameInputSourceAdapter::GetColorChannelDataAt,
-        JxlChunkedFrameInputSourceAdapter::GetExtraChannelPixelFormat,
-        JxlChunkedFrameInputSourceAdapter::GetExtraChannelDataAt,
-        JxlChunkedFrameInputSourceAdapter::ReleaseCurrentData};
+        METHOD_TO_C_CALLBACK(
+            &JxlChunkedFrameInputSourceAdapter::GetColorChannelsPixelFormat),
+        METHOD_TO_C_CALLBACK(
+            &JxlChunkedFrameInputSourceAdapter::GetColorChannelDataAt),
+        METHOD_TO_C_CALLBACK(
+            &JxlChunkedFrameInputSourceAdapter::GetExtraChannelPixelFormat),
+        METHOD_TO_C_CALLBACK(
+            &JxlChunkedFrameInputSourceAdapter::GetExtraChannelDataAt),
+        METHOD_TO_C_CALLBACK(
+            &JxlChunkedFrameInputSourceAdapter::ReleaseCurrentData)};
   }
 
  private:
-  const jxl::extras::PackedImage colorchannel_;
-  const jxl::extras::PackedImage extra_channel_;
+  const jxl::extras::PackedPixelFile colorchannel_;
+  const jxl::extras::PackedPixelFile extra_channel_;
 };
 
 struct StreamingTestParam {
@@ -1850,6 +1838,7 @@ TEST_P(EncoderStreamingTest, OutputCallback) {
   const StreamingTestParam p = GetParam();
   size_t xsize = p.onegroup() ? 17 : 257;
   size_t ysize = p.onegroup() ? 19 : 259;
+
   size_t number_extra_channels = p.with_extra_channels() ? 5 : 0;
   jxl::test::TestImage image;
   SetupImage(p, xsize, ysize, p.color_includes_alpha() ? 4 : 3,
