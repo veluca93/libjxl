@@ -57,27 +57,28 @@ void LowMemoryRenderPipeline::SaveBorders(size_t group_id, size_t c,
   size_t bordery_write = borders.second;
 
   if (gy > 0) {
-    Rect from(group_data_x_border_, group_data_y_border_, x1 - x0,
-              bordery_write);
+    Rect from(group_data_x_border_ + kRenderPipelineXOffset,
+              group_data_y_border_, x1 - x0, bordery_write);
     Rect to(x0, (gy * 2 - 1) * bordery_write, x1 - x0, bordery_write);
     CopyImageTo(from, in, to, &borders_horizontal_[c]);
   }
   if (gy + 1 < frame_dimensions_.ysize_groups) {
-    Rect from(group_data_x_border_,
+    Rect from(group_data_x_border_ + kRenderPipelineXOffset,
               group_data_y_border_ + y1 - y0 - bordery_write, x1 - x0,
               bordery_write);
     Rect to(x0, (gy * 2) * bordery_write, x1 - x0, bordery_write);
     CopyImageTo(from, in, to, &borders_horizontal_[c]);
   }
   if (gx > 0) {
-    Rect from(group_data_x_border_, group_data_y_border_, borderx_write,
-              y1 - y0);
+    Rect from(group_data_x_border_ + kRenderPipelineXOffset,
+              group_data_y_border_, borderx_write, y1 - y0);
     Rect to((gx * 2 - 1) * borderx_write, y0, borderx_write, y1 - y0);
     CopyImageTo(from, in, to, &borders_vertical_[c]);
   }
   if (gx + 1 < frame_dimensions_.xsize_groups) {
-    Rect from(group_data_x_border_ + x1 - x0 - borderx_write,
-              group_data_y_border_, borderx_write, y1 - y0);
+    Rect from(
+        group_data_x_border_ + x1 - x0 - borderx_write + kRenderPipelineXOffset,
+        group_data_y_border_, borderx_write, y1 - y0);
     Rect to((gx * 2) * borderx_write, y0, borderx_write, y1 - y0);
     CopyImageTo(from, in, to, &borders_vertical_[c]);
   }
@@ -134,7 +135,7 @@ void LowMemoryRenderPipeline::LoadBorders(size_t group_id, size_t c,
     CopyImageTo(
         Rect(x0src, (gy * 2 - 2) * bordery_write, x1src - x0src, bordery_write),
         borders_horizontal_[c],
-        Rect(group_data_x_border_ + x0src - x0,
+        Rect(group_data_x_border_ + x0src - x0 + kRenderPipelineXOffset,
              group_data_y_border_ - bordery_write, x1src - x0src,
              bordery_write),
         out);
@@ -145,8 +146,8 @@ void LowMemoryRenderPipeline::LoadBorders(size_t group_id, size_t c,
     CopyImageTo(
         Rect(x0src, (gy * 2 + 1) * bordery_write, x1src - x0src, bordery_write),
         borders_horizontal_[c],
-        Rect(group_data_x_border_ + x0src - x0, group_data_y_border_ + y1 - y0,
-             x1src - x0src, bordery_write),
+        Rect(group_data_x_border_ + x0src - x0 + kRenderPipelineXOffset,
+             group_data_y_border_ + y1 - y0, x1src - x0src, bordery_write),
         out);
   }
   if (x0src < x0) {
@@ -154,7 +155,7 @@ void LowMemoryRenderPipeline::LoadBorders(size_t group_id, size_t c,
     CopyImageTo(
         Rect((gx * 2 - 2) * borderx_write, y0src, borderx_write, y1src - y0src),
         borders_vertical_[c],
-        Rect(group_data_x_border_ - borderx_write,
+        Rect(group_data_x_border_ - borderx_write + kRenderPipelineXOffset,
              group_data_y_border_ + y0src - y0, borderx_write, y1src - y0src),
         out);
   }
@@ -164,8 +165,8 @@ void LowMemoryRenderPipeline::LoadBorders(size_t group_id, size_t c,
     CopyImageTo(
         Rect((gx * 2 + 1) * borderx_write, y0src, borderx_write, y1src - y0src),
         borders_vertical_[c],
-        Rect(group_data_x_border_ + x1 - x0, group_data_y_border_ + y0src - y0,
-             borderx_write, y1src - y0src),
+        Rect(group_data_x_border_ + x1 - x0 + kRenderPipelineXOffset,
+             group_data_y_border_ + y0src - y0, borderx_write, y1src - y0src),
         out);
   }
 }
@@ -379,10 +380,14 @@ Status LowMemoryRenderPipeline::PrepareForThreadsInternal(size_t num,
     group_data_.emplace_back();
     group_data_[t].resize(shifts.size());
     for (size_t c = 0; c < shifts.size(); c++) {
+      // TODO(veluca): we don't necessarily need a larger image here, we just
+      // need to ensure that there's kRenderPipelineXOffset floats in memory
+      // before the start of each group.
       JXL_ASSIGN_OR_RETURN(
           group_data_[t][c],
           ImageF::Create(memory_manager_,
-                         GroupInputXSize(c) + group_data_x_border_ * 2,
+                         GroupInputXSize(c) + group_data_x_border_ * 2 +
+                             kRenderPipelineXOffset,
                          GroupInputYSize(c) + group_data_y_border_ * 2));
     }
   }
@@ -446,14 +451,16 @@ std::vector<std::pair<ImageF*, Rect>> LowMemoryRenderPipeline::PrepareBuffers(
   const size_t gy = group_id / frame_dimensions_.xsize_groups;
   for (size_t c = 0; c < channel_shifts_[0].size(); c++) {
     ret[c].first = &group_data_[use_group_ids_ ? group_id : thread_id][c];
-    ret[c].second = Rect(group_data_x_border_, group_data_y_border_,
-                         GroupInputXSize(c), GroupInputYSize(c),
-                         DivCeil(frame_dimensions_.xsize_upsampled,
-                                 1 << channel_shifts_[0][c].first) -
-                             gx * GroupInputXSize(c) + group_data_x_border_,
-                         DivCeil(frame_dimensions_.ysize_upsampled,
-                                 1 << channel_shifts_[0][c].second) -
-                             gy * GroupInputYSize(c) + group_data_y_border_);
+    ret[c].second =
+        Rect(group_data_x_border_ + kRenderPipelineXOffset,
+             group_data_y_border_, GroupInputXSize(c), GroupInputYSize(c),
+             DivCeil(frame_dimensions_.xsize_upsampled,
+                     1 << channel_shifts_[0][c].first) -
+                 gx * GroupInputXSize(c) + group_data_x_border_ +
+                 kRenderPipelineXOffset,
+             DivCeil(frame_dimensions_.ysize_upsampled,
+                     1 << channel_shifts_[0][c].second) -
+                 gy * GroupInputYSize(c) + group_data_y_border_);
   }
   return ret;
 }
@@ -542,9 +549,7 @@ class Rows {
               .Translate(-group_data_x_border, -group_data_y_border)
               .ShiftLeft(base_color_shift)
               .CeilShiftRight(group_data_shift[c])
-              .Translate(group_data_x_border -
-                             static_cast<ssize_t>(kRenderPipelineXOffset),
-                         group_data_y_border);
+              .Translate(group_data_x_border, group_data_y_border);
       rows_[0][c].base_ptr = channel_group_data_rect.Row(&input_data[c], 0);
       rows_[0][c].stride = input_data[c].PixelsPerRow();
       rows_[0][c].ymod_minus_1 = -1;
