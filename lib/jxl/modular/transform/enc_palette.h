@@ -8,16 +8,41 @@
 
 #include <cstdint>
 
+#include <map>
+#include <vector>
+
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/modular/encoding/context_predict.h"
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/options.h"
+#include "lib/jxl/modular/transform/transform.h"
 
 namespace jxl {
 
+namespace palette_internal {
+
+void OrderPaletteGreedy(
+    const Image &input, uint32_t begin_c, uint32_t nb,
+    std::vector<std::vector<pixel_type>> &candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t> &color_freq_map);
+
+
+
+void OrderPaletteMinLA(
+    const Image &input, uint32_t begin_c, uint32_t nb,
+    std::vector<std::vector<pixel_type>> &candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t> &color_freq_map);
+
+void OrderPaletteMinLAGradient(
+    const Image &input, uint32_t begin_c, uint32_t nb,
+    std::vector<std::vector<pixel_type>> &candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t> &color_freq_map);
+
+}  // namespace palette_internal
+
 Status FwdPalette(Image &input, uint32_t begin_c, uint32_t end_c,
-                  uint32_t &nb_colors, uint32_t &nb_deltas, bool ordered,
-                  bool lossy, Predictor &predictor,
+                  uint32_t &nb_colors, uint32_t &nb_deltas,
+                  PaletteOrdering ordering, bool lossy, Predictor &predictor,
                   const weighted::Header &wp_header);
 
 }  // namespace jxl

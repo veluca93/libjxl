@@ -29,8 +29,10 @@ Status TransformForward(Transform &t, Image &input,
       return FwdSqueeze(input, t.squeezes, pool);
     case TransformId::kPalette:
       return FwdPalette(input, t.begin_c, t.begin_c + t.num_c - 1, t.nb_colors,
-                        t.nb_deltas, t.ordered_palette, t.lossy_palette,
-                        t.predictor, wp_header);
+                        t.nb_deltas,
+                        t.ordered_palette ? t.palette_ordering
+                                          : PaletteOrdering::kNone,
+                        t.lossy_palette, t.predictor, wp_header);
     default:
       return JXL_FAILURE("Unknown transformation (ID=%u)",
                          static_cast<unsigned int>(t.id));

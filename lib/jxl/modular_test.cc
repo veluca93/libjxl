@@ -51,6 +51,7 @@
 #include "lib/jxl/modular/encoding/encoding.h"
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/options.h"
+#include "lib/jxl/modular/transform/enc_palette.h"
 #include "lib/jxl/modular/transform/squeeze_params.h"
 #include "lib/jxl/modular/transform/transform.h"
 #include "lib/jxl/padded_bytes.h"
@@ -626,6 +627,98 @@ TEST(ModularTest, UnsqueezeIntegerOverflow) {
     EXPECT_NEAR(-0.5f, pixels[x], 1e-10);
     EXPECT_NEAR(0.5f, pixels[xsize + x], 1e-10);
   }
+}
+
+TEST(ModularTest, PaletteTSPOrderings) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  size_t w = 4;
+  size_t h = 4;
+  std::vector<std::vector<pixel_type>> colors = {
+      {10, 0, 0}, {20, 0, 0}, {30, 0, 0}, {40, 0, 0}};
+
+  JXL_TEST_ASSIGN_OR_DIE(Image image,
+                         Image::Create(memory_manager, w, h, 8, 3));
+
+  for (size_t y = 0; y < h; ++y) {
+    for (size_t x = 0; x < w; ++x) {
+      for (size_t c = 0; c < 3; ++c) {
+        image.channel[c].Row(y)[x] = colors[x][c];
+      }
+    }
+  }
+
+  std::map<std::vector<pixel_type>, size_t> freq;
+  for (size_t i = 0; i < 4; ++i) {
+    freq[colors[i]] = 4;
+  }
+
+  // Scrambled palette: {0, 2, 1, 3}
+  std::vector<std::vector<pixel_type>> cand_greedy = {
+      colors[0], colors[2], colors[1], colors[3]};
+  palette_internal::OrderPaletteGreedy(image, 0, 3, cand_greedy, freq);
+
+  for (size_t i = 0; i < 4; ++i) {
+    if (cand_greedy[i] == colors[1]) {
+      EXPECT_TRUE((i > 0 && cand_greedy[i - 1] == colors[0]) ||
+                  (i + 1 < 4 && cand_greedy[i + 1] == colors[0]));
+      EXPECT_TRUE((i > 0 && cand_greedy[i - 1] == colors[2]) ||
+                  (i + 1 < 4 && cand_greedy[i + 1] == colors[2]));
+    }
+  }
+
+  // MinLA Gradient on scrambled palette
+  std::vector<std::vector<pixel_type>> cand_grad = {
+      colors[3], colors[1], colors[0], colors[2]};
+  palette_internal::OrderPaletteMinLAGradient(image, 0, 3, cand_grad, freq);
+
+  for (size_t i = 0; i < 4; ++i) {
+    if (cand_grad[i] == colors[1]) {
+      EXPECT_TRUE((i > 0 && cand_grad[i - 1] == colors[0]) ||
+                  (i + 1 < 4 && cand_grad[i + 1] == colors[0]));
+      EXPECT_TRUE((i > 0 && cand_grad[i - 1] == colors[2]) ||
+                  (i + 1 < 4 && cand_grad[i + 1] == colors[2]));
+    }
+  }
+
+  // MinLA on scrambled palette
+  std::vector<std::vector<pixel_type>> cand_minla = {
+      colors[3], colors[1], colors[0], colors[2]};
+  palette_internal::OrderPaletteMinLA(image, 0, 3, cand_minla, freq);
+
+  for (size_t i = 0; i < 4; ++i) {
+    if (cand_minla[i] == colors[1]) {
+      EXPECT_TRUE((i > 0 && cand_minla[i - 1] == colors[0]) ||
+                  (i + 1 < 4 && cand_minla[i + 1] == colors[0]));
+      EXPECT_TRUE((i > 0 && cand_minla[i - 1] == colors[2]) ||
+                  (i + 1 < 4 && cand_minla[i + 1] == colors[2]));
+    }
+  }
+}
+
+TEST(ModularTest, PaletteOrderingRoundtrip) {
+  const std::vector<uint8_t> orig = ReadTestData("palette/358colors.png");
+  TestImage t;
+  ASSERT_TRUE(t.DecodeFromBytes(orig));
+
+  const std::vector<std::string> orderings = {
+      "none", "luma", "tsp_greedy", "minla", "minla_gradient"};
+
+  for (const auto& ordering : orderings) {
+    setenv("JXL_PALETTE_ORDERING", ordering.c_str(), 1);
+    extras::JXLCompressParams cparams;
+    cparams.distance = 0.0f;
+    cparams.AddOption(JXL_ENC_FRAME_SETTING_PALETTE_COLORS, 1024);
+    extras::JXLDecompressParams dparams;
+    dparams.accepted_formats = {{3, JXL_TYPE_UINT8, JXL_LITTLE_ENDIAN, 0}};
+
+    extras::PackedPixelFile ppf_out;
+    size_t compressed_size =
+        Roundtrip(t.ppf(), cparams, dparams, nullptr, &ppf_out);
+    EXPECT_GT(compressed_size, 0u) << "Failed for ordering: " << ordering;
+    float distance2 = test::ComputeDistance2(t.ppf(), ppf_out);
+    EXPECT_EQ(0.0f, distance2) << "Failed for ordering: " << ordering;
+  }
+  unsetenv("JXL_PALETTE_ORDERING");
 }
 
 }  // namespace

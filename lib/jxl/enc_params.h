@@ -119,6 +119,7 @@ struct CompressParams {
   // Use Local channel palette if #colors < this percentage of range
   float channel_colors_percent = 80.f;
   int palette_colors = 1 << 10;  // up to 10-bit palette is probably worthwhile
+  int palette_ordering = -1;     // -1 = auto (effort-based), or PaletteOrdering value
   bool lossy_palette = false;
 
   // Returns whether these params are lossless as defined by SetLossless();

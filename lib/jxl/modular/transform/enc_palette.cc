@@ -13,16 +13,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <map>
 #include <set>
 #include <utility>
 #include <vector>
 
+#include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/image_ops.h"
+#include "lib/jxl/pack_signed.h"
 #include "lib/jxl/modular/encoding/context_predict.h"
 #include "lib/jxl/modular/modular_image.h"
 #include "lib/jxl/modular/options.h"
@@ -108,6 +111,864 @@ static int QuantizeColorToImplicitPaletteIndex(
   }
 }
 
+struct DSU {
+  std::vector<uint32_t> parent;
+  explicit DSU(size_t n) : parent(n) {
+    for (size_t i = 0; i < n; ++i) parent[i] = i;
+  }
+  uint32_t Find(uint32_t x) {
+    if (parent[x] != x) parent[x] = Find(parent[x]);
+    return parent[x];
+  }
+  bool Union(uint32_t x, uint32_t y) {
+    uint32_t rx = Find(x);
+    uint32_t ry = Find(y);
+    if (rx == ry) return false;
+    parent[rx] = ry;
+    return true;
+  }
+};
+
+struct Edge {
+  uint32_t u;
+  uint32_t v;
+  uint32_t weight;
+  uint64_t dist_sq;
+};
+
+static uint64_t ColorDistSq(const std::vector<pixel_type>& a,
+                            const std::vector<pixel_type>& b) {
+  uint64_t dist = 0;
+  for (size_t c = 0; c < a.size(); ++c) {
+    int64_t diff = static_cast<int64_t>(a[c]) - static_cast<int64_t>(b[c]);
+    dist += diff * diff;
+  }
+  return dist;
+}
+
+static void BuildCooccurrenceEdges(
+    const Image& input, uint32_t begin_c, uint32_t nb,
+    const std::vector<std::vector<pixel_type>>& candidate_palette,
+    std::vector<Edge>& edges) {
+  size_t K = candidate_palette.size();
+  if (K <= 2) return;
+  size_t w = input.channel[begin_c].w;
+  size_t h = input.channel[begin_c].h;
+
+  struct ColorLookup {
+    const std::vector<pixel_type>* color;
+    uint32_t id;
+  };
+  std::vector<ColorLookup> sorted_palette(K);
+  for (size_t i = 0; i < K; ++i) {
+    sorted_palette[i] = {&candidate_palette[i], static_cast<uint32_t>(i)};
+  }
+  std::sort(sorted_palette.begin(), sorted_palette.end(),
+            [](const ColorLookup& a, const ColorLookup& b) {
+              return *a.color < *b.color;
+            });
+
+  auto find_color = [&](const std::vector<pixel_type>& c) -> uint32_t {
+    ColorLookup dummy{&c, 0};
+    auto it = std::lower_bound(
+        sorted_palette.begin(), sorted_palette.end(), dummy,
+        [](const ColorLookup& a, const ColorLookup& b) {
+          return *a.color < *b.color;
+        });
+    if (it != sorted_palette.end() && *it->color == c) {
+      return it->id;
+    }
+    return static_cast<uint32_t>(-1);
+  };
+
+  constexpr uint32_t kInvalidId = static_cast<uint32_t>(-1);
+  std::vector<uint32_t> cooccur_dense;
+  std::vector<std::map<uint32_t, uint32_t>> cooccur_sparse;
+  bool use_dense = (K <= 1024);
+  if (use_dense) {
+    cooccur_dense.assign(K * K, 0);
+  } else {
+    cooccur_sparse.resize(K);
+  }
+
+  auto add_cooccur = [&](uint32_t u, uint32_t v) {
+    if (use_dense) {
+      cooccur_dense[u * K + v]++;
+      cooccur_dense[v * K + u]++;
+    } else {
+      if (u > v) std::swap(u, v);
+      cooccur_sparse[u][v]++;
+    }
+  };
+
+  std::vector<uint32_t> prev_row(w, kInvalidId);
+  std::vector<uint32_t> curr_row(w, kInvalidId);
+  std::vector<pixel_type> pixel_color(nb);
+
+  for (size_t y = 0; y < h; ++y) {
+    for (size_t x = 0; x < w; ++x) {
+      for (size_t c = 0; c < nb; ++c) {
+        pixel_color[c] = input.channel[begin_c + c].Row(y)[x];
+      }
+      curr_row[x] = find_color(pixel_color);
+    }
+    for (size_t x = 0; x < w; ++x) {
+      uint32_t u = curr_row[x];
+      if (u == kInvalidId) continue;
+      if (x + 1 < w) {
+        uint32_t v = curr_row[x + 1];
+        if (v != kInvalidId && u != v) {
+          add_cooccur(u, v);
+        }
+      }
+      if (y > 0) {
+        uint32_t v = prev_row[x];
+        if (v != kInvalidId && u != v) {
+          add_cooccur(u, v);
+        }
+      }
+    }
+    prev_row.swap(curr_row);
+  }
+
+  if (use_dense) {
+    for (uint32_t u = 0; u < K; ++u) {
+      for (uint32_t v = u + 1; v < K; ++v) {
+        uint32_t weight = cooccur_dense[u * K + v];
+        if (weight > 0) {
+          edges.push_back({u, v, weight,
+                           ColorDistSq(candidate_palette[u],
+                                       candidate_palette[v])});
+        }
+      }
+    }
+  } else {
+    for (uint32_t u = 0; u < K; ++u) {
+      for (const auto& kv : cooccur_sparse[u]) {
+        uint32_t v = kv.first;
+        uint32_t weight = kv.second;
+        if (weight > 0) {
+          edges.push_back({u, v, weight,
+                           ColorDistSq(candidate_palette[u],
+                                       candidate_palette[v])});
+        }
+      }
+    }
+  }
+
+  std::sort(edges.begin(), edges.end(), [](const Edge& a, const Edge& b) {
+    if (a.weight != b.weight) return a.weight > b.weight;
+    if (a.dist_sq != b.dist_sq) return a.dist_sq < b.dist_sq;
+    if (a.u != b.u) return a.u < b.u;
+    return a.v < b.v;
+  });
+}
+
+static void OrientPaletteByFrequency(
+    const std::vector<std::vector<pixel_type>>& candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t>& color_freq_map,
+    std::vector<uint32_t>& order) {
+  size_t K = order.size();
+  std::vector<size_t> freq(K, 0);
+  for (size_t i = 0; i < K; ++i) {
+    auto it = color_freq_map.find(candidate_palette[i]);
+    if (it != color_freq_map.end()) freq[i] = it->second;
+  }
+  size_t forward_cost = 0;
+  size_t backward_cost = 0;
+  for (size_t i = 0; i < K; ++i) {
+    forward_cost += i * freq[order[i]];
+    backward_cost += (K - 1 - i) * freq[order[i]];
+  }
+  if (backward_cost < forward_cost) {
+    std::reverse(order.begin(), order.end());
+  }
+}
+
+void OrderPaletteGreedy(
+    const Image& input, uint32_t begin_c, uint32_t nb,
+    std::vector<std::vector<pixel_type>>& candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t>& color_freq_map) {
+  size_t K = candidate_palette.size();
+  if (K <= 2) return;
+
+  std::vector<Edge> edges;
+  BuildCooccurrenceEdges(input, begin_c, nb, candidate_palette, edges);
+
+  DSU dsu(K);
+  std::vector<uint8_t> degree(K, 0);
+  std::vector<std::vector<uint32_t>> adj(K);
+  std::vector<std::pair<uint32_t, uint32_t>> comp_ends(K);
+  for (size_t i = 0; i < K; ++i) {
+    comp_ends[i] = {static_cast<uint32_t>(i), static_cast<uint32_t>(i)};
+  }
+
+  for (const auto& e : edges) {
+    if (degree[e.u] < 2 && degree[e.v] < 2) {
+      uint32_t root_u = dsu.Find(e.u);
+      uint32_t root_v = dsu.Find(e.v);
+      if (root_u != root_v) {
+        degree[e.u]++;
+        degree[e.v]++;
+        adj[e.u].push_back(e.v);
+        adj[e.v].push_back(e.u);
+        uint32_t other_u = (comp_ends[root_u].first == e.u)
+                               ? comp_ends[root_u].second
+                               : comp_ends[root_u].first;
+        uint32_t other_v = (comp_ends[root_v].first == e.v)
+                               ? comp_ends[root_v].second
+                               : comp_ends[root_v].first;
+        dsu.Union(root_u, root_v);
+        uint32_t new_root = dsu.Find(root_u);
+        comp_ends[new_root] = {other_u, other_v};
+      }
+    }
+  }
+
+  // Connect remaining components using minimum color distance between endpoints
+  std::vector<uint32_t> roots;
+  for (size_t i = 0; i < K; ++i) {
+    if (dsu.Find(i) == i) {
+      roots.push_back(i);
+    }
+  }
+
+  while (roots.size() > 1) {
+    size_t best_i = 0;
+    size_t best_j = 1;
+    uint32_t best_ea = 0;
+    uint32_t best_eb = 0;
+    uint64_t best_dist = std::numeric_limits<uint64_t>::max();
+
+    for (size_t i = 0; i < roots.size(); ++i) {
+      uint32_t ra = roots[i];
+      uint32_t ends_a[2] = {comp_ends[ra].first, comp_ends[ra].second};
+      for (size_t j = i + 1; j < roots.size(); ++j) {
+        uint32_t rb = roots[j];
+        uint32_t ends_b[2] = {comp_ends[rb].first, comp_ends[rb].second};
+        for (uint32_t ea : ends_a) {
+          for (uint32_t eb : ends_b) {
+            uint64_t d = ColorDistSq(candidate_palette[ea], candidate_palette[eb]);
+            if (d < best_dist) {
+              best_dist = d;
+              best_i = i;
+              best_j = j;
+              best_ea = ea;
+              best_eb = eb;
+            }
+          }
+        }
+      }
+    }
+
+    uint32_t ra = roots[best_i];
+    uint32_t rb = roots[best_j];
+    degree[best_ea]++;
+    degree[best_eb]++;
+    adj[best_ea].push_back(best_eb);
+    adj[best_eb].push_back(best_ea);
+
+    uint32_t other_a = (comp_ends[ra].first == best_ea) ? comp_ends[ra].second
+                                                        : comp_ends[ra].first;
+    uint32_t other_b = (comp_ends[rb].first == best_eb) ? comp_ends[rb].second
+                                                        : comp_ends[rb].first;
+    dsu.Union(ra, rb);
+    uint32_t new_root = dsu.Find(ra);
+    comp_ends[new_root] = {other_a, other_b};
+
+    roots[best_i] = new_root;
+    roots.erase(roots.begin() + best_j);
+  }
+
+  // Extract path from endpoint to endpoint
+  uint32_t final_root = dsu.Find(0);
+  uint32_t start_node = comp_ends[final_root].first;
+  uint32_t end_node = comp_ends[final_root].second;
+
+  std::vector<uint32_t> order;
+  order.reserve(K);
+  std::vector<bool> visited(K, false);
+  uint32_t curr = start_node;
+  order.push_back(curr);
+  visited[curr] = true;
+
+  while (curr != end_node) {
+    uint32_t next = static_cast<uint32_t>(-1);
+    for (uint32_t v : adj[curr]) {
+      if (!visited[v]) {
+        next = v;
+        break;
+      }
+    }
+    JXL_DASSERT(next != static_cast<uint32_t>(-1));
+    visited[next] = true;
+    order.push_back(next);
+    curr = next;
+  }
+
+  OrientPaletteByFrequency(candidate_palette, color_freq_map, order);
+
+  std::vector<std::vector<pixel_type>> new_palette(K);
+  for (size_t i = 0; i < K; ++i) {
+    new_palette[i] = std::move(candidate_palette[order[i]]);
+  }
+  candidate_palette = std::move(new_palette);
+}
+
+static void BuildCooccurrenceMatrix(
+    const Image& input, uint32_t begin_c, uint32_t nb,
+    const std::vector<std::vector<pixel_type>>& candidate_palette,
+    std::vector<uint32_t>& cooccur_matrix) {
+  size_t K = candidate_palette.size();
+  cooccur_matrix.assign(K * K, 0);
+  if (K <= 1) return;
+  size_t w = input.channel[begin_c].w;
+  size_t h = input.channel[begin_c].h;
+
+  struct ColorLookup {
+    const std::vector<pixel_type>* color;
+    uint32_t id;
+  };
+  std::vector<ColorLookup> sorted_palette(K);
+  for (size_t i = 0; i < K; ++i) {
+    sorted_palette[i] = {&candidate_palette[i], static_cast<uint32_t>(i)};
+  }
+  std::sort(sorted_palette.begin(), sorted_palette.end(),
+            [](const ColorLookup& a, const ColorLookup& b) {
+              return *a.color < *b.color;
+            });
+
+  auto find_color = [&](const std::vector<pixel_type>& c) -> uint32_t {
+    ColorLookup dummy{&c, 0};
+    auto it = std::lower_bound(
+        sorted_palette.begin(), sorted_palette.end(), dummy,
+        [](const ColorLookup& a, const ColorLookup& b) {
+          return *a.color < *b.color;
+        });
+    if (it != sorted_palette.end() && *it->color == c) {
+      return it->id;
+    }
+    return static_cast<uint32_t>(-1);
+  };
+
+  constexpr uint32_t kInvalidId = static_cast<uint32_t>(-1);
+  std::vector<uint32_t> prev_row(w, kInvalidId);
+  std::vector<uint32_t> curr_row(w, kInvalidId);
+  std::vector<pixel_type> pixel_color(nb);
+
+  for (size_t y = 0; y < h; ++y) {
+    for (size_t x = 0; x < w; ++x) {
+      for (size_t c = 0; c < nb; ++c) {
+        pixel_color[c] = input.channel[begin_c + c].Row(y)[x];
+      }
+      curr_row[x] = find_color(pixel_color);
+    }
+    for (size_t x = 0; x < w; ++x) {
+      uint32_t u = curr_row[x];
+      if (u == kInvalidId) continue;
+      if (x + 1 < w) {
+        uint32_t v = curr_row[x + 1];
+        if (v != kInvalidId && u != v) {
+          cooccur_matrix[u * K + v]++;
+          cooccur_matrix[v * K + u]++;
+        }
+      }
+      if (y > 0) {
+        uint32_t v = prev_row[x];
+        if (v != kInvalidId && u != v) {
+          cooccur_matrix[u * K + v]++;
+          cooccur_matrix[v * K + u]++;
+        }
+      }
+    }
+    prev_row.swap(curr_row);
+  }
+}
+
+static void ModifiedZengOrdering(
+    const std::vector<uint32_t>& cooccur, size_t K,
+    const std::vector<std::vector<pixel_type>>& candidate_palette,
+    std::vector<uint32_t>& order) {
+  order.clear();
+  if (K <= 2) {
+    for (size_t i = 0; i < K; ++i) order.push_back(i);
+    return;
+  }
+
+  uint32_t c1 = 0;
+  uint64_t max_sum = 0;
+  for (size_t i = 0; i < K; ++i) {
+    uint64_t sum = 0;
+    for (size_t j = 0; j < K; ++j) sum += cooccur[i * K + j];
+    if (sum > max_sum) {
+      max_sum = sum;
+      c1 = i;
+    }
+  }
+
+  uint32_t c2 = (c1 == 0 ? 1 : 0);
+  uint32_t max_c = 0;
+  for (size_t i = 0; i < K; ++i) {
+    if (i == c1) continue;
+    uint32_t w = cooccur[c1 * K + i];
+    if (w > max_c) {
+      max_c = w;
+      c2 = i;
+    }
+  }
+
+  std::deque<uint32_t> chain;
+  chain.push_back(c1);
+  chain.push_back(c2);
+
+  std::vector<bool> placed(K, false);
+  placed[c1] = true;
+  placed[c2] = true;
+
+  std::vector<uint64_t> sums(K, 0);
+  for (size_t i = 0; i < K; ++i) {
+    if (!placed[i]) {
+      sums[i] = cooccur[i * K + c1] + cooccur[i * K + c2];
+    }
+  }
+
+  for (size_t step = 2; step < K; ++step) {
+    uint32_t best_u = 0;
+    uint64_t best_val = 0;
+    bool found = false;
+    for (size_t i = 0; i < K; ++i) {
+      if (!placed[i]) {
+        if (!found || sums[i] > best_val) {
+          best_val = sums[i];
+          best_u = i;
+          found = true;
+        }
+      }
+    }
+    JXL_DASSERT(found);
+
+    if (best_val == 0) {
+      uint64_t min_dist = std::numeric_limits<uint64_t>::max();
+      uint32_t front_c = chain.front();
+      uint32_t back_c = chain.back();
+      bool attach_front = false;
+      for (size_t i = 0; i < K; ++i) {
+        if (!placed[i]) {
+          uint64_t df =
+              ColorDistSq(candidate_palette[i], candidate_palette[front_c]);
+          uint64_t db =
+              ColorDistSq(candidate_palette[i], candidate_palette[back_c]);
+          if (df < min_dist) {
+            min_dist = df;
+            best_u = i;
+            attach_front = true;
+          }
+          if (db < min_dist) {
+            min_dist = db;
+            best_u = i;
+            attach_front = false;
+          }
+        }
+      }
+      placed[best_u] = true;
+      if (attach_front) {
+        chain.push_front(best_u);
+      } else {
+        chain.push_back(best_u);
+      }
+      for (size_t i = 0; i < K; ++i) {
+        if (!placed[i]) sums[i] += cooccur[i * K + best_u];
+      }
+      continue;
+    }
+
+    int64_t delta = 0;
+    int32_t m = chain.size();
+    for (int32_t j = 0; j < m; ++j) {
+      uint32_t lj = chain[j];
+      delta += (int64_t)(m - 1 - 2 * j) * (int64_t)cooccur[best_u * K + lj];
+    }
+
+    placed[best_u] = true;
+    if (delta > 0) {
+      chain.push_front(best_u);
+    } else {
+      chain.push_back(best_u);
+    }
+
+    for (size_t i = 0; i < K; ++i) {
+      if (!placed[i]) {
+        sums[i] += cooccur[i * K + best_u];
+      }
+    }
+  }
+
+  order.assign(chain.begin(), chain.end());
+}
+
+static void MinLACutProfile(const std::vector<uint32_t>& cooccur, size_t K,
+                            const std::vector<uint32_t>& order,
+                            const std::vector<uint64_t>& row_sum,
+                            std::vector<int64_t>& cut) {
+  cut.assign(K + 1, 0);
+  int64_t running = 0;
+  cut[0] = 0;
+  for (size_t k = 0; k < K; ++k) {
+    uint32_t c = order[k];
+    const uint32_t* row = &cooccur[c * K];
+    int64_t to_before = 0;
+    for (size_t m = 0; m < k; ++m) to_before += row[order[m]];
+    int64_t to_after = static_cast<int64_t>(row_sum[c]) - to_before;
+    running += to_after - to_before;
+    cut[k + 1] = running;
+  }
+}
+
+static uint32_t MinLABestSlot(const std::vector<uint32_t>& cooccur, size_t K,
+                              uint32_t at, const std::vector<int64_t>& cut,
+                              const std::vector<uint32_t>& order,
+                              const std::vector<uint64_t>& row_sum) {
+  uint32_t color = order[at];
+  int64_t total_w = row_sum[color];
+  if (total_w == 0) return at;
+
+  const uint32_t* row = &cooccur[color * K];
+  const uint32_t* order_ptr = order.data();
+  const int64_t* cut_ptr = cut.data();
+  uint32_t m = K - 1;
+  int64_t left_w = 0;
+  int64_t left_wr = 0;
+  int64_t pre_v = 0;
+  uint32_t best_j = at;
+  int64_t best = std::numeric_limits<int64_t>::max();
+  int64_t at_cost = 0;
+
+  for (uint32_t j = 0; j < K; ++j) {
+    uint32_t r = (j == m) ? color : (j < at) ? order_ptr[j] : order_ptr[j + 1];
+    int64_t own = (int64_t)j * (2 * left_w - total_w) - left_w - 2 * left_wr;
+    int64_t straddle =
+        (j <= at) ? cut_ptr[j] - pre_v
+                  : cut_ptr[j + 1] - (total_w - pre_v - row[order_ptr[j]]);
+    int64_t cost = own + straddle;
+    if (cost < best) {
+      best = cost;
+      best_j = j;
+    }
+    if (j == at) at_cost = cost;
+    pre_v += row[order_ptr[j]];
+    left_w += row[r];
+    left_wr += (int64_t)row[r] * j;
+  }
+  return (at_cost == best) ? at : best_j;
+}
+
+static void PaletteMinLARefine(const std::vector<uint32_t>& cooccur, size_t K,
+                               std::vector<uint32_t>& order) {
+  if (K <= 2) return;
+  std::vector<uint64_t> row_sum(K, 0);
+  for (size_t c = 0; c < K; ++c) {
+    uint64_t sum = 0;
+    const uint32_t* row = &cooccur[c * K];
+    for (size_t u = 0; u < K; ++u) sum += row[u];
+    row_sum[c] = sum;
+  }
+  std::vector<int64_t> cut(K + 1);
+  MinLACutProfile(cooccur, K, order, row_sum, cut);
+
+  constexpr int kMaxSweeps = 20;
+  for (int sweep = 0; sweep < kMaxSweeps; ++sweep) {
+    int moved = 0;
+    for (uint32_t at = 0; at < K; ++at) {
+      uint32_t best_j = MinLABestSlot(cooccur, K, at, cut, order, row_sum);
+      if (best_j != at) {
+        uint32_t color = order[at];
+        const uint32_t* row = &cooccur[color * K];
+        int64_t c_sum = static_cast<int64_t>(row_sum[color]);
+
+        if (best_j > at) {
+          int64_t to_before = 0;
+          for (size_t m = 0; m < at; ++m) {
+            to_before += row[order[m]];
+          }
+          for (size_t k = at + 1; k <= best_j; ++k) {
+            to_before += row[order[k]];
+            cut[k] = cut[k + 1] + 2 * to_before - c_sum;
+          }
+          for (size_t k = at; k < best_j; ++k) order[k] = order[k + 1];
+          order[best_j] = color;
+        } else {
+          int64_t to_before = 0;
+          for (size_t m = 0; m < best_j; ++m) {
+            to_before += row[order[m]];
+          }
+          int64_t prev_cut = cut[best_j];
+          for (size_t k = best_j + 1; k <= at; ++k) {
+            int64_t next_prev = cut[k];
+            cut[k] = prev_cut + c_sum - 2 * to_before;
+            prev_cut = next_prev;
+            to_before += row[order[k - 1]];
+          }
+          for (size_t k = at; k > best_j; --k) order[k] = order[k - 1];
+          order[best_j] = color;
+        }
+        ++moved;
+      }
+    }
+    JXL_DEBUG_V(8, "MinLA sweep %d: %d moved", sweep, moved);
+    if (moved == 0) break;
+  }
+}
+
+void OrderPaletteMinLA(
+    const Image& input, uint32_t begin_c, uint32_t nb,
+    std::vector<std::vector<pixel_type>>& candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t>& color_freq_map) {
+  size_t K = candidate_palette.size();
+  if (K <= 2) return;
+
+  std::vector<uint32_t> cooccur;
+  BuildCooccurrenceMatrix(input, begin_c, nb, candidate_palette, cooccur);
+
+  std::vector<uint32_t> order;
+  ModifiedZengOrdering(cooccur, K, candidate_palette, order);
+  PaletteMinLARefine(cooccur, K, order);
+
+  OrientPaletteByFrequency(candidate_palette, color_freq_map, order);
+
+  std::vector<std::vector<pixel_type>> new_palette(K);
+  for (size_t i = 0; i < K; ++i) {
+    new_palette[i] = std::move(candidate_palette[order[i]]);
+  }
+  candidate_palette = std::move(new_palette);
+}
+
+void OrderPaletteMinLAGradient(
+    const Image& input, uint32_t begin_c, uint32_t nb,
+    std::vector<std::vector<pixel_type>>& candidate_palette,
+    const std::map<std::vector<pixel_type>, size_t>& color_freq_map) {
+  // First, initialize with MinLA ordering.
+  OrderPaletteMinLA(input, begin_c, nb, candidate_palette, color_freq_map);
+
+  size_t K = candidate_palette.size();
+  if (K <= 2) return;
+
+  size_t w = input.channel[begin_c].w;
+  size_t h = input.channel[begin_c].h;
+  if (w == 0 || h == 0 || w > 65535 || h > 65535) return;
+  if (w * h > 4000000) return;
+
+  // Build fast color lookup.
+  struct ColorLookup {
+    const std::vector<pixel_type>* color;
+    uint32_t id;
+  };
+  std::vector<ColorLookup> sorted_palette(K);
+  for (size_t i = 0; i < K; ++i) {
+    sorted_palette[i] = {&candidate_palette[i], static_cast<uint32_t>(i)};
+  }
+  std::sort(sorted_palette.begin(), sorted_palette.end(),
+            [](const ColorLookup& a, const ColorLookup& b) {
+              return *a.color < *b.color;
+            });
+
+  auto find_color = [&](const std::vector<pixel_type>& c) -> uint32_t {
+    ColorLookup dummy{&c, 0};
+    auto it = std::lower_bound(
+        sorted_palette.begin(), sorted_palette.end(), dummy,
+        [](const ColorLookup& a, const ColorLookup& b) {
+          return *a.color < *b.color;
+        });
+    if (it != sorted_palette.end() && *it->color == c) {
+      return it->id;
+    }
+    return static_cast<uint32_t>(-1);
+  };
+
+  constexpr uint32_t kInvalidId = static_cast<uint32_t>(-1);
+  std::vector<uint32_t> grid(w * h, kInvalidId);
+  std::vector<pixel_type> pixel_color(nb);
+
+  for (size_t y = 0; y < h; ++y) {
+    for (size_t x = 0; x < w; ++x) {
+      for (size_t c = 0; c < nb; ++c) {
+        pixel_color[c] = input.channel[begin_c + c].Row(y)[x];
+      }
+      grid[y * w + x] = find_color(pixel_color);
+    }
+  }
+
+  std::vector<std::vector<uint32_t>> affected(K);
+  for (size_t y = 0; y < h; ++y) {
+    for (size_t x = 0; x < w; ++x) {
+      uint32_t c = grid[y * w + x];
+      if (c >= K) continue;
+      uint32_t coord =
+          (static_cast<uint32_t>(y) << 16) | static_cast<uint32_t>(x);
+      affected[c].push_back(coord);
+      if (x + 1 < w) {
+        affected[c].push_back(coord + 1);
+      }
+      if (y + 1 < h) {
+        affected[c].push_back(coord + (1 << 16));
+      }
+      if (x + 1 < w && y + 1 < h) {
+        affected[c].push_back(coord + (1 << 16) + 1);
+      }
+    }
+  }
+
+  for (size_t c = 0; c < K; ++c) {
+    std::sort(affected[c].begin(), affected[c].end());
+    affected[c].erase(std::unique(affected[c].begin(), affected[c].end()),
+                      affected[c].end());
+  }
+
+  std::vector<uint32_t> order(K);
+  std::vector<uint32_t> inv_order(K);
+  for (size_t i = 0; i < K; ++i) {
+    order[i] = i;
+    inv_order[i] = i;
+  }
+
+  std::vector<int32_t> log_lut(K + 1);
+  for (size_t d = 0; d <= K; ++d) {
+    log_lut[d] =
+        static_cast<int32_t>(std::round(256.0 * std::log2(1.0 + d)));
+  }
+
+  auto eval_pixel = [&](uint32_t coord) -> int32_t {
+    size_t x = coord & 0xFFFF;
+    size_t y = coord >> 16;
+    size_t idx = y * w + x;
+    uint32_t c_curr = grid[idx];
+    int32_t cur = (c_curr < K) ? inv_order[c_curr] : 0;
+    int32_t left = 0;
+    if (x > 0) {
+      uint32_t c_w = grid[idx - 1];
+      left = (c_w < K) ? inv_order[c_w] : 0;
+    } else if (y > 0) {
+      uint32_t c_n = grid[idx - w];
+      left = (c_n < K) ? inv_order[c_n] : 0;
+    }
+    int32_t top =
+        (y > 0) ? ((grid[idx - w] < K) ? inv_order[grid[idx - w]] : 0) : left;
+    int32_t topleft = (x > 0 && y > 0)
+                          ? ((grid[idx - 1 - w] < K)
+                                 ? inv_order[grid[idx - 1 - w]]
+                                 : 0)
+                          : left;
+    int32_t guess = ClampedGradient(top, left, topleft);
+    int32_t res = cur - guess;
+    uint32_t d = static_cast<uint32_t>(std::abs(res));
+    return (d <= K)
+               ? log_lut[d]
+               : static_cast<int32_t>(std::round(256.0 * std::log2(1.0 + d)));
+  };
+
+  auto try_swap = [&](uint32_t pos1, uint32_t pos2) -> bool {
+    if (pos1 == pos2) return false;
+    uint32_t u = order[pos1];
+    uint32_t v = order[pos2];
+    const auto& a1 = affected[u];
+    const auto& a2 = affected[v];
+
+    int64_t old_cost = 0;
+    size_t p1 = 0, p2 = 0;
+    while (p1 < a1.size() || p2 < a2.size()) {
+      uint32_t pt;
+      if (p1 < a1.size() && p2 < a2.size()) {
+        if (a1[p1] < a2[p2]) {
+          pt = a1[p1++];
+        } else if (a2[p2] < a1[p1]) {
+          pt = a2[p2++];
+        } else {
+          pt = a1[p1++];
+          p2++;
+        }
+      } else if (p1 < a1.size()) {
+        pt = a1[p1++];
+      } else {
+        pt = a2[p2++];
+      }
+      old_cost += eval_pixel(pt);
+    }
+
+    std::swap(inv_order[u], inv_order[v]);
+
+    int64_t new_cost = 0;
+    p1 = 0;
+    p2 = 0;
+    bool worse = false;
+    while (p1 < a1.size() || p2 < a2.size()) {
+      uint32_t pt;
+      if (p1 < a1.size() && p2 < a2.size()) {
+        if (a1[p1] < a2[p2]) {
+          pt = a1[p1++];
+        } else if (a2[p2] < a1[p1]) {
+          pt = a2[p2++];
+        } else {
+          pt = a1[p1++];
+          p2++;
+        }
+      } else if (p1 < a1.size()) {
+        pt = a1[p1++];
+      } else {
+        pt = a2[p2++];
+      }
+      new_cost += eval_pixel(pt);
+      if (new_cost >= old_cost) {
+        worse = true;
+        break;
+      }
+    }
+
+    if (worse) {
+      std::swap(inv_order[u], inv_order[v]);
+      return false;
+    }
+
+    std::swap(order[pos1], order[pos2]);
+    return true;
+  };
+
+  // Phase 1: multi-pass adjacent transpositions
+  constexpr int kMaxAdjacentPasses = 4;
+  for (int pass = 0; pass < kMaxAdjacentPasses; ++pass) {
+    int moved = 0;
+    for (size_t i = 0; i + 1 < K; ++i) {
+      if (try_swap(i, i + 1)) {
+        moved++;
+      }
+    }
+    if (moved == 0) break;
+  }
+
+  // Phase 2: windowed jump swaps to cross local minima
+  for (size_t step : {2, 3, 4, 8, 16}) {
+    if (step >= K) continue;
+    for (size_t i = 0; i + step < K; ++i) {
+      try_swap(i, i + step);
+    }
+  }
+
+  // Phase 3: settle adjacent transpositions
+  for (int pass = 0; pass < 2; ++pass) {
+    int moved = 0;
+    for (size_t i = 0; i + 1 < K; ++i) {
+      if (try_swap(i, i + 1)) {
+        moved++;
+      }
+    }
+    if (moved == 0) break;
+  }
+
+  std::vector<std::vector<pixel_type>> new_palette(K);
+  for (size_t i = 0; i < K; ++i) {
+    new_palette[i] = std::move(candidate_palette[order[i]]);
+  }
+  candidate_palette = std::move(new_palette);
+}
+
 }  // namespace palette_internal
 
 int RoundInt(int value, int div) {  // symmetric rounding around 0
@@ -176,7 +1037,8 @@ struct PaletteIterationData {
 
 Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
                            uint32_t &nb_colors, uint32_t &nb_deltas,
-                           bool ordered, bool lossy, Predictor &predictor,
+                           PaletteOrdering ordering, bool lossy,
+                           Predictor &predictor,
                            const weighted::Header &wp_header,
                            PaletteIterationData &palette_iteration_data) {
   JXL_QUIET_RETURN_IF_ERROR(CheckEqualChannels(input, begin_c, end_c));
@@ -422,12 +1284,13 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
   // Within each bucket, the colors are sorted on luma (times alpha).
   float freq_threshold = 4;  // arbitrary threshold
   int clr = 0;
-  if (ordered && nb >= 3) {
+  if (ordering == PaletteOrdering::kLuma && nb >= 3) {
     JXL_DEBUG_V(7, "Palette of %i colors, using luma order", nb_colors);
     // sort on luma (multiplied by alpha if available)
     std::sort(candidate_palette_imageorder.begin(),
               candidate_palette_imageorder.end(),
-              [&](std::vector<pixel_type> ap, std::vector<pixel_type> bp) {
+              [&](const std::vector<pixel_type>& ap,
+                  const std::vector<pixel_type>& bp) {
                 float ay;
                 float by;
                 ay = (0.299f * ap[0] + 0.587f * ap[1] + 0.114f * ap[2] + 0.1f);
@@ -440,6 +1303,19 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
                 by = color_freq_map[bp] > freq_threshold ? -by : by;
                 return ay < by;
               });
+  } else if (ordering == PaletteOrdering::kTSPGreedy && nb >= 2) {
+    JXL_DEBUG_V(7, "Palette of %i colors, using TSP greedy order", nb_colors);
+    palette_internal::OrderPaletteGreedy(
+        input, begin_c, nb, candidate_palette_imageorder, color_freq_map);
+  } else if (ordering == PaletteOrdering::kMinLA && nb >= 2) {
+    JXL_DEBUG_V(7, "Palette of %i colors, using MinLA order", nb_colors);
+    palette_internal::OrderPaletteMinLA(
+        input, begin_c, nb, candidate_palette_imageorder, color_freq_map);
+  } else if (ordering == PaletteOrdering::kMinLAGradient && nb >= 2) {
+    JXL_DEBUG_V(7, "Palette of %i colors, using MinLA Gradient order",
+                nb_colors);
+    palette_internal::OrderPaletteMinLAGradient(
+        input, begin_c, nb, candidate_palette_imageorder, color_freq_map);
   } else {
     JXL_DEBUG_V(7, "Palette of %i colors, using image order", nb_colors);
   }
@@ -645,8 +1521,8 @@ Status FwdPaletteIteration(Image &input, uint32_t begin_c, uint32_t end_c,
 }
 
 Status FwdPalette(Image &input, uint32_t begin_c, uint32_t end_c,
-                  uint32_t &nb_colors, uint32_t &nb_deltas, bool ordered,
-                  bool lossy, Predictor &predictor,
+                  uint32_t &nb_colors, uint32_t &nb_deltas,
+                  PaletteOrdering ordering, bool lossy, Predictor &predictor,
                   const weighted::Header &wp_header) {
   PaletteIterationData palette_iteration_data;
   uint32_t nb_colors_orig = nb_colors;
@@ -654,12 +1530,12 @@ Status FwdPalette(Image &input, uint32_t begin_c, uint32_t end_c,
   // preprocessing pass in case of lossy palette
   if (lossy && input.bitdepth >= 8) {
     JXL_RETURN_IF_ERROR(FwdPaletteIteration(
-        input, begin_c, end_c, nb_colors_orig, nb_deltas_orig, ordered, lossy,
+        input, begin_c, end_c, nb_colors_orig, nb_deltas_orig, ordering, lossy,
         predictor, wp_header, palette_iteration_data));
   }
   palette_iteration_data.final_run = true;
   return FwdPaletteIteration(input, begin_c, end_c, nb_colors, nb_deltas,
-                             ordered, lossy, predictor, wp_header,
+                             ordering, lossy, predictor, wp_header,
                              palette_iteration_data);
 }
 

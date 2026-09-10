@@ -35,6 +35,14 @@ enum class TransformId : uint32_t {
   kInvalid = 3,
 };
 
+enum class PaletteOrdering : uint32_t {
+  kNone = 0,          // Image order (unordered)
+  kLuma = 1,          // Legacy luma-based sort
+  kTSPGreedy = 2,     // Greedy multi-fragment TSP heuristic
+  kMinLA = 3,         // Minimum Linear Arrangement local search refinement
+  kMinLAGradient = 4, // MinLA refined with clamped gradient residuals
+};
+
 class Transform : public Fields {
  public:
   TransformId id;
@@ -55,6 +63,7 @@ class Transform : public Fields {
   Predictor predictor;
   // for Palette, not serialized.
   bool ordered_palette = true;
+  PaletteOrdering palette_ordering = PaletteOrdering::kLuma;
   bool lossy_palette = false;
 
   explicit Transform(TransformId id);
