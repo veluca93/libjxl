@@ -315,7 +315,8 @@ V HfModulation(const D d, const size_t x, const size_t y, const ImageF& xyb_y,
 void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
                          const ImageF& xyb_y, const ImageF& xyb_b,
                          const Rect& rect_in, const float scale,
-                         const Rect& rect_out, ImageF* out) {
+                         const Rect& rect_out, ImageF* out,
+                         ImageF (*band_qf)[4]) {
   float base_level = 0.48f * scale;
   float kDampenRampStart = 2.0f;
   float kDampenRampEnd = 14.0f;
@@ -329,20 +330,216 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
   }
   const float mul = scale * dampen;
   const float add = (1.0f - dampen) * base_level;
+  const size_t xsize = rect_in.xsize();
+  const size_t ysize = rect_in.ysize();
+
   for (size_t iy = rect_out.y0(); iy < rect_out.y1(); iy++) {
     const size_t y = iy * 8;
     float* const JXL_RESTRICT row_out = out->Row(iy);
     const HWY_CAPPED(float, kBlockDim) df;
     for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
-      size_t x = ix * 8;
-      auto mask_val = ComputeMask(df, Set(df, row_out[ix]));
+      const size_t x = ix * 8;
+      const float eroded_val = row_out[ix];
+      auto mask_val = ComputeMask(df, Set(df, eroded_val));
       mask_val = GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, mask_val);
-      auto out_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
-      out_val = Min(out_val, BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b,
-                                            rect_in, mask_val));
-      // We want multiplicative quantization field, so everything
-      // until this point has been modulating the exponent.
-      row_out[ix] = FastPow2f(GetLane(out_val) * 1.442695041f) * mul + add;
+      auto hf_val = HfModulation(df, x, y, xyb_y, rect_in, mask_val);
+      auto blue_val =
+          BlueModulation(df, x, y, xyb_x, xyb_y, xyb_b, rect_in, mask_val);
+      float base_log_q = GetLane(Min(hf_val, blue_val));
+      const float q_base =
+          FastPow2f(base_log_q * 1.442695041f) * mul + add;
+      row_out[ix] = q_base;
+
+      if (band_qf != nullptr) {
+        const float blue_boost =
+            std::max(0.0f, GetLane(blue_val) - GetLane(mask_val));
+
+        // Extract 8x8 perceptual opponent patch:
+        // c=0: 10*X (red-green), c=1: Y (luma), c=2: 0.55*(B - Y) (blue-yellow).
+        float p[3][8][8];
+        float sub4x4[3][2][2] = {};
+        float sub2x2[3][4][4] = {};
+        float block_mean[3] = {};
+        for (size_t dy = 0; dy < 8; ++dy) {
+          const float* JXL_RESTRICT rx = rect_in.ConstRow(xyb_x, y + dy) + x;
+          const float* JXL_RESTRICT ry = rect_in.ConstRow(xyb_y, y + dy) + x;
+          const float* JXL_RESTRICT rb = rect_in.ConstRow(xyb_b, y + dy) + x;
+          for (size_t dx = 0; dx < 8; ++dx) {
+            const float vx = 10.0f * rx[dx];
+            const float vy = ry[dx];
+            const float vb = 0.55f * (rb[dx] - ry[dx]);
+            p[0][dy][dx] = vx;
+            p[1][dy][dx] = vy;
+            p[2][dy][dx] = vb;
+            sub2x2[0][dy >> 1][dx >> 1] += 0.25f * vx;
+            sub2x2[1][dy >> 1][dx >> 1] += 0.25f * vy;
+            sub2x2[2][dy >> 1][dx >> 1] += 0.25f * vb;
+            sub4x4[0][dy >> 2][dx >> 2] += (1.0f / 16.0f) * vx;
+            sub4x4[1][dy >> 2][dx >> 2] += (1.0f / 16.0f) * vy;
+            sub4x4[2][dy >> 2][dx >> 2] += (1.0f / 16.0f) * vb;
+          }
+        }
+        for (size_t c = 0; c < 3; ++c) {
+          block_mean[c] =
+              0.25f * (sub4x4[c][0][0] + sub4x4[c][0][1] + sub4x4[c][1][0] +
+                       sub4x4[c][1][1]);
+        }
+
+        // Compute 4-scale contrast energies E[c][s] for s in 0..3:
+        // s=0 (1:1 2px), s=1 (1:2 4px), s=2 (1:4 8px), s=3 (1:8 16px).
+        float E[3][4] = {};
+        float E0_harm[3] = {};
+        static constexpr float kSatCap[3] = {0.035f, 0.030f, 0.035f};
+        for (size_t c = 0; c < 3; ++c) {
+          const float cap = kSatCap[c];
+          float q_energy[4] = {};
+          for (size_t qy = 0; qy < 2; ++qy) {
+            for (size_t qx = 0; qx < 2; ++qx) {
+              float qsum = 0.0f;
+              for (size_t dy = qy * 4; dy < qy * 4 + 4; ++dy) {
+                const size_t dyn = (dy + 1 < 8) ? dy + 1 : dy;
+                for (size_t dx = qx * 4; dx < qx * 4 + 4; ++dx) {
+                  const size_t dxn = (dx + 1 < 8) ? dx + 1 : dx;
+                  const float dh =
+                      std::min(cap, std::abs(p[c][dy][dx] - p[c][dy][dxn]));
+                  const float dv =
+                      std::min(cap, std::abs(p[c][dy][dx] - p[c][dyn][dx]));
+                  qsum += 0.5f * (dh + dv);
+                }
+              }
+              q_energy[qy * 2 + qx] = qsum * (1.0f / 16.0f);
+            }
+          }
+          E[c][0] =
+              0.25f * (q_energy[0] + q_energy[1] + q_energy[2] + q_energy[3]);
+          // Harmonic (L_{-2}) pooling across the four 4x4 quadrants:
+          // stays small if any 4x4 sub-block is flat (preventing edge ringing).
+          float inv_sq_sum = 0.0f;
+          for (size_t q = 0; q < 4; ++q) {
+            const float qe = q_energy[q] + 5e-4f;
+            inv_sq_sum += 1.0f / (qe * qe);
+          }
+          E0_harm[c] = 2.0f / std::sqrt(inv_sq_sum);
+
+          // Scale s=1 (1:2 superpixels on 4x4 grid):
+          float s1_sum = 0.0f;
+          for (size_t sy = 0; sy < 4; ++sy) {
+            const size_t syn = (sy + 1 < 4) ? sy + 1 : sy;
+            for (size_t sx = 0; sx < 4; ++sx) {
+              const size_t sxn = (sx + 1 < 4) ? sx + 1 : sx;
+              const float dh = std::min(
+                  cap, std::abs(sub2x2[c][sy][sx] - sub2x2[c][sy][sxn]));
+              const float dv = std::min(
+                  cap, std::abs(sub2x2[c][sy][sx] - sub2x2[c][syn][sx]));
+              s1_sum += 0.5f * (dh + dv);
+            }
+          }
+          E[c][1] = s1_sum * (1.0f / 16.0f);
+
+          // Scale s=2 (1:4 sub-blocks on 2x2 grid):
+          const float d2_h0 = std::abs(sub4x4[c][0][0] - sub4x4[c][0][1]);
+          const float d2_h1 = std::abs(sub4x4[c][1][0] - sub4x4[c][1][1]);
+          const float d2_v0 = std::abs(sub4x4[c][0][0] - sub4x4[c][1][0]);
+          const float d2_v1 = std::abs(sub4x4[c][0][1] - sub4x4[c][1][1]);
+          E[c][2] = std::min(cap, 0.25f * (d2_h0 + d2_h1 + d2_v0 + d2_v1));
+        }
+
+        // Scale s=3 (1:8 coarse gradient against adjacent 8x8 blocks):
+        const size_t xm = (x >= 4) ? x - 4 : x;
+        const size_t xp = (x + 11 < xsize) ? x + 11 : x + 7;
+        const size_t ym = (y >= 4) ? y - 4 : y;
+        const size_t yp = (y + 11 < ysize) ? y + 11 : y + 7;
+        float nb_mean[3] = {};
+        for (size_t dy : {size_t(2), size_t(5)}) {
+          for (size_t dx : {size_t(2), size_t(5)}) {
+            const float vx_l = 10.0f * rect_in.ConstRow(xyb_x, y + dy)[xm];
+            const float vx_r = 10.0f * rect_in.ConstRow(xyb_x, y + dy)[xp];
+            const float vy_t = rect_in.ConstRow(xyb_y, ym)[x + dx];
+            const float vy_b = rect_in.ConstRow(xyb_y, yp)[x + dx];
+            const float vb_t =
+                0.55f * (rect_in.ConstRow(xyb_b, ym)[x + dx] - vy_t);
+            const float vb_b =
+                0.55f * (rect_in.ConstRow(xyb_b, yp)[x + dx] - vy_b);
+            nb_mean[0] += 0.125f * (std::abs(vx_l - block_mean[0]) +
+                                    std::abs(vx_r - block_mean[0]));
+            nb_mean[1] += 0.125f * (std::abs(vy_t - block_mean[1]) +
+                                    std::abs(vy_b - block_mean[1]));
+            nb_mean[2] += 0.125f * (std::abs(vb_t - block_mean[2]) +
+                                    std::abs(vb_b - block_mean[2]));
+          }
+        }
+        for (size_t c = 0; c < 3; ++c) {
+          E[c][3] = std::min(kSatCap[c], nb_mean[c]);
+        }
+
+        const float size_gate = (xsize * ysize > 64) ? 1.0f : 0.0f;
+        const float dist_w =
+            size_gate * 0.28f * Clamp1(3.5f - butteraugli_target, 0.0f, 1.0f) *
+            Clamp1((butteraugli_target - 0.55f) * 2.2f, 0.0f, 1.0f);
+        const float band_dist_w =
+            size_gate * 0.52f * Clamp1(3.5f - butteraugli_target, 0.0f, 1.0f) *
+            Clamp1((butteraugli_target - 0.35f) * 2.0f, 0.0f, 1.0f);
+        const float edge_loc_y =
+            Clamp1(E[1][0] / (E0_harm[1] + 1e-4f), 1.0f, 2.5f);
+        const float edge_boost_q =
+            std::min(0.012f, 0.010f * std::max(0.0f, edge_loc_y - 1.25f) *
+                                 Clamp1((E[1][0] - 0.015f) * 80.0f, 0.0f, 1.0f));
+        const float luma_broad = E[1][0] + E[1][1] + E[1][2] + 0.004f;
+        const float chroma_x_ratio = (E[0][0] + E[0][1] + E[0][2]) / luma_broad;
+        const float chroma_b_ratio = (E[2][0] + E[2][1] + E[2][2]) / luma_broad;
+        const float chroma_boost =
+            std::min(0.012f,
+                     0.006f * std::max(0.0f, chroma_x_ratio - 0.65f) +
+                         0.005f * std::max(0.0f, chroma_b_ratio - 0.65f));
+        const float achromatic =
+            Clamp1(1.15f - (chroma_x_ratio + chroma_b_ratio), 0.0f, 1.0f);
+        const float uniform_tex_mask =
+            achromatic * (0.009f / (edge_loc_y * edge_loc_y)) *
+            std::min(1.0f, std::max(0.0f, E0_harm[1] - 0.020f) / 0.018f);
+        base_log_q += dist_w * (edge_boost_q + chroma_boost - uniform_tex_mask);
+        const float q_mod =
+            FastPow2f(base_log_q * 1.442695041f) * mul + add;
+        row_out[ix] = q_mod;
+
+        for (size_t c = 0; c < 3; ++c) {
+          const float eps = 0.001f;
+          const float e_avg =
+              0.30f * E[c][0] + 0.30f * E[c][1] + 0.25f * E[c][2] +
+              0.15f * E[c][3] + eps;
+          const float c_boost =
+              (c == 0)   ? Clamp1(0.98f + 0.16f * chroma_x_ratio, 0.94f, 1.28f)
+              : (c == 2) ? Clamp1(0.98f + 0.14f * chroma_b_ratio + 0.35f * blue_boost,
+                                  0.94f, 1.28f)
+                         : 1.0f;
+          // Localized edge indicator: when E[c][0] >> E0_harm[c], the block has
+          // an isolated edge next to a smooth area; protect HF/MF precision.
+          const float edge_loc =
+              Clamp1(E[c][0] / (E0_harm[c] + 1e-4f), 1.0f, 2.5f);
+          const float edge_boost = 1.0f + 0.08f * std::max(0.0f, edge_loc - 1.20f);
+          const float tex_excess = std::max(0.0f, E0_harm[1] - 0.014f);
+          for (size_t s = 0; s < 4; ++s) {
+            const float rel = (E[c][s] + eps) / e_avg;
+            float phi = Clamp1(0.95f + 0.07f * rel, 0.92f, 1.22f) * c_boost;
+            if (s == 0) {
+              const float hf_mask =
+                  1.0f / (1.0f + 0.22f * (tex_excess / 0.014f) / (edge_loc * edge_loc));
+              phi *= hf_mask * edge_boost;
+            } else if (s == 1) {
+              const float hf_mask =
+                  1.0f / (1.0f + 0.09f * (tex_excess / 0.014f) / edge_loc);
+              phi *= hf_mask * 1.02f;
+            } else if (s == 2) {
+              phi *= 1.01f;
+            } else {
+              // Coarse scale (s = 3, 1:8 LF) cascades across all pyramid levels.
+              phi *= 1.05f;
+            }
+            const float mod_phi =
+                1.0f + band_dist_w * (Clamp1(phi, 0.72f, 1.32f) - 1.0f);
+            band_qf[c][s].Row(iy)[ix] = q_mod * mod_phi;
+          }
+        }
+      }
     }
   }
 }
@@ -465,7 +662,8 @@ struct AdaptiveQuantizationImpl {
 
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
                      const Rect& rect_in, const Rect& rect_out,
-                     const int thread, ImageF* mask, ImageF* mask1x1) {
+                     const int thread, ImageF* mask, ImageF* mask1x1,
+                     ImageF (*band_qf)[4]) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
     const size_t xsize = xyb.xsize();
@@ -623,7 +821,8 @@ struct AdaptiveQuantizationImpl {
       }
     }
     PerBlockModulations(butteraugli_target, xyb.Plane(0), xyb.Plane(1),
-                        xyb.Plane(2), rect_in, scale, rect_out, &aq_map);
+                        xyb.Plane(2), rect_in, scale, rect_out, &aq_map,
+                        band_qf);
     return true;
   }
   std::vector<ImageF> pre_erosion;
@@ -664,7 +863,8 @@ Status Blur1x1Masking(JxlMemoryManager* memory_manager, ThreadPool* pool,
 StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
                                          const Image3F& xyb, const Rect& rect,
                                          float scale, ThreadPool* pool,
-                                         ImageF* mask, ImageF* mask1x1) {
+                                         ImageF* mask, ImageF* mask1x1,
+                                         ImageF (*band_qf)[4]) {
   JXL_ENSURE(rect.xsize() % kBlockDim == 0);
   JXL_ENSURE(rect.ysize() % kBlockDim == 0);
   AdaptiveQuantizationImpl impl;
@@ -677,6 +877,15 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
       *mask, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
   JXL_ASSIGN_OR_RETURN(
       *mask1x1, ImageF::Create(memory_manager, xyb.xsize(), xyb.ysize()));
+  if (band_qf != nullptr) {
+    for (size_t c = 0; c < 3; ++c) {
+      for (size_t s = 0; s < 4; ++s) {
+        JXL_ASSIGN_OR_RETURN(
+            band_qf[c][s],
+            ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
+      }
+    }
+  }
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(impl.PrepareBuffers(memory_manager, num_threads));
     return true;
@@ -692,7 +901,8 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
     Rect rect_out(bx0, by0, bx1 - bx0, by1 - by0);
     JXL_RETURN_IF_ERROR(impl.ComputeTile(butteraugli_target, scale, xyb, rect,
-                                         rect_out, thread, mask, mask1x1));
+                                         rect_out, thread, mask, mask1x1,
+                                         band_qf));
     return true;
   };
   size_t num_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks) *
@@ -1196,10 +1406,15 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
 }  // namespace
 
 Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
-                        float butteraugli_target, ImageF* quant_field) {
+                        float butteraugli_target, ImageF* quant_field,
+                        ImageF (*band_qf)[4]) {
   // Replace the whole quant_field in non-8x8 blocks with the maximum of each
   // 8x8 block.
   size_t stride = quant_field->PixelsPerRow();
+  const bool has_band_qf =
+      butteraugli_target < 3.5f &&
+      quant_field->xsize() * quant_field->ysize() > 64 && band_qf != nullptr &&
+      band_qf[0][0].xsize() > 0 && band_qf[0][0].ysize() > 0;
 
   // At low distances it is great to use max, but mean works better
   // at high distances. We interpolate between them for a distance
@@ -1239,7 +1454,22 @@ Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
       }
       for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
         for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
+          const float old_q = std::max(quant_row[x + ix + iy * stride], 1e-4f);
+          const float rescale = max / old_q;
           quant_row[x + ix + iy * stride] = max;
+          if (has_band_qf) {
+            static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f,
+                                                         1.00f};
+            for (size_t c = 0; c < 3; ++c) {
+              for (size_t s = 0; s < 4; ++s) {
+                const float band_rescale =
+                    (rescale > 1.0f)
+                        ? (1.0f + kBandRescaleMix[s] * (rescale - 1.0f))
+                        : rescale;
+                rect.Row(&band_qf[c][s], y + iy)[x + ix] *= band_rescale;
+              }
+            }
+          }
         }
       }
     }
@@ -1264,10 +1494,12 @@ float InitialQuantDC(float butteraugli_target) {
 StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* mask, ImageF* mask1x1) {
-  const float quant_ac = kAcQuant / butteraugli_target;
+                                   ImageF* mask, ImageF* mask1x1,
+                                   ImageF (*band_qf)[4]) {
+  const float quant_ac = kAcQuant / std::max(1e-4f, butteraugli_target);
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
-      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask, mask1x1);
+      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask, mask1x1,
+      band_qf);
 }
 
 Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,

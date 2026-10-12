@@ -330,7 +330,7 @@ Status LoopFilterFromParams(const CompressParams& cparams, bool streaming_mode,
     if (frame_header->encoding == FrameEncoding::kModular) {
       loop_filter->epf_iters = 0;
     } else {
-      constexpr float kThresholds[3] = {0.7, 1.5, 4.0};
+      constexpr float kThresholds[3] = {0.7f, 3.0f, 4.5f};
       loop_filter->epf_iters = 0;
       if (cparams.decoding_speed_tier < 3) {
         for (size_t i = cparams.decoding_speed_tier == 2 ? 1 : 0; i < 3; i++) {

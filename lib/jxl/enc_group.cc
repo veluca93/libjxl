@@ -34,6 +34,7 @@
 #include "lib/jxl/common.h"  // kMaxNumPasses
 #include "lib/jxl/dct_util.h"
 #include "lib/jxl/dec_transforms-inl.h"
+#include "lib/jxl/enc_adaptive_quantization.h"
 #include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_params.h"
@@ -48,167 +49,371 @@ namespace HWY_NAMESPACE {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Abs;
+using hwy::HWY_NAMESPACE::Add;
+using hwy::HWY_NAMESPACE::CopySignToAbs;
 using hwy::HWY_NAMESPACE::Ge;
-using hwy::HWY_NAMESPACE::IfThenElse;
 using hwy::HWY_NAMESPACE::IfThenElseZero;
-using hwy::HWY_NAMESPACE::MaskFromVec;
+using hwy::HWY_NAMESPACE::Lt;
+using hwy::HWY_NAMESPACE::Max;
 using hwy::HWY_NAMESPACE::Round;
+using hwy::HWY_NAMESPACE::Sub;
 
 // NOTE: caller takes care of extracting quant from rect of RawQuantField.
 void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
                      size_t c, float qm_multiplier, AcStrategyType quant_kind,
-                     size_t xsize, size_t ysize, float* thresholds,
-                     const float* JXL_RESTRICT block_in, const int32_t* quant,
-                     int32_t* JXL_RESTRICT block_out) {
+                     size_t xsize, size_t ysize, const float zero_thres[8],
+                     float eob_scale, const float* JXL_RESTRICT block_in,
+                     int32_t quant, int32_t* JXL_RESTRICT block_out) {
   const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
-  float qac = quantizer.Scale() * (*quant);
-  // Not SIMD-ified for now.
+  const float qac = quantizer.Scale() * quant * qm_multiplier;
+
+  float quad_thres[4] = {zero_thres[0], zero_thres[1], zero_thres[2],
+                         zero_thres[3]};
   if (c != 1 && xsize * ysize >= 4) {
+    const float sub = 0.00744f * static_cast<float>(xsize * ysize);
     for (int i = 0; i < 4; ++i) {
-      thresholds[i] -= 0.00744f * xsize * ysize;
-      if (thresholds[i] < 0.5) {
-        thresholds[i] = 0.5;
+      quad_thres[i] = std::max(0.50f, quad_thres[i] - sub);
+    }
+  }
+
+  HWY_CAPPED(float, kBlockDim) df;
+  HWY_CAPPED(int32_t, kBlockDim) di;
+  const auto quantv = Set(df, qac);
+  const auto one = Set(df, 1.0f);
+  const auto half = Set(df, 0.5f);
+  const auto lim1 = Set(df, 2.2f);
+  const auto lim2 = Set(df, 4.2f);
+
+  HWY_ALIGN float t0_row[AcStrategy::kMaxBlockDim];
+  HWY_ALIGN float bias_row[AcStrategy::kMaxBlockDim];
+  const float bias_scale = Clamp1(1.35f * eob_scale, 0.0f, 1.0f);
+
+  for (size_t v8 = 0; v8 < kBlockDim; ++v8) {
+    if ((v8 & 1) == 0) {
+      for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
+        const size_t hfix =
+            (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
+        const float t0 = quad_thres[hfix] + zero_thres[4 + kCoeffBand[v8][u8]];
+        const float bias =
+            bias_scale * Clamp1(0.42f * (t0 - 0.568f), -0.004f, 0.040f);
+        for (size_t ix = 0; ix < xsize; ++ix) {
+          t0_row[u8 * xsize + ix] = t0;
+          bias_row[u8 * xsize + ix] = bias;
+        }
+      }
+    }
+    for (size_t iy = 0; iy < ysize; ++iy) {
+      const size_t y = v8 * ysize + iy;
+      const size_t off = y * kBlockDim * xsize;
+      for (size_t x = 0; x < xsize * kBlockDim; x += Lanes(df)) {
+        const auto t0 = Load(df, t0_row + x);
+        const auto half_bias = Mul(Load(df, bias_row + x), half);
+        const auto q = Mul(Load(df, qm + off + x), quantv);
+        const auto in = Load(df, block_in + off + x);
+        const auto val = Mul(q, in);
+        const auto abs_val = Abs(val);
+        const auto nzero_mask = Ge(abs_val, t0);
+        const auto eff_bias =
+            Add(IfThenElseZero(Lt(abs_val, lim1), half_bias),
+                IfThenElseZero(Lt(abs_val, lim2), half_bias));
+        const auto r_abs = Max(one, Round(Sub(abs_val, eff_bias)));
+        const auto v = ConvertTo(
+            di, IfThenElseZero(nzero_mask, CopySignToAbs(r_abs, val)));
+        Store(v, di, block_out + off + x);
       }
     }
   }
-  HWY_CAPPED(float, kBlockDim) df;
-  HWY_CAPPED(int32_t, kBlockDim) di;
-  HWY_CAPPED(uint32_t, kBlockDim) du;
-  const auto quantv = Set(df, qac * qm_multiplier);
-  for (size_t y = 0; y < ysize * kBlockDim; y++) {
-    size_t yfix = static_cast<size_t>(y >= ysize * kBlockDim / 2) * 2;
-    const size_t off = y * kBlockDim * xsize;
-    for (size_t x = 0; x < xsize * kBlockDim; x += Lanes(df)) {
-      auto threshold = Zero(df);
-      if (xsize == 1) {
-        HWY_ALIGN uint32_t kMask[kBlockDim] = {0, 0, 0, 0, ~0u, ~0u, ~0u, ~0u};
-        const auto mask = MaskFromVec(BitCast(df, Load(du, kMask + x)));
-        threshold = IfThenElse(mask, Set(df, thresholds[yfix + 1]),
-                               Set(df, thresholds[yfix]));
-      } else {
-        // Same for all lanes in the vector.
-        threshold = Set(
-            df,
-            thresholds[yfix + static_cast<size_t>(x >= xsize * kBlockDim / 2)]);
+
+  // Backward EOB / trailing zero-run RDO along the natural zig-zag scan order.
+  // In AC tokenization, the scan terminates immediately after the last non-zero
+  // coefficient (when --nzeros == 0). Thus, a trailing +/-1 coefficient
+  // preceded by a run of Z zeros costs (Z + 1) extra tokens compared to
+  // terminating at the previous non-zero coefficient.
+  if (eob_scale > 0.0f &&
+      ((1 << static_cast<size_t>(quant_kind)) & kPartialBlockKinds) == 0 &&
+      xsize >= ysize) {
+    const size_t cx = xsize;
+    const size_t cy = ysize;
+    const size_t xs = cx / cy;
+    const size_t xsm = xs - 1;
+    const size_t xss = CeilLog2Nonzero(xs);
+    const size_t dim = cx * kBlockDim;
+    const size_t min_keep_nz =
+        (eob_scale < 0.35f) ? (2 * cx * cy) : ((c == 1) ? 2 : 1);
+    const float max_bonus = ((c == 1) ? 0.045f : 0.055f) * eob_scale;
+    const float cand_max_bonus = 1.35f * max_bonus;
+    const float run_slope = ((c == 1) ? 0.0032f : 0.0040f) * eob_scale;
+
+    constexpr size_t kMaxCands = 8;
+    struct TailCand {
+      int pos;
+      float norm_excess;
+      uint8_t band;
+      size_t zeros_before;
+    };
+    TailCand cands[kMaxCands];
+    size_t num_cands = 0;
+    bool hit_barrier = false;
+    size_t kept_nz = 0;
+    size_t zeros_since_last_nz = 0;
+    int pending_interior_pos = -1;
+
+    auto visit_coeff = [&](size_t x, size_t y) -> bool {
+      const size_t pos = y * dim + x;
+      const int32_t q = block_out[pos];
+      if (q == 0) {
+        if (num_cands > 0 && !hit_barrier) {
+          ++cands[num_cands - 1].zeros_before;
+        }
+        ++zeros_since_last_nz;
+        return true;
       }
-      const auto q = Mul(Load(df, qm + off + x), quantv);
-      const auto in = Load(df, block_in + off + x);
-      const auto val = Mul(q, in);
-      const auto nzero_mask = Ge(Abs(val), threshold);
-      const auto v = ConvertTo(di, IfThenElseZero(nzero_mask, Round(val)));
-      Store(v, di, block_out + off + x);
+      if (pending_interior_pos >= 0) {
+        if (zeros_since_last_nz >= 5) {
+          block_out[pending_interior_pos] = 0;
+          --kept_nz;
+        }
+        pending_interior_pos = -1;
+      }
+      const size_t v8 = y / cy;
+      const size_t u8 = x / cx;
+      const uint8_t s = kCoeffBand[v8][u8];
+      const size_t hfix =
+          (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
+      const float t0 = quad_thres[hfix] + zero_thres[4 + s];
+      const float abs_val = std::abs(block_in[pos] * (qm[pos] * qac));
+
+      if (!hit_barrier && num_cands < kMaxCands) {
+        if ((q == 1 || q == -1) && s <= 2 && zero_thres[4 + s] >= -0.004f) {
+          const float excess = std::max(0.0f, abs_val - t0);
+          const float band_scale =
+              (s == 0) ? 1.0f : ((s == 1) ? 0.80f : 0.45f);
+          const float norm_excess = excess / band_scale;
+          if (norm_excess < cand_max_bonus) {
+            cands[num_cands++] = {static_cast<int>(pos), norm_excess, s, 0};
+            zeros_since_last_nz = 0;
+            return true;
+          }
+        }
+        hit_barrier = true;
+      }
+
+      // Sparse-tail level transition |q|=2 -> 1 when preceded/followed by
+      // long zero runs in UHF/HF (s <= 1).
+      if ((q == 2 || q == -2) && s <= 1 && zeros_since_last_nz >= 3 &&
+          zero_thres[4 + s] >= 0.0f) {
+        const float bias =
+            bias_scale * Clamp1(0.42f * (t0 - 0.568f), -0.004f, 0.040f);
+        const float level2_thres = 1.50f + bias + 0.022f * eob_scale;
+        if (abs_val < level2_thres) {
+          block_out[pos] = (q > 0) ? 1 : -1;
+        }
+      } else if (hit_barrier && (q == 1 || q == -1) && s == 0 && hfix == 3 &&
+                 zeros_since_last_nz >= 5 && zero_thres[4] > 0.002f) {
+        const float excess = abs_val - t0;
+        if (excess < 0.012f * eob_scale) {
+          pending_interior_pos = static_cast<int>(pos);
+        }
+      }
+
+      zeros_since_last_nz = 0;
+      ++kept_nz;
+      return (kept_nz < min_keep_nz + 4);
+    };
+
+    bool keep_scanning = true;
+    for (size_t i = 0; i < dim - 1 && keep_scanning; ++i) {
+      for (size_t jj = 0; jj <= i; ++jj) {
+        const size_t j = i - jj;
+        size_t x = dim - 1 - (i - j);
+        size_t y = dim - 1 - j;
+        if (i & 1) std::swap(x, y);
+        if ((y & xsm) != 0) continue;
+        y >>= xss;
+        if (!visit_coeff(x, y)) {
+          keep_scanning = false;
+          break;
+        }
+      }
+    }
+    for (size_t ii = 0; ii < dim && keep_scanning; ++ii) {
+      const size_t i = dim - 1 - ii;
+      for (size_t jj = 0; jj <= i; ++jj) {
+        const size_t j = i - jj;
+        size_t x = j;
+        size_t y = i - j;
+        if (i & 1) std::swap(x, y);
+        if ((y & xsm) != 0) continue;
+        y >>= xss;
+        if (x < cx && y < cy) continue;
+        if (!visit_coeff(x, y)) {
+          keep_scanning = false;
+          break;
+        }
+      }
+    }
+
+    if (kept_nz + num_cands > min_keep_nz) {
+      const size_t max_k =
+          std::min(num_cands, (kept_nz + num_cands) - min_keep_nz);
+      // Viterbi DP for optimal EOB cutoff position best_m in [0, max_k].
+      bool reachable[kMaxCands + 1] = {true};
+      float dp_gain[kMaxCands + 1] = {0.0f};
+      size_t best_m = 0;
+      float best_gain = 0.0f;
+      for (size_t m = 1; m <= max_k; ++m) {
+        for (size_t prev_m = 0; prev_m < m; ++prev_m) {
+          if (!reachable[prev_m]) continue;
+          if (m - prev_m == 1 && cands[prev_m].norm_excess >= max_bonus) {
+            continue;
+          }
+          float group_excess = 0.0f;
+          size_t group_zeros = 0;
+          uint8_t max_band = 0;
+          for (size_t j = prev_m; j < m; ++j) {
+            group_excess += cands[j].norm_excess;
+            group_zeros += cands[j].zeros_before;
+            max_band = std::max(max_band, cands[j].band);
+          }
+          group_zeros += (m - 1 - prev_m);
+          const size_t min_run = (max_band == 2) ? 5 : 2;
+          const float group_cap =
+              max_bonus * (1.0f + 0.35f * static_cast<float>(m - 1 - prev_m));
+          if (group_zeros >= min_run) {
+            const float allowed = std::min(
+                group_cap,
+                run_slope * static_cast<float>(group_zeros - min_run + 1));
+            if (group_excess < allowed) {
+              reachable[m] = true;
+              const float gain = dp_gain[prev_m] + (allowed - group_excess);
+              if (gain > dp_gain[m]) {
+                dp_gain[m] = gain;
+              }
+            }
+          }
+        }
+        if (reachable[m] && dp_gain[m] >= best_gain) {
+          best_gain = dp_gain[m];
+          best_m = m;
+        }
+      }
+      for (size_t i = 0; i < best_m; ++i) {
+        block_out[cands[i].pos] = 0;
+      }
     }
   }
 }
 
 void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
                         float qm_multiplier, AcStrategyType quant_kind,
-                        size_t xsize, size_t ysize, float* thresholds,
+                        size_t xsize, size_t ysize, float dct8_err_min,
+                        float zero_thres[8],
                         const float* JXL_RESTRICT block_in, int32_t* quant) {
-  // No quantization adjusting for these small blocks.
-  // Quantization adjusting attempts to fix some known issues
-  // with larger blocks and on the 8x8 dct's emerging 8x8 blockiness
-  // when there are not many non-zeros.
-  constexpr size_t kPartialBlockKinds =
-      (1 << static_cast<size_t>(AcStrategyType::IDENTITY)) |
-      (1 << static_cast<size_t>(AcStrategyType::DCT2X2)) |
-      (1 << static_cast<size_t>(AcStrategyType::DCT4X4)) |
-      (1 << static_cast<size_t>(AcStrategyType::DCT4X8)) |
-      (1 << static_cast<size_t>(AcStrategyType::DCT8X4)) |
-      (1 << static_cast<size_t>(AcStrategyType::AFV0)) |
-      (1 << static_cast<size_t>(AcStrategyType::AFV1)) |
-      (1 << static_cast<size_t>(AcStrategyType::AFV2)) |
-      (1 << static_cast<size_t>(AcStrategyType::AFV3));
   if ((1 << static_cast<size_t>(quant_kind)) & kPartialBlockKinds) {
     return;
   }
 
-  const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
-  float qac = quantizer.Scale() * (*quant);
+  float trial_thres[4] = {0.58f, 0.64f, 0.64f, 0.64f};
   if (xsize > 1 || ysize > 1) {
+    const float sub = Clamp1(0.003f * xsize * ysize, 0.0f, 0.08f);
     for (int i = 0; i < 4; ++i) {
-      thresholds[i] -= Clamp1(0.003f * xsize * ysize, 0.f, 0.08f);
-      if (thresholds[i] < 0.54) {
-        thresholds[i] = 0.54;
-      }
+      trial_thres[i] = std::max(0.54f, trial_thres[i] - sub);
     }
   }
-  float sum_of_highest_freq_row_and_column = 0;
-  float sum_of_error = 0;
-  float sum_of_vals = 0;
+
+  // Band distortion weights w_s = (q_{c,s} / q_ref)^2 derived from per-band
+  // deadzone offsets zero_thres[4 + s].
+  float band_w[4];
+  for (size_t s = 0; s < 4; ++s) {
+    band_w[s] = Clamp1(1.0f - 3.5f * zero_thres[4 + s], 0.88f, 1.12f);
+  }
+
+  const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
+  const float qac_mul = quantizer.Scale() * (*quant) * qm_multiplier;
+
+  float sum_of_highest_freq_row_and_column = 0.0f;
+  float sum_of_error = 0.0f;
+  float sum_of_vals = 0.0f;
   float hfNonZeros[4] = {};
   float hfMaxError[4] = {};
+  uint8_t hfMaxErrorBand[4] = {2, 1, 1, 0};
 
   for (size_t y = 0; y < ysize * kBlockDim; y++) {
+    const size_t v8 = y / ysize;
     for (size_t x = 0; x < xsize * kBlockDim; x++) {
       const size_t pos = y * kBlockDim * xsize + x;
       if (x < xsize && y < ysize) {
         continue;
       }
-      const size_t hfix = (static_cast<size_t>(y >= ysize * kBlockDim / 2) * 2 +
-                           static_cast<size_t>(x >= xsize * kBlockDim / 2));
-      const float val = block_in[pos] * (qm[pos] * qac * qm_multiplier);
-      const float v = (std::abs(val) < thresholds[hfix]) ? 0 : rintf(val);
+      const size_t u8 = x / xsize;
+      const uint8_t s = kCoeffBand[v8][u8];
+      const size_t hfix =
+          (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
+      const float val = block_in[pos] * (qm[pos] * qac_mul);
+      const float abs_val = std::abs(val);
+      const float t_trial = trial_thres[hfix] + zero_thres[4 + s];
+      const float v_trial = (abs_val < t_trial) ? 0.0f : rintf(val);
+      sum_of_error += band_w[s] * std::abs(val - v_trial);
+      sum_of_vals += std::abs(v_trial);
+      const float t0 = (dct8_err_min > 0.0f)
+                           ? (zero_thres[hfix] + zero_thres[4 + s])
+                           : t_trial;
+      const float v = (abs_val < t0) ? 0.0f : rintf(val);
       const float error = std::abs(val - v);
-      sum_of_error += error;
-      sum_of_vals += std::abs(v);
-      if (c == 1 && v == 0) {
+      if (c == 1 && v == 0.0f) {
         if (hfMaxError[hfix] < error) {
           hfMaxError[hfix] = error;
+          hfMaxErrorBand[hfix] = s;
         }
       }
       if (v != 0.0f) {
-        hfNonZeros[hfix] += std::abs(v);
-        bool in_corner = y >= 7 * ysize && x >= 7 * xsize;
+        const float abs_v = std::abs(v);
+        hfNonZeros[hfix] += abs_v;
+        bool in_corner = v8 >= 7 && u8 >= 7;
         bool on_border =
             y == ysize * kBlockDim - 1 || x == xsize * kBlockDim - 1;
-        bool in_larger_corner = x >= 4 * xsize && y >= 4 * ysize;
+        bool in_larger_corner = u8 >= 4 && v8 >= 4;
         if (in_corner || (on_border && in_larger_corner)) {
-          sum_of_highest_freq_row_and_column += std::abs(val);
+          sum_of_highest_freq_row_and_column += abs_val;
         }
       }
     }
   }
   if (c == 1 && sum_of_vals * 8 < xsize * ysize) {
-    static const double kLimit[4] = {
-        0.46,
-        0.46,
-        0.46,
-        0.46,
-    };
-    static const double kMul[4] = {
-        0.9999,
-        0.9999,
-        0.9999,
-        0.9999,
-    };
+    static constexpr float kLimit = 0.46f;
+    static constexpr float kMul = 0.9999f;
     const int32_t orig_quant = *quant;
     int32_t new_quant = *quant;
     for (int i = 1; i < 4; ++i) {
-      if (hfNonZeros[i] == 0.0 && hfMaxError[i] > kLimit[i]) {
+      if (hfNonZeros[i] == 0.0f && hfMaxError[i] > kLimit) {
         new_quant = orig_quant + 1;
         break;
       }
     }
     *quant = new_quant;
-    if (hfNonZeros[3] == 0.0 && hfMaxError[3] > kLimit[3]) {
-      thresholds[3] = kMul[3] * hfMaxError[3] * new_quant / orig_quant;
-    } else if ((hfNonZeros[1] == 0.0 && hfMaxError[1] > kLimit[1]) ||
-               (hfNonZeros[2] == 0.0 && hfMaxError[2] > kLimit[2])) {
-      thresholds[1] = kMul[1] * std::max(hfMaxError[1], hfMaxError[2]) *
-                      new_quant / orig_quant;
-      thresholds[2] = thresholds[1];
-    } else if (hfNonZeros[0] == 0.0 && hfMaxError[0] > kLimit[0]) {
-      thresholds[0] = kMul[0] * hfMaxError[0] * new_quant / orig_quant;
+    if (hfNonZeros[3] == 0.0f && hfMaxError[3] > kLimit) {
+      zero_thres[3] = kMul * hfMaxError[3] * new_quant / orig_quant -
+                      zero_thres[4 + hfMaxErrorBand[3]];
+    } else if ((hfNonZeros[1] == 0.0f && hfMaxError[1] > kLimit) ||
+               (hfNonZeros[2] == 0.0f && hfMaxError[2] > kLimit)) {
+      if (hfNonZeros[1] == 0.0f &&
+          (hfNonZeros[2] != 0.0f || hfMaxError[1] >= hfMaxError[2])) {
+        zero_thres[1] = kMul * hfMaxError[1] * new_quant / orig_quant -
+                        zero_thres[4 + hfMaxErrorBand[1]];
+      } else {
+        zero_thres[2] = kMul * hfMaxError[2] * new_quant / orig_quant -
+                        zero_thres[4 + hfMaxErrorBand[2]];
+      }
+    } else if (hfNonZeros[0] == 0.0f && hfMaxError[0] > kLimit) {
+      zero_thres[0] = kMul * hfMaxError[0] * new_quant / orig_quant -
+                      zero_thres[4 + hfMaxErrorBand[0]];
     }
   }
-  // Heuristic for improving accuracy of high-frequency patterns
-  // occurring in an environment with no medium-frequency masking
-  // patterns.
+  // Protect isolated high-frequency patterns when medium-frequency masking is absent.
   {
     float all =
-        hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3] + 1;
-    float mul[3] = {70, 30, 60};
+        hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3] + 1.0f;
+    float mul[3] = {70.0f, 30.0f, 60.0f};
     if (mul[c] * sum_of_highest_freq_row_and_column >= all) {
       *quant += mul[c] * sum_of_highest_freq_row_and_column / all;
       if (*quant >= Quantizer::kQuantMax) {
@@ -217,9 +422,9 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
     }
   }
   if (quant_kind == AcStrategyType::DCT) {
-    // If this 8x8 block is too flat, increase the adaptive quantization level
-    // a bit to reduce visible block boundaries and requantize the block.
-    if (hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3] < 11) {
+    const float total_nz =
+        hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3];
+    if (total_nz < 11.0f && sum_of_error >= dct8_err_min) {
       *quant += 1;
       if (*quant >= Quantizer::kQuantMax) {
         *quant = Quantizer::kQuantMax - 1;
@@ -228,48 +433,16 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
   }
   {
     static const double kMul1[4][3] = {
-        {
-            0.22080615753848404,
-            0.45797479824262011,
-            0.29859235095977965,
-        },
-        {
-            0.70109486510286834,
-            0.16185281305512639,
-            0.14387691730035473,
-        },
-        {
-            0.114985964456218638,
-            0.44656840441027695,
-            0.10587658215149048,
-        },
-        {
-            0.46849665264409396,
-            0.41239077937781954,
-            0.088667407767185444,
-        },
+        {0.22080615753848404, 0.45797479824262011, 0.29859235095977965},
+        {0.70109486510286834, 0.16185281305512639, 0.14387691730035473},
+        {0.114985964456218638, 0.44656840441027695, 0.10587658215149048},
+        {0.46849665264409396, 0.41239077937781954, 0.088667407767185444},
     };
     static const double kMul2[4][3] = {
-        {
-            0.27450281941822197,
-            1.1255766549984996,
-            0.98950459134128388,
-        },
-        {
-            0.4652168675598285,
-            0.40945807983455818,
-            0.36581899811751367,
-        },
-        {
-            0.28034972424715715,
-            0.9182653201929738,
-            1.5581531543057416,
-        },
-        {
-            0.26873118114033728,
-            0.68863712390392484,
-            1.2082185408666786,
-        },
+        {0.27450281941822197, 1.1255766549984996, 0.98950459134128388},
+        {0.4652168675598285, 0.40945807983455818, 0.36581899811751367},
+        {0.28034972424715715, 0.9182653201929738, 1.5581531543057416},
+        {0.26873118114033728, 0.68863712390392484, 1.2082185408666786},
     };
     static const double kQuantNormalizer = 2.2942708343284721;
     sum_of_error *= kQuantNormalizer;
@@ -279,7 +452,9 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
       if (quant_kind == AcStrategyType::DCT32X16 ||
           quant_kind == AcStrategyType::DCT16X32) {
         ix = 1;
-      } else if (quant_kind == AcStrategyType::DCT16X16) {
+      } else if (quant_kind == AcStrategyType::DCT16X16 ||
+                 quant_kind == AcStrategyType::DCT32X8 ||
+                 quant_kind == AcStrategyType::DCT8X32) {
         ix = 0;
       } else if (quant_kind == AcStrategyType::DCT32X32) {
         ix = 2;
@@ -303,7 +478,6 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
     }
   }
   {
-    // Reduce quant in highly active areas.
     int32_t div = (xsize * ysize);
     float min_hf_non_zeros =
         std::min({hfNonZeros[0], hfNonZeros[1], hfNonZeros[2], hfNonZeros[3]});
@@ -313,8 +487,17 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
     }
     int32_t qp = *quant - activity;
     if (c == 1) {
-      for (int i = 1; i < 4; ++i) {
-        thresholds[i] += 0.01 * activity;
+      if (dct8_err_min > 0.0f) {
+        if (activity <= 2 && hfNonZeros[0] >= 2.0f * div) {
+          zero_thres[0] -= 0.003f;
+        }
+        zero_thres[1] += 0.010f * activity;
+        zero_thres[2] += 0.010f * activity;
+        zero_thres[3] += 0.002f + 0.0115f * activity;
+      } else {
+        for (int i = 1; i < 4; ++i) {
+          zero_thres[i] += 0.01f * activity;
+        }
       }
     }
     int32_t orig_qp_limit = std::max(4, *quant / 2);
@@ -330,38 +513,64 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
                                const Quantizer& quantizer,
                                const bool error_diffusion,
                                AcStrategyType quant_kind, size_t xsize,
-                               size_t ysize, const float* JXL_RESTRICT biases,
+                               size_t ysize, float zero_thres[3][8],
+                               float eob_scale, const float* JXL_RESTRICT biases,
                                int32_t* quant, float* JXL_RESTRICT inout,
                                int32_t* JXL_RESTRICT quantized) {
-  float thres_y[4] = {0.58f, 0.64f, 0.64f, 0.64f};
   if (enc_state->cparams.speed_tier <= SpeedTier::kHare) {
+    const float d = enc_state->cparams.butteraugli_distance;
+    const float dz_w =
+        Clamp1((d - 0.50f) / (d + 0.55f) * 1.65f, 0.0f, 1.0f);
+    const float hr_w = 1.0f - dz_w;
+    const float dct8_err_min =
+        (eob_scale > 0.0f) ? (0.40f + 1.80f * Clamp1(d - 1.0f, 0.0f, 1.0f))
+                           : 0.0f;
+    const float orig_y_q0 = zero_thres[1][0];
+    const float orig_y_hf[3] = {zero_thres[1][1], zero_thres[1][2],
+                                zero_thres[1][3]};
     int32_t max_quant = 0;
-    int quant_orig = *quant;
-    float val[3] = {enc_state->x_qm_multiplier, 1.0f,
-                    enc_state->b_qm_multiplier};
+    const int32_t quant_orig = *quant;
+    const float val[3] = {enc_state->x_qm_multiplier, 1.0f,
+                          enc_state->b_qm_multiplier};
     for (int c : {1, 0, 2}) {
-      float thres[4] = {0.58f, 0.64f, 0.64f, 0.64f};
       *quant = quant_orig;
       AdjustQuantBlockAC(quantizer, c, val[c], quant_kind, xsize, ysize,
-                         &thres[0], inout + c * size, quant);
-      // Dead zone adjustment
-      if (c == 1) {
-        for (int k = 0; k < 4; ++k) {
-          thres_y[k] = thres[k];
+                         dct8_err_min, zero_thres[c], inout + c * size, quant);
+      if (c == 1 && eob_scale > 0.0f) {
+        if (zero_thres[1][0] > orig_y_q0) {
+          zero_thres[1][0] =
+              orig_y_q0 + dz_w * (zero_thres[1][0] - orig_y_q0);
+        }
+        for (int k = 1; k < 4; ++k) {
+          const float base_hf = orig_y_hf[k - 1];
+          if (zero_thres[1][k] > base_hf) {
+            zero_thres[1][k] =
+                base_hf - 0.002f * hr_w + dz_w * (zero_thres[1][k] - base_hf);
+          }
+        }
+        const float luma_hf_dz =
+            std::max(0.0f, zero_thres[1][1] - orig_y_hf[0]);
+        for (int cc : {0, 2}) {
+          zero_thres[cc][1] += 0.15f * luma_hf_dz;
+          zero_thres[cc][2] += 0.15f * luma_hf_dz;
+          zero_thres[cc][3] += 0.005f * dz_w + 0.35f * luma_hf_dz;
         }
       }
       max_quant = std::max(*quant, max_quant);
     }
     *quant = max_quant;
   } else {
-    thres_y[0] = 0.56;
-    thres_y[1] = 0.62;
-    thres_y[2] = 0.62;
-    thres_y[3] = 0.62;
+    zero_thres[1][0] = 0.56f;
+    zero_thres[1][1] = 0.62f;
+    zero_thres[1][2] = 0.62f;
+    zero_thres[1][3] = 0.62f;
+    for (size_t s = 0; s < 4; ++s) {
+      zero_thres[1][4 + s] = 0.0f;
+    }
   }
-
   QuantizeBlockAC(quantizer, error_diffusion, 1, 1.0f, quant_kind, xsize, ysize,
-                  &thres_y[0], inout + size, quant, quantized + size);
+                  zero_thres[1], eob_scale, inout + size, *quant,
+                  quantized + size);
 
   const float* JXL_RESTRICT dequant_matrix =
       quantizer.DequantMatrix(quant_kind, 1);
@@ -400,6 +609,16 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
 
   ImageI& full_quant_field = enc_state->shared.raw_quant_field;
   const CompressParams& cparams = enc_state->cparams;
+  const size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
+  JXL_ENSURE(num_passes > 0);
+  const bool has_band_qf =
+      cparams.speed_tier <= SpeedTier::kHare &&
+      !cparams.disable_perceptual_optimizations && num_passes == 1 &&
+      cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
+      cparams.gaborish != Override::kOff &&
+      xsize_blocks * ysize_blocks > 64 &&
+      enc_state->band_qf[1][0].xsize() > 0 &&
+      enc_state->band_qf[1][0].ysize() > 0;
 
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
@@ -420,8 +639,6 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
     constexpr HWY_CAPPED(float, kDCTBlockSize) d;
 
     int32_t* JXL_RESTRICT coeffs[3][kMaxNumPasses] = {};
-    size_t num_passes = enc_state->progressive_splitter.GetNumPasses();
-    JXL_ENSURE(num_passes > 0);
     for (size_t i = 0; i < num_passes; i++) {
       // TODO(veluca): 16-bit quantized coeffs are not implemented yet.
       JXL_ENSURE(enc_state->coeffs[i]->Type() == ACType::k32);
@@ -465,15 +682,55 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           const AcStrategy acs = ac_strategy_row[bx];
           if (!acs.IsFirstBlock()) continue;
 
-          size_t xblocks = acs.covered_blocks_x();
-          size_t yblocks = acs.covered_blocks_y();
+          const size_t cov_x = acs.covered_blocks_x();
+          const size_t cov_y = acs.covered_blocks_y();
+          size_t xblocks = cov_x;
+          size_t yblocks = cov_y;
 
           CoefficientLayout(&yblocks, &xblocks);
 
           size_t size = kDCTBlockSize * xblocks * yblocks;
 
-          // DCT Y channel, roundtrip-quantize it and set DC.
           int32_t quant_ac = row_quant_ac[bx];
+          const float q_block = enc_state->shared.quantizer.Scale() * quant_ac;
+
+          // Gather per-band target quantizer q_{c, s}(T) over the covered blocks
+          // and derive jpegli-style per-band deadzones.
+          const float d_target = cparams.butteraugli_distance;
+          const float dz_w =
+              has_band_qf
+                  ? Clamp1((d_target - 0.35f) / (d_target + 0.55f) * 1.55f,
+                           0.0f, 1.0f)
+                  : 0.0f;
+          const float eob_scale =
+              (has_band_qf && cparams.speed_tier <= SpeedTier::kHare)
+                  ? Clamp1((d_target - 0.28f) / (d_target + 0.50f) * 1.45f,
+                           0.0f, 1.0f)
+                  : 0.0f;
+          float zero_thres[3][8];
+          const float inv_nblocks = 1.0f / static_cast<float>(cov_x * cov_y);
+          for (size_t c = 0; c < 3; ++c) {
+            float band_q[4] = {q_block, q_block, q_block, q_block};
+            if (has_band_qf) {
+              for (size_t s = 0; s < 4; ++s) {
+                float sq_sum = 0.0f;
+                for (size_t iy = 0; iy < cov_y; ++iy) {
+                  const float* JXL_RESTRICT bq_row =
+                      block_group_rect.ConstRow(enc_state->band_qf[c][s],
+                                                by + iy);
+                  for (size_t ix = 0; ix < cov_x; ++ix) {
+                    const float v = bq_row[bx + ix];
+                    sq_sum += v * v;
+                  }
+                }
+                band_q[s] = std::sqrt(sq_sum * inv_nblocks);
+              }
+            }
+            ComputeBandThresholds(c, acs.Strategy(), xblocks, yblocks, q_block,
+                                  band_q, zero_thres[c], dz_w);
+          }
+
+          // DCT all channels, roundtrip-quantize Y and set DC.
           for (size_t c : {0, 1, 2}) {
             TransformFromPixels(acs.Strategy(), opsin_rows[c] + bx * kBlockDim,
                                 opsin_stride, coeffs_in + c * size,
@@ -484,8 +741,9 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
 
           QuantizeRoundtripYBlockAC(
               enc_state, size, enc_state->shared.quantizer, error_diffusion,
-              acs.Strategy(), xblocks, yblocks, kDefaultQuantBias, &quant_ac,
-              coeffs_in, quantized);
+              acs.Strategy(), xblocks, yblocks, zero_thres, eob_scale,
+              kDefaultQuantBias, &quant_ac, coeffs_in, quantized);
+          row_quant_ac[bx] = quant_ac;
 
           // Unapply color correlation
           for (size_t k = 0; k < size; k += Lanes(d)) {
@@ -500,17 +758,15 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
 
           // Quantize X and B channels and set DC.
           for (size_t c : {0, 2}) {
-            float thres[4] = {0.58f, 0.62f, 0.62f, 0.62f};
             QuantizeBlockAC(enc_state->shared.quantizer, error_diffusion, c,
                             c == 0 ? enc_state->x_qm_multiplier
                                    : enc_state->b_qm_multiplier,
-                            acs.Strategy(), xblocks, yblocks, &thres[0],
-                            coeffs_in + c * size, &quant_ac,
+                            acs.Strategy(), xblocks, yblocks, zero_thres[c],
+                            eob_scale, coeffs_in + c * size, quant_ac,
                             quantized + c * size);
             DCFromLowestFrequencies(acs.Strategy(), coeffs_in + c * size,
                                     dc_rows[c] + bx, dc_stride, scratch_space);
           }
-          row_quant_ac[bx] = quant_ac;
           for (size_t c = 0; c < 3; c++) {
             enc_state->progressive_splitter.SplitACCoefficients(
                 quantized + c * size, acs, bx, by, coeffs[c]);

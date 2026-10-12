@@ -73,6 +73,10 @@ struct PassesEncoderState {
 
   ImageF initial_quant_masking1x1;
 
+  // Per-channel (X, Y, B), per-scale band (s = 0: 1:1, 1: 1:2, 2: 1:4, 3: 1:8)
+  // target quantizer fields at 8x8 block resolution for intra-block AQ and RDO.
+  ImageF band_qf[3][4];
+
   JxlMemoryManager* memory_manager() const { return shared.memory_manager; }
 };
 

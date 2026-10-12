@@ -901,6 +901,18 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
   float clamped_butteraugli = std::min(5.0f, cparams.butteraugli_distance);
+  const bool ar_enable_rdo =
+      cparams.speed_tier <= SpeedTier::kSquirrel &&
+      !cparams.disable_perceptual_optimizations &&
+      cparams.butteraugli_distance >= 0.35f &&
+      cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
+      cparams.ec_resampling <= 1 && cparams.gaborish != Override::kOff &&
+      cparams.epf != 3 &&
+      enc_state->progressive_splitter.GetNumPasses() == 1;
+  if (frame_header.loop_filter.epf_iters == 0 && ar_enable_rdo) {
+    FillPlane(static_cast<uint8_t>(0), &epf_sharpness, Rect(epf_sharpness));
+    return true;
+  }
   if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
       cparams.speed_tier > SpeedTier::kWombat ||
       frame_header.loop_filter.epf_iters == 0) {
@@ -987,9 +999,13 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
         int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
         const auto& ctx_histo = histo[context];
         const int mulix = epf_steps_lut[val] + 3 * context;
+        const float ratio =
+            ar_enable_rdo
+                ? (static_cast<float>(ctx_histo[val]) /
+                   static_cast<float>(totals[context]))
+                : static_cast<float>(ctx_histo[val] / totals[context]);
         mul[mulix] =
-            1.0 / (1.0 + c5 * std::log1p(ctx_histo[val] / totals[context]) /
-                             clamped_butteraugli);
+            1.0f / (1.0f + c5 * std::log1p(ratio) / clamped_butteraugli);
         if (val == 0) {
           mul[mulix] *= c3;
         }
@@ -1090,6 +1106,18 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   CfLHeuristics cfl_heuristics(memory_manager);
   ImageF initial_quant_field;
   ImageF initial_quant_masking;
+  const bool enable_rdo =
+      cparams.speed_tier <= SpeedTier::kSquirrel &&
+      !cparams.disable_perceptual_optimizations &&
+      cparams.butteraugli_distance >= 0.35f &&
+      cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
+      cparams.ec_resampling <= 1 && cparams.gaborish != Override::kOff &&
+      cparams.epf != 3 &&
+      enc_state->progressive_splitter.GetNumPasses() == 1 &&
+      frame_dim.xsize_blocks * frame_dim.ysize_blocks > 64;
+  if (!enable_rdo) {
+    enc_state->band_qf[1][0] = ImageF();
+  }
 
   // Compute an initial estimate of the quantization field.
   // Call InitialQuantField only in Hare mode or slower. Otherwise, rely
@@ -1124,7 +1152,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
                           1.0f, &initial_quant_masking,
-                          &initial_quant_masking1x1));
+                          &initial_quant_masking1x1,
+                          enable_rdo ? enc_state->band_qf : nullptr));
     float q = 0.39 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
@@ -1148,55 +1177,91 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         memory_manager, cparams, modular_frame_encoder, &matrices));
   }
 
-  JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
-  JXL_RETURN_IF_ERROR(acs_heuristics.Init(*opsin, rect, initial_quant_field,
-                                          initial_quant_masking,
-                                          initial_quant_masking1x1, &matrices));
+  enc_state->x_qm_multiplier =
+      std::pow(1.25f, frame_header.x_qm_scale - 2.0f);
+  enc_state->b_qm_multiplier =
+      std::pow(1.25f, frame_header.b_qm_scale - 2.0f);
 
+  JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
+  JXL_RETURN_IF_ERROR(acs_heuristics.Init(
+      *opsin, rect, initial_quant_field, initial_quant_masking,
+      initial_quant_masking1x1, &matrices,
+      enable_rdo ? enc_state->band_qf : nullptr, enc_state->x_qm_multiplier,
+      enc_state->b_qm_multiplier));
+
+  const size_t acs_tile_dim_blocks =
+      enable_rdo ? kGroupDimInBlocks : kEncTileDimInBlocks;
   auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
-    size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks);
+    size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks);
     size_t tx = tid % n_enc_tiles;
     size_t ty = tid / n_enc_tiles;
-    size_t by0 = ty * kEncTileDimInBlocks;
-    size_t by1 =
-        std::min((ty + 1) * kEncTileDimInBlocks, frame_dim.ysize_blocks);
-    size_t bx0 = tx * kEncTileDimInBlocks;
-    size_t bx1 =
-        std::min((tx + 1) * kEncTileDimInBlocks, frame_dim.xsize_blocks);
-    Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+    size_t gby0 = ty * acs_tile_dim_blocks;
+    size_t gby1 =
+        std::min((ty + 1) * acs_tile_dim_blocks, frame_dim.ysize_blocks);
+    size_t gbx0 = tx * acs_tile_dim_blocks;
+    size_t gbx1 =
+        std::min((tx + 1) * acs_tile_dim_blocks, frame_dim.xsize_blocks);
+    Rect group_rect(gbx0, gby0, gbx1 - gbx0, gby1 - gby0);
 
     // For speeds up to Wombat, we only compute the color correlation map
     // once we know the transform type and the quantization map.
     if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-      JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices,
-          /*ac_strategy=*/nullptr,
-          /*raw_quant_field=*/nullptr,
-          /*quantizer=*/nullptr, /*fast=*/false, thread, &cmap));
+      if (enable_rdo) {
+        quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                    &raw_quant_field);
+      }
+      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+        size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+          size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+          Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+              r, *opsin, rect, matrices,
+              /*ac_strategy=*/nullptr,
+              /*raw_quant_field=*/enable_rdo ? &raw_quant_field : nullptr,
+              /*quantizer=*/enable_rdo ? &quantizer : nullptr, /*fast=*/false,
+              thread, &cmap,
+              /*shrink_towards_zero=*/!enable_rdo ||
+                  cparams.noise == Override::kOn));
+        }
+      }
     }
 
     // Choose block sizes.
     JXL_RETURN_IF_ERROR(
-        acs_heuristics.ProcessRect(r, cmap, &ac_strategy, thread));
+        acs_heuristics.ProcessRect(group_rect, cmap, &ac_strategy, thread));
 
     // Always set the initial quant field, so we can compute the CfL map with
     // more accuracy. The initial quant field might change in slower modes, but
     // adjusting the quant field with butteraugli when all the other encoding
     // parameters are fixed is likely a more reliable choice anyway.
-    JXL_RETURN_IF_ERROR(AdjustQuantField(
-        ac_strategy, r, cparams.butteraugli_distance, &initial_quant_field));
-    quantizer.SetQuantFieldRect(initial_quant_field, r, &raw_quant_field);
+    JXL_RETURN_IF_ERROR(
+        AdjustQuantField(ac_strategy, group_rect, cparams.butteraugli_distance,
+                         &initial_quant_field,
+                         enable_rdo ? enc_state->band_qf : nullptr));
+    quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                &raw_quant_field);
 
     // Compute a non-default CfL map if we are at Hare speed, or slower.
     if (cparams.speed_tier <= SpeedTier::kHare) {
-      JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-          r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field, &quantizer,
-          /*fast=*/cparams.speed_tier >= SpeedTier::kWombat, thread, &cmap));
+      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+        size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+          size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+          Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+              r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+              &quantizer, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat,
+              thread, &cmap,
+              /*shrink_towards_zero=*/!enable_rdo ||
+                  cparams.noise == Override::kOn));
+        }
+      }
     }
     return true;
   };
-  size_t num_tiles = DivCeil(frame_dim.xsize_blocks, kEncTileDimInBlocks) *
-                     DivCeil(frame_dim.ysize_blocks, kEncTileDimInBlocks);
+  size_t num_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks) *
+                     DivCeil(frame_dim.ysize_blocks, acs_tile_dim_blocks);
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));

@@ -126,7 +126,7 @@ struct CFLFunction {
 // Chroma-from-luma search, values_m will have luma -- and values_s chroma.
 int32_t FindBestMultiplier(const float* values_m, const float* values_s,
                            size_t num, float base, float distance_mul,
-                           bool fast) {
+                           bool fast, bool shrink_towards_zero = false) {
   if (num == 0) {
     return 0;
   }
@@ -167,19 +167,15 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
       if (std::abs(step) < 3e-3) break;
     }
   }
-  // CFL seems to be tricky for larger transforms for HF components
-  // close to zero. This heuristic brings the solutions closer to zero
-  // and reduces red-green oscillations. A better approach would
-  // look into variance of the multiplier within separate (e.g. 8x8)
-  // areas and only apply this heuristic where there is a high variance.
-  // This would give about 1 % more compression density.
-  float towards_zero = 2.6;
-  if (x >= towards_zero) {
-    x -= towards_zero;
-  } else if (x <= -towards_zero) {
-    x += towards_zero;
-  } else {
-    x = 0;
+  if (shrink_towards_zero) {
+    constexpr float kTowardsZero = 2.6f;
+    if (std::abs(x) <= kTowardsZero) {
+      x = 0.0f;
+    } else if (x > 0.0f) {
+      x -= kTowardsZero;
+    } else {
+      x += kTowardsZero;
+    }
   }
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
@@ -209,8 +205,9 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const DequantMatrices& dequant,
                    const AcStrategyImage* ac_strategy,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
-                   const Rect& rect, bool fast, bool use_dct8, ImageSB* map_x,
-                   ImageSB* map_b, ImageF* dc_values, Span<float> mem) {
+                   const Rect& rect, bool fast, bool use_dct8,
+                   bool shrink_towards_zero, ImageSB* map_x, ImageSB* map_b,
+                   ImageF* dc_values, Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
   size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
@@ -239,11 +236,12 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   float* HWY_RESTRICT block_x = block_y + AcStrategy::kMaxCoeffArea;
   float* HWY_RESTRICT block_b = block_x + AcStrategy::kMaxCoeffArea;
   JXL_ENSURE(mem.remove_prefix(3 * AcStrategy::kMaxCoeffArea));
+  constexpr size_t kMaxTileCoeffs = 4 * kColorTileDim * kColorTileDim;
   float* HWY_RESTRICT coeffs_yx = mem.begin();
-  float* HWY_RESTRICT coeffs_x = coeffs_yx + kColorTileDim * kColorTileDim;
-  float* HWY_RESTRICT coeffs_yb = coeffs_x + kColorTileDim * kColorTileDim;
-  float* HWY_RESTRICT coeffs_b = coeffs_yb + kColorTileDim * kColorTileDim;
-  JXL_ENSURE(mem.remove_prefix(4 * kColorTileDim * kColorTileDim));
+  float* HWY_RESTRICT coeffs_x = coeffs_yx + kMaxTileCoeffs;
+  float* HWY_RESTRICT coeffs_yb = coeffs_x + kMaxTileCoeffs;
+  float* HWY_RESTRICT coeffs_b = coeffs_yb + kMaxTileCoeffs;
+  JXL_ENSURE(mem.remove_prefix(4 * kMaxTileCoeffs));
   constexpr size_t dc_size =
       AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
   float* HWY_RESTRICT dc_y = mem.begin();
@@ -283,8 +281,10 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
           dequant.InvMatrix(acs.Strategy(), 0);
       const float* const JXL_RESTRICT qm_b =
           dequant.InvMatrix(acs.Strategy(), 2);
-      float q_dc_x = use_dct8 ? 1 : 1.0f / quantizer->GetInvDcStep(0);
-      float q_dc_b = use_dct8 ? 1 : 1.0f / quantizer->GetInvDcStep(2);
+      float q_dc_x =
+          (quantizer == nullptr) ? 1.0f : 1.0f / quantizer->GetInvDcStep(0);
+      float q_dc_b =
+          (quantizer == nullptr) ? 1.0f : 1.0f / quantizer->GetInvDcStep(2);
 
       // Copy DCs in dc_values.
       for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
@@ -298,12 +298,6 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
           dc_values_b[(iy + y) * xsize_blocks + ix + x] =
               dc_b[iy * xs + ix] * q_dc_b;
         }
-      }
-
-      // Do not use this block for computing AC CfL.
-      if (acs.covered_blocks_x() + x0 > x1 ||
-          acs.covered_blocks_y() + y0 > y1) {
-        continue;
       }
 
       // Copy AC coefficients in the local block. The order in which
@@ -324,11 +318,13 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       // Unclear why this is like it is. (This works slightly better
       // than the previous approach which was also a hack.)
       const float qq =
-          (raw_quant_field == nullptr) ? 1.0f : raw_quant_field->Row(y)[x];
+          (raw_quant_field == nullptr) ? 1.0f : raw_quant_field->ConstRow(y)[x];
       // Experimentally values 128-130 seem best -- I don't know why we
       // need this multiplier.
       const float kStrangeMultiplier = 128;
-      float q = use_dct8 ? 1 : quantizer->Scale() * kStrangeMultiplier * qq;
+      float q = (quantizer == nullptr)
+                    ? 1.0f
+                    : quantizer->Scale() * kStrangeMultiplier * qq;
       const auto qv = Set(df, q);
       for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
         const auto b_y = Load(df, block_y + i);
@@ -346,10 +342,11 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   }
   JXL_ENSURE(num_ac % Lanes(df) == 0);
   row_out_x[tx] = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
-                                     kDistanceMultiplierAC, fast);
+                                     kDistanceMultiplierAC, fast,
+                                     shrink_towards_zero);
   row_out_b[tx] =
       FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
-                         kDistanceMultiplierAC, fast);
+                         kDistanceMultiplierAC, fast, shrink_towards_zero);
   return true;
 }
 
@@ -377,13 +374,15 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                                   const AcStrategyImage* ac_strategy,
                                   const ImageI* raw_quant_field,
                                   const Quantizer* quantizer, bool fast,
-                                  size_t thread, ColorCorrelationMap* cmap) {
+                                  size_t thread, ColorCorrelationMap* cmap,
+                                  bool shrink_towards_zero) {
   bool use_dct8 = ac_strategy == nullptr;
   Span<float> scratch(mem.address<float>() + thread * ItemsPerThread(),
                       ItemsPerThread());
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
-      fast, use_dct8, &cmap->ytox_map, &cmap->ytob_map, &dc_values, scratch);
+      fast, use_dct8, shrink_towards_zero, &cmap->ytox_map, &cmap->ytob_map,
+      &dc_values, scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
