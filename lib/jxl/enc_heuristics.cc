@@ -80,7 +80,7 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
         3 * kNumOrders == sizeof(kSimpleCtxMap) / sizeof *kSimpleCtxMap,
         "Update simple context map");
 
-    auto bcm = *block_ctx_map;
+    auto& bcm = *block_ctx_map;
     bcm.ctx_map.assign(std::begin(kSimpleCtxMap), std::end(kSimpleCtxMap));
     bcm.num_ctxs = 2;
     bcm.num_dc_ctxs = 1;
@@ -180,9 +180,16 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
       remap[i] = remap[remap[i]];
     }
   }
-  // Relabel starting from 0.
+  // Sort remaining cluster roots by descending count so the largest clusters
+  // receive the lowest indices (and thus remain unmerged for chroma below).
+  std::sort(clusters.begin(), clusters.end(),
+            [&](int a, int b) { return counts[a] > counts[b]; });
+  // Relabel starting from 0 in descending cluster size order.
   std::vector<uint8_t> remap_remap(remap.size(), remap.size());
   size_t num = 0;
+  for (uint8_t c : clusters) {
+    remap_remap[c] = num++;
+  }
   for (size_t i = 0; i < remap.size(); i++) {
     if (remap_remap[remap[i]] == remap.size()) {
       remap_remap[remap[i]] = num++;
@@ -999,11 +1006,8 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
         int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
         const auto& ctx_histo = histo[context];
         const int mulix = epf_steps_lut[val] + 3 * context;
-        const float ratio =
-            ar_enable_rdo
-                ? (static_cast<float>(ctx_histo[val]) /
-                   static_cast<float>(totals[context]))
-                : static_cast<float>(ctx_histo[val] / totals[context]);
+        const float ratio = static_cast<float>(ctx_histo[val]) /
+                            static_cast<float>(totals[context]);
         mul[mulix] =
             1.0f / (1.0f + c5 * std::log1p(ratio) / clamped_butteraugli);
         if (val == 0) {

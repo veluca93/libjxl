@@ -180,37 +180,15 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
 
-Status InitDCStorage(JxlMemoryManager* memory_manager, size_t num_blocks,
-                     ImageF* dc_values) {
-  // First row: Y channel
-  // Second row: X channel
-  // Third row: Y channel
-  // Fourth row: B channel
-  JXL_ASSIGN_OR_RETURN(
-      *dc_values,
-      ImageF::Create(memory_manager, RoundUpTo(num_blocks, Lanes(df)), 4));
-
-  JXL_ENSURE(dc_values->xsize() != 0);
-  // Zero-fill the last lanes
-  for (size_t y = 0; y < 4; y++) {
-    for (size_t x = dc_values->xsize() - Lanes(df); x < dc_values->xsize();
-         x++) {
-      dc_values->Row(y)[x] = 0;
-    }
-  }
-  return true;
-}
-
 Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const DequantMatrices& dequant,
                    const AcStrategyImage* ac_strategy,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
                    const Rect& rect, bool fast, bool use_dct8,
                    bool shrink_towards_zero, ImageSB* map_x, ImageSB* map_b,
-                   ImageF* dc_values, Span<float> mem) {
+                   Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
-  size_t xsize_blocks = opsin_rect.xsize() / kBlockDim;
   constexpr float kDistanceMultiplierAC = 1e-9f;
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
@@ -226,11 +204,6 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   int8_t* JXL_RESTRICT row_out_x = map_x->Row(ty);
   int8_t* JXL_RESTRICT row_out_b = map_b->Row(ty);
 
-  float* JXL_RESTRICT dc_values_yx = dc_values->Row(0);
-  float* JXL_RESTRICT dc_values_x = dc_values->Row(1);
-  float* JXL_RESTRICT dc_values_yb = dc_values->Row(2);
-  float* JXL_RESTRICT dc_values_b = dc_values->Row(3);
-
   // All are aligned.
   float* HWY_RESTRICT block_y = mem.begin();
   float* HWY_RESTRICT block_x = block_y + AcStrategy::kMaxCoeffArea;
@@ -242,12 +215,6 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   float* HWY_RESTRICT coeffs_yb = coeffs_x + kMaxTileCoeffs;
   float* HWY_RESTRICT coeffs_b = coeffs_yb + kMaxTileCoeffs;
   JXL_ENSURE(mem.remove_prefix(4 * kMaxTileCoeffs));
-  constexpr size_t dc_size =
-      AcStrategy::kMaxCoeffBlocks * AcStrategy::kMaxCoeffBlocks;
-  float* HWY_RESTRICT dc_y = mem.begin();
-  float* HWY_RESTRICT dc_x = dc_y + dc_size;
-  float* HWY_RESTRICT dc_b = dc_x + dc_size;
-  JXL_ENSURE(mem.remove_prefix(3 * dc_size));
   float* HWY_RESTRICT scratch_space = mem.begin();
   JXL_ENSURE(mem.size() == 2 * AcStrategy::kMaxCoeffArea + dct_scratch_size);
 
@@ -267,38 +234,16 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                            ? AcStrategy::FromRawStrategy(AcStrategyType::DCT)
                            : ac_strategy->ConstRow(y)[x];
       if (!acs.IsFirstBlock()) continue;
-      size_t xs = acs.covered_blocks_x();
       TransformFromPixels(acs.Strategy(), row_y + x * kBlockDim, stride,
                           block_y, scratch_space);
-      DCFromLowestFrequencies(acs.Strategy(), block_y, dc_y, xs, scratch_space);
       TransformFromPixels(acs.Strategy(), row_x + x * kBlockDim, stride,
                           block_x, scratch_space);
-      DCFromLowestFrequencies(acs.Strategy(), block_x, dc_x, xs, scratch_space);
       TransformFromPixels(acs.Strategy(), row_b + x * kBlockDim, stride,
                           block_b, scratch_space);
-      DCFromLowestFrequencies(acs.Strategy(), block_b, dc_b, xs, scratch_space);
       const float* const JXL_RESTRICT qm_x =
           dequant.InvMatrix(acs.Strategy(), 0);
       const float* const JXL_RESTRICT qm_b =
           dequant.InvMatrix(acs.Strategy(), 2);
-      float q_dc_x =
-          (quantizer == nullptr) ? 1.0f : 1.0f / quantizer->GetInvDcStep(0);
-      float q_dc_b =
-          (quantizer == nullptr) ? 1.0f : 1.0f / quantizer->GetInvDcStep(2);
-
-      // Copy DCs in dc_values.
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < xs; ix++) {
-          dc_values_yx[(iy + y) * xsize_blocks + ix + x] =
-              dc_y[iy * xs + ix] * q_dc_x;
-          dc_values_x[(iy + y) * xsize_blocks + ix + x] =
-              dc_x[iy * xs + ix] * q_dc_x;
-          dc_values_yb[(iy + y) * xsize_blocks + ix + x] =
-              dc_y[iy * xs + ix] * q_dc_b;
-          dc_values_b[(iy + y) * xsize_blocks + ix + x] =
-              dc_b[iy * xs + ix] * q_dc_b;
-        }
-      }
 
       // Copy AC coefficients in the local block. The order in which
       // coefficients get stored does not matter.
@@ -358,15 +303,7 @@ HWY_AFTER_NAMESPACE();
 #if HWY_ONCE
 namespace jxl {
 
-HWY_EXPORT(InitDCStorage);
 HWY_EXPORT(ComputeTile);
-
-Status CfLHeuristics::Init(const Rect& rect) {
-  size_t xsize_blocks = rect.xsize() / kBlockDim;
-  size_t ysize_blocks = rect.ysize() / kBlockDim;
-  return HWY_DYNAMIC_DISPATCH(InitDCStorage)(
-      memory_manager, xsize_blocks * ysize_blocks, &dc_values);
-}
 
 Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                                   const Rect& opsin_rect,
@@ -382,7 +319,7 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
       fast, use_dct8, shrink_towards_zero, &cmap->ytox_map, &cmap->ytob_map,
-      &dc_values, scratch);
+      scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
