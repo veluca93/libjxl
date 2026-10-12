@@ -374,6 +374,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   HWY_ALIGN float w_row[AcStrategy::kMaxBlockDim];
   HWY_ALIGN float t0_row[AcStrategy::kMaxBlockDim];
   auto loss = Zero(df8);
+  auto loss2 = Zero(df8);
 
   const bool is_partial_block =
       ((1 << static_cast<size_t>(acs.Strategy())) & kPartialBlockKinds) != 0;
@@ -442,6 +443,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     }
 
     auto lossc = Zero(df8);
+    auto lossc2 = Zero(df8);
     {
       float masku_lut[3] = {
           12.0,
@@ -467,6 +469,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                         masku_off);
                 in = Mul(masku, in);
                 in = Mul(in, in);
+                lossc2 = Add(lossc2, in);
                 in = Mul(in, in);
                 in = Mul(in, in);
                 lossc = Add(lossc, in);
@@ -480,7 +483,13 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           pow(1.0, 8.0),
           pow(1.03, 8.0),
       };
+      static const float kChannelMul2[3] = {
+          8.2f * 8.2f,
+          1.0f,
+          1.03f * 1.03f,
+      };
       lossc = Mul(Set(df8, kChannelMul[c]), lossc);
+      lossc2 = Mul(Set(df8, kChannelMul2[c]), lossc2);
     }
     float entropy_c = config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
     size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
@@ -496,14 +505,19 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       float w = 1.0 + std::min(3.0, num_blocks / 8.0);
       entropy_c *= w;
       lossc = Mul(lossc, Set(df8, w));
+      lossc2 = Mul(lossc2, Set(df8, std::pow(w, 0.25f)));
     }
     entropy += entropy_c;
     loss = Add(loss, lossc);
+    loss2 = Add(loss2, lossc2);
   }
-  float loss_scalar =
-      pow(GetLane(SumOfLanes(df8, loss)) / (num_blocks * kDCTBlockSize),
-          1.0f / 8.0f) *
-      (num_blocks * kDCTBlockSize) / quant_norm16;
+  const float inv_npixels = 1.0f / (num_blocks * kDCTBlockSize);
+  const float d8 =
+      std::pow(GetLane(SumOfLanes(df8, loss)) * inv_npixels, 1.0f / 8.0f);
+  const float d2 = std::sqrt(GetLane(SumOfLanes(df8, loss2)) * inv_npixels);
+  const float d_blend =
+      (config.band_qf_stride > 0) ? (0.93f * d8 + 0.07f * 2.08f * d2) : d8;
+  float loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / quant_norm16;
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
   if (config.band_qf_stride > 0 && num_blocks >= 2 && num_blocks <= 4 &&
