@@ -93,9 +93,11 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
       for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
         const size_t hfix =
             (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
-        const float t0 = quad_thres[hfix] + zero_thres[4 + kCoeffBand[v8][u8]];
+        const uint8_t s = kCoeffBand[v8][u8];
+        const float t0 = quad_thres[hfix] + zero_thres[4 + s];
+        const float min_bias = (c == 1 && s == 3) ? -0.010f : -0.004f;
         const float bias =
-            bias_scale * Clamp1(0.42f * (t0 - 0.568f), -0.004f, 0.040f);
+            bias_scale * Clamp1(0.42f * (t0 - 0.568f), min_bias, 0.040f);
         for (size_t ix = 0; ix < xsize; ++ix) {
           t0_row[u8 * xsize + ix] = t0;
           bias_row[u8 * xsize + ix] = bias;
@@ -353,8 +355,17 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
       const float abs_val = std::abs(val);
       const float t_trial = trial_thres[hfix] + zero_thres[4 + s];
       const float v_trial = (abs_val < t_trial) ? 0.0f : rintf(val);
-      sum_of_error += band_w[s] * std::abs(val - v_trial);
-      sum_of_vals += std::abs(v_trial);
+      const float abs_v_trial = std::abs(v_trial);
+      const float adj_abs_v_trial =
+          (abs_v_trial == 0.0f)
+              ? 0.0f
+              : ((abs_v_trial == 1.0f)
+                     ? kDefaultQuantBias[c]
+                     : (abs_v_trial - kDefaultQuantBias[3] / abs_v_trial));
+      const float eff_v_trial =
+          0.65f * abs_v_trial + 0.35f * adj_abs_v_trial;
+      sum_of_error += band_w[s] * std::abs(abs_val - eff_v_trial);
+      sum_of_vals += eff_v_trial;
       const float t0 = (dct8_err_min > 0.0f)
                            ? (zero_thres[hfix] + zero_thres[4 + s])
                            : t_trial;
