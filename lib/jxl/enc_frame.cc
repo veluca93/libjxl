@@ -598,19 +598,30 @@ struct PixelStatsForChromacityAdjustment {
   float dx = 0;
   float db = 0;
   float exposed_blue = 0;
+  static constexpr size_t kTopK = 8;
+  static inline void InsertTopK(float v, float top[kTopK]) {
+    if (v <= top[kTopK - 1]) return;
+    size_t i = kTopK - 1;
+    while (i > 0 && v > top[i - 1]) {
+      top[i] = top[i - 1];
+      --i;
+    }
+    top[i] = v;
+  }
   static float CalcPlane(const ImageF* JXL_RESTRICT plane, const Rect& rect) {
-    float xmax = 0;
-    float ymax = 0;
+    float xtop[kTopK] = {};
+    float ytop[kTopK] = {};
     for (size_t ty = 1; ty < rect.ysize(); ++ty) {
       for (size_t tx = 1; tx < rect.xsize(); ++tx) {
         float cur = rect.Row(plane, ty)[tx];
         float prev_row = rect.Row(plane, ty - 1)[tx];
         float prev = rect.Row(plane, ty)[tx - 1];
-        xmax = std::max(xmax, std::abs(cur - prev));
-        ymax = std::max(ymax, std::abs(cur - prev_row));
+        InsertTopK(std::abs(cur - prev), xtop);
+        InsertTopK(std::abs(cur - prev_row), ytop);
       }
     }
-    return std::max(xmax, ymax);
+    const size_t idx = (rect.xsize() * rect.ysize() >= 64) ? (kTopK - 1) : 0;
+    return std::max(xtop[idx], ytop[idx]);
   }
   void CalcExposedBlue(const ImageF* JXL_RESTRICT plane_y,
                        const ImageF* JXL_RESTRICT plane_b, const Rect& rect) {
