@@ -1546,23 +1546,37 @@ Status ModularFrameEncoder::PrepareStreamParams(const Rect& rect,
 }
 
 constexpr float q_deadzone = 0.62f;
+constexpr float kDcDeadzoneRdo[3] = {0.65f, 0.58f, 0.61f};
+constexpr float kDcBias1Rdo[3] = {0.07f, 0.0f, 0.03f};
+constexpr float kDcBias2Rdo[3] = {0.04f, 0.0f, 0.0f};
+
 int QuantizeWP(const int32_t* qrow, size_t onerow, size_t c, size_t x, size_t y,
                size_t w, weighted::State* wp_state, float value,
-               float inv_factor, bool* has_outliers) {
+               float inv_factor, bool enable_rdo, bool* has_outliers) {
   float svalue = value * inv_factor;
   PredictionResult pred =
       PredictNoTreeWP(w, qrow + x, onerow, x, y, Predictor::Weighted, wp_state);
   svalue -= pred.guess;
-  if (svalue > -q_deadzone && svalue < q_deadzone) svalue = 0;
+  const float dz = enable_rdo ? kDcDeadzoneRdo[c] : q_deadzone;
+  if (svalue > -dz && svalue < dz) svalue = 0;
   int residual = 0;
   if (std::isnan(svalue) ||
       svalue > static_cast<float>(std::numeric_limits<int>::max()) ||
       svalue < static_cast<float>(std::numeric_limits<int>::min())) {
     *has_outliers = true;
-  } else {
+  } else if (!enable_rdo) {
     residual = std::round(svalue);
+    if (residual > 2 || residual < -2) residual = std::round(svalue * 0.5f) * 2;
+  } else if (svalue != 0.0f) {
+    const float sign = (svalue >= 0.0f) ? 1.0f : -1.0f;
+    const float abs_s = std::abs(svalue);
+    residual = static_cast<int>(sign * std::round(abs_s - kDcBias1Rdo[c]));
+    if (residual > 2 || residual < -2) {
+      residual =
+          static_cast<int>(sign * std::round(abs_s * 0.5f - kDcBias2Rdo[c])) *
+          2;
+    }
   }
-  if (residual > 2 || residual < -2) residual = std::round(svalue * 0.5f) * 2;
   return residual + pred.guess;
 }
 
@@ -1646,6 +1660,8 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
     }
   } else if (nl_dc) {
     JXL_ENSURE(frame_header.chroma_subsampling.Is444());
+    const bool enable_rdo = enc_state->band_qf[1][0].xsize() > 0 &&
+                            enc_state->band_qf[1][0].ysize() > 0;
     for (size_t c : {1, 0, 2}) {
       float inv_factor = enc_state->shared.quantizer.GetInvDcStep(c) * mul;
       float y_factor = enc_state->shared.quantizer.GetDcStep(1) / mul;
@@ -1663,7 +1679,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
           for (size_t x = 0; x < r.xsize(); x++) {
             quant_row[x] =
                 QuantizeWP(quant_row, stride, c, x, y, r.xsize(), &wp_state,
-                           row[x], inv_factor, &has_outliers);
+                           row[x], inv_factor, enable_rdo, &has_outliers);
             wp_state.UpdateErrors(quant_row[x], x, y, r.xsize());
           }
         } else {
@@ -1673,7 +1689,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
             quant_row[x] =
                 QuantizeWP(quant_row, stride, c, x, y, r.xsize(), &wp_state,
                            row[x] - quant_row_y[x] * (y_factor * cfl_factor),
-                           inv_factor, &has_outliers);
+                           inv_factor, enable_rdo, &has_outliers);
             wp_state.UpdateErrors(quant_row[x], x, y, r.xsize());
           }
         }
