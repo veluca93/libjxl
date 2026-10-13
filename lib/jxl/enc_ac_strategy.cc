@@ -484,9 +484,9 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           pow(1.03, 8.0),
       };
       static const float kChannelMul2[3] = {
-          8.2f * 8.2f,
+          2.2f * 2.2f,
           1.0f,
-          1.03f * 1.03f,
+          0.90f * 0.90f,
       };
       lossc = Mul(Set(df8, kChannelMul[c]), lossc);
       lossc2 = Mul(Set(df8, kChannelMul2[c]), lossc2);
@@ -516,7 +516,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       std::pow(GetLane(SumOfLanes(df8, loss)) * inv_npixels, 1.0f / 8.0f);
   const float d2 = std::sqrt(GetLane(SumOfLanes(df8, loss2)) * inv_npixels);
   const float d_blend =
-      (config.band_qf_stride > 0) ? (0.93f * d8 + 0.07f * 2.08f * d2) : d8;
+      (config.band_qf_stride > 0) ? (0.93f * d8 + 0.07f * 2.18f * d2) : d8;
   float loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / quant_norm16;
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
