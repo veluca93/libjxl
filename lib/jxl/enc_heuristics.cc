@@ -336,7 +336,9 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                            ? 0.30f
                            : (1.58f / static_cast<float>(out_bands - 2)));
             const float s = v - c0;
-            delta_l = a_mid * s * (1.15f - 0.45f * t_d * v);
+            const float hf_decay =
+                (c == 1 || s <= 0.0f) ? 0.45f : ((c == 0) ? 0.85f : 1.05f);
+            delta_l = a_mid * s * (1.15f - hf_decay * t_d * v);
           }
           target_w[k] = w_u * std::exp(delta_l);
         }

@@ -585,6 +585,16 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
       }
       max_quant = std::max(*quant, max_quant);
     }
+    if (eob_scale > 0.0f) {
+      for (int cc : {0, 2}) {
+        const float c_scale = (cc == 0) ? 0.85f : 1.15f;
+        zero_thres[cc][1] += 0.005f * c_scale * dz_w;
+        zero_thres[cc][2] += 0.005f * c_scale * dz_w;
+        zero_thres[cc][3] += 0.003f * c_scale * dz_w;
+        zero_thres[cc][4 + 0] += 0.004f * c_scale * dz_w;
+        zero_thres[cc][4 + 1] += 0.002f * c_scale * dz_w;
+      }
+    }
     *quant = max_quant;
   } else {
     zero_thres[1][0] = 0.56f;
