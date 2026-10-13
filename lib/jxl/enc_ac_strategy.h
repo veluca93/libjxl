@@ -44,6 +44,7 @@ struct ACSConfig {
   size_t src_stride;
   const float* JXL_RESTRICT band_qf_rows[3][4];
   size_t band_qf_stride;
+  float csf_w[3][64];
   float qm_multiplier[3];
   float info_loss_multiplier;
   float cost_delta;

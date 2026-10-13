@@ -387,7 +387,8 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
     float band_w[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float zero_thres[8] = {0.50f, 0.50f, 0.50f, 0.50f, 0.0f, 0.0f, 0.0f, 0.0f};
-    if (!is_partial_block && config.band_qf_stride > 0) {
+    const bool use_csf_w = (!is_partial_block && config.band_qf_stride > 0);
+    if (use_csf_w) {
       float bq[4];
       for (size_t s = 0; s < 4; ++s) {
         float sq_sum = 0.0f;
@@ -409,16 +410,16 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     auto entropy_v = Zero(df);
     auto nzeros_v = Zero(df);
     for (size_t v8 = 0; v8 < kBlockDim; ++v8) {
-      if ((v8 & 1) == 0) {
-        for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
-          const uint8_t s = kCoeffBand[v8][u8];
-          const float ws = band_w[s];
-          const float dz = (v8 == 0 && u8 == 0) ? 0.0f : zero_thres[4 + s];
-          const float t0 = 0.50f + ((dz >= 0.0f) ? dz : (0.5f * dz));
-          for (size_t ix = 0; ix < cx; ++ix) {
-            w_row[u8 * cx + ix] = ws;
-            t0_row[u8 * cx + ix] = t0;
-          }
+      for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
+        const uint8_t s = kCoeffBand[v8][u8];
+        const float csf =
+            use_csf_w ? config.csf_w[c][v8 * kBlockDim + u8] : 1.0f;
+        const float ws = band_w[s] * csf;
+        const float dz = (v8 == 0 && u8 == 0) ? 0.0f : zero_thres[4 + s];
+        const float t0 = 0.50f + ((dz >= 0.0f) ? dz : (0.5f * dz));
+        for (size_t ix = 0; ix < cx; ++ix) {
+          w_row[u8 * cx + ix] = ws;
+          t0_row[u8 * cx + ix] = t0;
         }
       }
       for (size_t iy = 0; iy < cy; ++iy) {
@@ -1220,6 +1221,23 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   config.qm_multiplier[0] = x_qm_multiplier;
   config.qm_multiplier[1] = 1.0f;
   config.qm_multiplier[2] = b_qm_multiplier;
+  for (size_t c = 0; c < 3; ++c) {
+    const float* dct8_matrix = matrices->Matrix(AcStrategyType::DCT, c);
+    const float m_ref = dct8_matrix[1];
+    constexpr float kBetaCsf = 0.08f;
+    float csf_sum = 0.0f;
+    for (size_t i = 0; i < 64; ++i) {
+      const float m_uv =
+          (i == 0) ? m_ref : std::max(dct8_matrix[i], m_ref * 0.5f);
+      const float w_uv = std::pow(m_ref / m_uv, kBetaCsf);
+      config.csf_w[c][i] = w_uv;
+      csf_sum += w_uv;
+    }
+    const float csf_norm = 61.8f / csf_sum;
+    for (size_t i = 0; i < 64; ++i) {
+      config.csf_w[c][i] *= csf_norm;
+    }
+  }
 
   config.src_rows[0] = rect_in.ConstPlaneRow(src, 0, 0);
   config.src_rows[1] = rect_in.ConstPlaneRow(src, 1, 0);
