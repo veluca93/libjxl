@@ -989,8 +989,12 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
                              const ImageF& mask1x1, size_t by, size_t bx) {
   Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
             a.ysize());
-  float err2[3] = {0.0f};
-  for (size_t y = 0; y < rect.ysize(); ++y) {
+  const size_t xsize = rect.xsize();
+  const size_t ysize = rect.ysize();
+  float err2_masked[3] = {0.0f};
+  float err2_unmasked[3] = {0.0f};
+  float sum_mask2 = 0.0f;
+  for (size_t y = 0; y < ysize; ++y) {
     const float* row_a[3] = {
         rect.ConstPlaneRow(a, 0, y),
         rect.ConstPlaneRow(a, 1, y),
@@ -1002,14 +1006,25 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
         rect.ConstPlaneRow(b, 2, y),
     };
     const float* row_mask = rect.ConstRow(mask1x1, y);
-    for (size_t x = 0; x < rect.xsize(); ++x) {
+    for (size_t x = 0; x < xsize; ++x) {
       float mask = row_mask[x];
       float mask2 = mask * mask;
+      sum_mask2 += mask2;
       for (int i = 0; i < 3; ++i) {
         float diff = row_a[i][x] - row_b[i][x];
-        err2[i] += mask2 * diff * diff;
+        float diff2 = diff * diff;
+        err2_masked[i] += mask2 * diff2;
+        err2_unmasked[i] += diff2;
       }
     }
+  }
+  const float mean_mask2 =
+      sum_mask2 / static_cast<float>(xsize * ysize);
+  constexpr float kUnmaskedMix = 0.22f;
+  float err2[3];
+  for (int i = 0; i < 3; ++i) {
+    err2[i] = (1.0f - kUnmaskedMix) * err2_masked[i] +
+              kUnmaskedMix * mean_mask2 * err2_unmasked[i];
   }
   static const double kW[] = {
       12.339445295782363,
@@ -1084,26 +1099,42 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       }
     }
   }
+  double sum_sqrt_d0 = 0.0;
+  for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
+    const float* row0 = error_images[0].ConstRow(by);
+    for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
+      sum_sqrt_d0 += std::sqrt(row0[bx]);
+    }
+  }
+  const float mean_sqrt_d0 =
+      sum_sqrt_d0 /
+      std::max<size_t>(1, frame_dim.xsize_blocks * frame_dim.ysize_blocks);
+  const float ref_d0 = mean_sqrt_d0 * mean_sqrt_d0;
+  constexpr float kLocalRef = 0.84f;
+  const float global_ref =
+      0.15f / std::pow(clamped_butteraugli, 0.35f);
   std::vector<std::vector<size_t>> histo(9, std::vector<size_t>(kNumEPFVals));
   std::vector<size_t> totals(9, 1);
   static const float kFavorNoSmoothing = 0.99;
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
     uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
+    const float* row0 = error_images[0].ConstRow(by);
     for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
+      const float d_ref = kLocalRef * row0[bx] + global_ref * ref_d0;
       uint8_t best_val = 0;
       float best_error = std::numeric_limits<float>::max();
       uint8_t top_val = by > 0 ? prev_row[bx] : 0;
       uint8_t left_val = bx > 0 ? out_row[bx - 1] : 0;
-      float top_error = error_images[top_val].Row(by)[bx] * 0.985f;
-      float left_error = error_images[left_val].Row(by)[bx] * 0.985f;
-      if (top_val == 0) top_error *= kFavorNoSmoothing;
-      if (left_val == 0) left_error *= kFavorNoSmoothing;
+      float top_mul = 0.985f * (top_val == 0 ? kFavorNoSmoothing : 1.0f);
+      float left_mul = 0.985f * (left_val == 0 ? kFavorNoSmoothing : 1.0f);
+      float top_error =
+          error_images[top_val].Row(by)[bx] + d_ref * (top_mul - 1.0f);
+      float left_error =
+          error_images[left_val].Row(by)[bx] + d_ref * (left_mul - 1.0f);
       for (uint8_t val : epf_steps) {
-        float error = error_images[val].Row(by)[bx];
-        if (val == 0) {
-          error *= kFavorNoSmoothing;
-        }
+        float m = (val == 0) ? kFavorNoSmoothing : 1.0f;
+        float error = error_images[val].Row(by)[bx] + d_ref * (m - 1.0f);
         if (error < best_error) {
           best_val = val;
           best_error = error;
@@ -1150,7 +1181,9 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
     uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
+    const float* row0 = error_images[0].ConstRow(by);
     for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
+      const float d_ref = kLocalRef * row0[bx] + global_ref * ref_d0;
       uint8_t best_val = 0;
       float best_error = std::numeric_limits<float>::max();
       uint8_t top_val = by > 0 ? prev_row[bx] : 0;
@@ -1158,7 +1191,8 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
       for (uint8_t val : epf_steps) {
         int mulix = epf_steps_lut[val] + 3 * context;
-        float error = error_images[val].Row(by)[bx] * mul[mulix];
+        float error =
+            error_images[val].Row(by)[bx] + d_ref * (mul[mulix] - 1.0f);
         if (error < best_error) {
           best_val = val;
           best_error = error;
