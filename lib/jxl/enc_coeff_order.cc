@@ -43,18 +43,29 @@ std::pair<uint32_t, uint32_t> ComputeUsedOrders(
 
   uint32_t ret = 0;
   uint32_t ret_customize = 0;
+  size_t ord_counts[7] = {};
   size_t xsize_blocks = rect.xsize();
   size_t ysize_blocks = rect.ysize();
   // TODO(veluca): precompute when doing DCT.
   for (size_t by = 0; by < ysize_blocks; ++by) {
     AcStrategyRow acs_row = ac_strategy.ConstRow(rect, by);
     for (size_t bx = 0; bx < xsize_blocks; ++bx) {
-      int ord = kStrategyOrder[acs_row[bx].RawStrategy()];
+      AcStrategy acs = acs_row[bx];
+      int ord = kStrategyOrder[acs.RawStrategy()];
       // Do not customize coefficient orders for blocks bigger than 32x32.
       ret |= 1u << ord;
       if (ord > 6) {
         continue;
       }
+      if (acs.IsFirstBlock()) {
+        ++ord_counts[ord];
+      }
+    }
+  }
+  for (int ord = 0; ord <= 6; ++ord) {
+    if (xsize_blocks * ysize_blocks <= 64) {
+      if (ord_counts[ord] >= 1) ret_customize |= 1u << ord;
+    } else if (ord_counts[ord] >= 4) {
       ret_customize |= 1u << ord;
     }
   }
@@ -195,22 +206,49 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
       continue;
     }
 
+    const bool enable_order_rdo =
+        frame_dim.xsize_blocks * frame_dim.ysize_blocks > 64;
     bool is_nondefault = false;
     for (uint8_t c = 0; c < 3; c++) {
       // Apply zig-zag order.
       PosAndCount* pos_and_val = mem.address<PosAndCount>();
       size_t offset = CoeffOrderOffset(ord, c);
       JXL_ENSURE(CoeffOrderOffset(ord, c + 1) - offset == sz);
+      size_t llf = acs.covered_blocks_x() * acs.covered_blocks_y();
+      int64_t max_zeros = 0;
+      for (size_t i = llf; i < sz; ++i) {
+        max_zeros = std::max(max_zeros, num_zeros[offset + natural_order_buffer[i]]);
+      }
       float inv_sqrt_sz = 1.0f / std::sqrt(sz);
+      const float phase = (sz <= 128) ? 0.0f : 0.5f;
+      int64_t zero_bucket_count = 0;
+      size_t last_end = llf;
       for (size_t i = 0; i < sz; ++i) {
         size_t pos = natural_order_buffer[i];
         pos_and_val[i].pos = pos;
-        // We don't care for the exact number -> quantize number of zeros,
-        // to get less permuted order.
-        uint64_t count = num_zeros[offset + pos] * inv_sqrt_sz + 0.1f;
-        // Worst case: all dct8x8, all zeroes: count <= nb_pixels/64/8
-        // nb_pixels is limited to 2^40 (Level 10 limit)
-        // so count is limited to 2^31
+        uint64_t count = 0;
+        if (!enable_order_rdo) {
+          count = num_zeros[offset + pos] * inv_sqrt_sz + 0.1f;
+        } else if (i >= llf) {
+          // Anchor quantization at max_zeros (0 non-zeros) so that isolated
+          // high-frequency non-zeros stay in the unpermuted tail.
+          int64_t nonzeros = max_zeros - num_zeros[offset + pos];
+          uint64_t nz_bucket =
+              static_cast<uint64_t>(nonzeros * inv_sqrt_sz + phase);
+          if (nz_bucket > 0) {
+            if (zero_bucket_count > 0 &&
+                zero_bucket_count * nonzeros <
+                    2 * static_cast<int64_t>(i + 1 - last_end)) {
+              nz_bucket = 0;
+            } else {
+              last_end = i + 1;
+            }
+          }
+          if (nz_bucket == 0) {
+            ++zero_bucket_count;
+          }
+          count = static_cast<uint64_t>(max_zeros + 2) - nz_bucket;
+        }
         JXL_DASSERT(count < (uint64_t{1} << 48));
         pos_and_val[i].count_and_idx = (count << 16) | i;
       }
@@ -222,10 +260,29 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
       };
       std::sort(pos_and_val, pos_and_val + sz, comparator);
 
-      // Grab indices.
-      for (size_t i = 0; i < sz; ++i) {
-        order[offset + i] = pos_and_val[i].pos;
-        is_nondefault |= natural_order_buffer[i] != pos_and_val[i].pos;
+      // Per-channel RDO gate: require total scan-index advancement of non-zero
+      // coefficients to outweigh the Lehmer permutation span (end - llf).
+      int64_t scan_gain = 0;
+      size_t end = llf;
+      for (size_t i = llf; i < sz; ++i) {
+        const size_t nat_pos = natural_order_buffer[i];
+        const size_t ord_pos = pos_and_val[i].pos;
+        if (nat_pos != ord_pos) {
+          end = i + 1;
+          const int64_t nz_nat = max_zeros - num_zeros[offset + nat_pos];
+          const int64_t nz_ord = max_zeros - num_zeros[offset + ord_pos];
+          scan_gain += static_cast<int64_t>(i) * (nz_nat - nz_ord);
+        }
+      }
+      if (!enable_order_rdo ||
+          (end > llf && scan_gain >= static_cast<int64_t>(2 * (end - llf)))) {
+        for (size_t i = 0; i < sz; ++i) {
+          order[offset + i] = pos_and_val[i].pos;
+          is_nondefault |= natural_order_buffer[i] != pos_and_val[i].pos;
+        }
+      } else {
+        memcpy(&order[offset], natural_order_buffer.data(),
+               sz * sizeof(*order));
       }
     }
     if (!is_nondefault) {
