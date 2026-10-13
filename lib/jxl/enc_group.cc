@@ -70,9 +70,18 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
   float quad_thres[4] = {zero_thres[0], zero_thres[1], zero_thres[2],
                          zero_thres[3]};
   if (c != 1 && xsize * ysize >= 4) {
-    const float sub = 0.00744f * static_cast<float>(xsize * ysize);
-    for (int i = 0; i < 4; ++i) {
-      quad_thres[i] = std::max(0.50f, quad_thres[i] - sub);
+    if (eob_scale > 0.0f) {
+      const float sub =
+          Clamp1(0.0045f * static_cast<float>(xsize * ysize), 0.0f, 0.055f);
+      quad_thres[0] = std::max(0.525f, quad_thres[0] - sub);
+      for (int i = 1; i < 3; ++i) {
+        quad_thres[i] = std::max(0.57f, quad_thres[i] - 0.35f * sub);
+      }
+    } else {
+      const float sub = 0.00744f * static_cast<float>(xsize * ysize);
+      for (int i = 0; i < 4; ++i) {
+        quad_thres[i] = std::max(0.50f, quad_thres[i] - sub);
+      }
     }
   }
 
@@ -325,10 +334,12 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
   }
 
   // Band distortion weights w_s = (q_{c,s} / q_ref)^2 derived from per-band
-  // deadzone offsets zero_thres[4 + s].
+  // deadzone offsets zero_thres[4 + s], weighted by radial frequency importance.
+  static constexpr float kBandErrWeight[4] = {0.81f, 0.96f, 1.18f, 1.40f};
   float band_w[4];
   for (size_t s = 0; s < 4; ++s) {
-    band_w[s] = Clamp1(1.0f - 3.5f * zero_thres[4 + s], 0.88f, 1.12f);
+    const float w_rad = (dct8_err_min > 0.0f) ? kBandErrWeight[s] : 1.0f;
+    band_w[s] = w_rad * Clamp1(1.0f - 3.5f * zero_thres[4 + s], 0.88f, 1.12f);
   }
 
   const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
@@ -396,18 +407,22 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
     static constexpr float kMul = 0.9999f;
     const int32_t orig_quant = *quant;
     int32_t new_quant = *quant;
-    for (int i = 1; i < 4; ++i) {
-      if (hfNonZeros[i] == 0.0f && hfMaxError[i] > kLimit) {
-        new_quant = orig_quant + 1;
-        break;
+    if (dct8_err_min <= 0.0f) {
+      for (int i = 1; i < 4; ++i) {
+        if (hfNonZeros[i] == 0.0f && hfMaxError[i] > kLimit) {
+          new_quant = orig_quant + 1;
+          break;
+        }
       }
     }
     *quant = new_quant;
-    if (hfNonZeros[3] == 0.0f && hfMaxError[3] > kLimit) {
+    if (dct8_err_min <= 0.0f && hfNonZeros[3] == 0.0f &&
+        hfMaxError[3] > kLimit) {
       zero_thres[3] = kMul * hfMaxError[3] * new_quant / orig_quant -
                       zero_thres[4 + hfMaxErrorBand[3]];
-    } else if ((hfNonZeros[1] == 0.0f && hfMaxError[1] > kLimit) ||
-               (hfNonZeros[2] == 0.0f && hfMaxError[2] > kLimit)) {
+    } else if (dct8_err_min <= 0.0f &&
+               ((hfNonZeros[1] == 0.0f && hfMaxError[1] > kLimit) ||
+                (hfNonZeros[2] == 0.0f && hfMaxError[2] > kLimit))) {
       if (hfNonZeros[1] == 0.0f &&
           (hfNonZeros[2] != 0.0f || hfMaxError[1] >= hfMaxError[2])) {
         zero_thres[1] = kMul * hfMaxError[1] * new_quant / orig_quant -
@@ -422,7 +437,7 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
     }
   }
   // Protect isolated high-frequency patterns when medium-frequency masking is absent.
-  {
+  if (dct8_err_min <= 0.0f) {
     float all =
         hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3] + 1.0f;
     float mul[3] = {70.0f, 30.0f, 60.0f};
@@ -503,9 +518,9 @@ void AdjustQuantBlockAC(const Quantizer& quantizer, size_t c,
         if (activity <= 2 && hfNonZeros[0] >= 2.0f * div) {
           zero_thres[0] -= 0.003f;
         }
-        zero_thres[1] += 0.010f * activity;
-        zero_thres[2] += 0.010f * activity;
-        zero_thres[3] += 0.002f + 0.0115f * activity;
+        zero_thres[1] += 0.0085f * activity;
+        zero_thres[2] += 0.0085f * activity;
+        zero_thres[3] += 0.002f + 0.0100f * activity;
       } else {
         for (int i = 1; i < 4; ++i) {
           zero_thres[i] += 0.01f * activity;
@@ -535,7 +550,7 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
         Clamp1((d - 0.50f) / (d + 0.55f) * 1.65f, 0.0f, 1.0f);
     const float hr_w = 1.0f - dz_w;
     const float dct8_err_min =
-        (eob_scale > 0.0f) ? (0.40f + 1.80f * Clamp1(d - 1.0f, 0.0f, 1.0f))
+        (eob_scale > 0.0f) ? (0.42f + 1.85f * Clamp1(d - 0.95f, 0.0f, 1.20f))
                            : 0.0f;
     const float orig_y_q0 = zero_thres[1][0];
     const float orig_y_hf[3] = {zero_thres[1][1], zero_thres[1][2],
@@ -563,9 +578,9 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
         const float luma_hf_dz =
             std::max(0.0f, zero_thres[1][1] - orig_y_hf[0]);
         for (int cc : {0, 2}) {
-          zero_thres[cc][1] += 0.15f * luma_hf_dz;
-          zero_thres[cc][2] += 0.15f * luma_hf_dz;
-          zero_thres[cc][3] += 0.005f * dz_w + 0.35f * luma_hf_dz;
+          zero_thres[cc][1] += 0.18f * luma_hf_dz;
+          zero_thres[cc][2] += 0.18f * luma_hf_dz;
+          zero_thres[cc][3] += 0.005f * dz_w + 0.40f * luma_hf_dz;
         }
       }
       max_quant = std::max(*quant, max_quant);
