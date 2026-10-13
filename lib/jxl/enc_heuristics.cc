@@ -1095,8 +1095,10 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       float best_error = std::numeric_limits<float>::max();
       uint8_t top_val = by > 0 ? prev_row[bx] : 0;
       uint8_t left_val = bx > 0 ? out_row[bx - 1] : 0;
-      float top_error = error_images[top_val].Row(by)[bx];
-      float left_error = error_images[left_val].Row(by)[bx];
+      float top_error = error_images[top_val].Row(by)[bx] * 0.985f;
+      float left_error = error_images[left_val].Row(by)[bx] * 0.985f;
+      if (top_val == 0) top_error *= kFavorNoSmoothing;
+      if (left_val == 0) left_error *= kFavorNoSmoothing;
       for (uint8_t val : epf_steps) {
         float error = error_images[val].Row(by)[bx];
         if (val == 0) {
@@ -1134,6 +1136,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
                             static_cast<float>(totals[context]);
         mul[mulix] =
             1.0f / (1.0f + c5 * std::log1p(ratio) / clamped_butteraugli);
+        if (val == top_val && val == left_val) {
+          mul[mulix] *= 0.988f;
+        } else if (val == top_val || val == left_val) {
+          mul[mulix] *= 0.994f;
+        }
         if (val == 0) {
           mul[mulix] *= c3;
         }
