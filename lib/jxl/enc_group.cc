@@ -189,7 +189,8 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
         if ((q == 1 || q == -1) && s <= 2 && zero_thres[4 + s] >= -0.004f) {
           const float excess = std::max(0.0f, abs_val - t0);
           const float band_scale =
-              (s == 0) ? 1.0f : ((s == 1) ? 0.80f : 0.45f);
+              ((s == 0) ? 1.0f : ((s == 1) ? 0.80f : 0.45f)) *
+              Clamp1(1.0f + 2.5f * zero_thres[4 + s], 0.80f, 1.25f);
           const float norm_excess = excess / band_scale;
           if (norm_excess < cand_max_bonus) {
             cands[num_cands++] = {static_cast<int>(pos), norm_excess, s, 0};
