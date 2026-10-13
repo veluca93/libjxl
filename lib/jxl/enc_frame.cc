@@ -1551,9 +1551,13 @@ Status ComputeEncodingData(
   JXL_ASSIGN_OR_RETURN(shared.epf_sharpness,
                        ImageB::Create(memory_manager, frame_dim.xsize_blocks,
                                       frame_dim.ysize_blocks));
+  const ColorCorrelation prev_cmap_base = shared.cmap.base();
   JXL_ASSIGN_OR_RETURN(
       shared.cmap, ColorCorrelationMap::Create(memory_manager, frame_dim.xsize,
                                                frame_dim.ysize));
+  if (!enc_state.initialize_global_state) {
+    shared.cmap.base() = prev_cmap_base;
+  }
   shared.coeff_order_size = kCoeffOrderMaxSize;
   if (frame_header.encoding == FrameEncoding::kVarDCT) {
     shared.coeff_orders.resize(frame_header.passes.num_passes *

@@ -222,6 +222,147 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
     shared.dc = &shared.dc_storage;
     JXL_ENSURE(encoded_size == 0);
   } else {
+    if (enc_state->initialize_global_state &&
+        frame_header.chroma_subsampling.Is444() &&
+        !enc_state->cparams.disable_perceptual_optimizations &&
+        enc_state->cparams.speed_tier < SpeedTier::kFalcon &&
+        shared.frame_dim.xsize_blocks * shared.frame_dim.ysize_blocks > 64) {
+      const size_t xsize = shared.frame_dim.xsize_blocks;
+      const size_t ysize = shared.frame_dim.ysize_blocks;
+      const float inv_dc_x = shared.quantizer.GetInvDcStep(0);
+      const float inv_dc_y = shared.quantizer.GetInvDcStep(1);
+      const float inv_dc_b = shared.quantizer.GetInvDcStep(2);
+      const float y_step = shared.quantizer.GetDcStep(1);
+      auto clamped_grad = [](float n, float w, float nw) -> float {
+        const float m = std::min(n, w);
+        const float M = std::max(n, w);
+        return Clamp1(n + w - nw, m, M);
+      };
+      double num_x = 0.0;
+      double den_x = 1e-5;
+      double num_b = 0.0;
+      double den_b = 1e-5;
+      const float base_b = shared.cmap.base().GetBaseCorrelationB();
+      for (size_t y = 1; y < ysize; ++y) {
+        const float* JXL_RESTRICT rx = dc.ConstPlaneRow(0, y);
+        const float* JXL_RESTRICT rx_p = dc.ConstPlaneRow(0, y - 1);
+        const float* JXL_RESTRICT ry = dc.ConstPlaneRow(1, y);
+        const float* JXL_RESTRICT ry_p = dc.ConstPlaneRow(1, y - 1);
+        const float* JXL_RESTRICT rb = dc.ConstPlaneRow(2, y);
+        const float* JXL_RESTRICT rb_p = dc.ConstPlaneRow(2, y - 1);
+        for (size_t x = 1; x < xsize; ++x) {
+          const float dy =
+              ry[x] - clamped_grad(ry_p[x], ry[x - 1], ry_p[x - 1]);
+          const float dx =
+              rx[x] - clamped_grad(rx_p[x], rx[x - 1], rx_p[x - 1]);
+          const float db =
+              (rb[x] - base_b * ry[x]) -
+              clamped_grad(rb_p[x] - base_b * ry_p[x],
+                           rb[x - 1] - base_b * ry[x - 1],
+                           rb_p[x - 1] - base_b * ry_p[x - 1]);
+          const float q_dy = dy * inv_dc_y;
+          const float w = 1.0f / (1.0f + 0.02f * q_dy * q_dy);
+          num_x += w * dy * dx;
+          den_x += w * dy * dy;
+          num_b += w * dy * db;
+          den_b += w * dy * dy;
+        }
+      }
+      const int32_t est_x = Clamp1<int32_t>(
+          std::lround((num_x / den_x) * shared.cmap.base().GetColorFactor()),
+          -128, 127);
+      const int32_t est_b = Clamp1<int32_t>(
+          std::lround((num_b / den_b) * shared.cmap.base().GetColorFactor()),
+          -128, 127);
+
+      const float inv_fy = inv_dc_y * 2.0f;
+      const float half_y_step = y_step * 0.5f;
+      auto eval_cfl_cost = [&](size_t c, float inv_dc, int32_t idx) -> double {
+        const float k = (c == 0) ? shared.cmap.base().YtoXRatio(idx)
+                                 : shared.cmap.base().YtoBRatio(idx);
+        const float yk = half_y_step * k;
+        const float inv_f = inv_dc * 2.0f;
+        const float dz = (c == 0) ? 0.65f : 0.61f;
+        const float bias1 = (c == 0) ? 0.07f : 0.03f;
+        const float bias2 = (c == 0) ? 0.04f : 0.0f;
+        const float lambda_dist = (c == 0) ? 4.5f : 3.0f;
+        double cost = 0.0;
+        for (size_t y = 1; y < ysize; ++y) {
+          const float* JXL_RESTRICT rc = dc.ConstPlaneRow(c, y);
+          const float* JXL_RESTRICT rc_p = dc.ConstPlaneRow(c, y - 1);
+          const float* JXL_RESTRICT ry = dc.ConstPlaneRow(1, y);
+          const float* JXL_RESTRICT ry_p = dc.ConstPlaneRow(1, y - 1);
+          for (size_t x = 1; x < xsize; ++x) {
+            const float vc = rc[x] - std::round(ry[x] * inv_fy) * yk;
+            const float vn = rc_p[x] - std::round(ry_p[x] * inv_fy) * yk;
+            const float vw = rc[x - 1] - std::round(ry[x - 1] * inv_fy) * yk;
+            const float vnw = rc_p[x - 1] - std::round(ry_p[x - 1] * inv_fy) * yk;
+            const float abs_s =
+                std::abs(vc - clamped_grad(vn, vw, vnw)) * inv_f;
+            float q_abs = 0.0f;
+            float bits = 0.0f;
+            if (abs_s >= dz) {
+              q_abs = std::round(abs_s - bias1);
+              if (q_abs > 2.0f) {
+                q_abs = std::round(abs_s * 0.5f - bias2) * 2.0f;
+              }
+              if (q_abs > 0.0f) {
+                bits = 1.25f + std::log2(1.0f + std::min(32.0f, q_abs));
+              }
+            }
+            const float err = abs_s - q_abs;
+            cost += bits + lambda_dist * err * err;
+          }
+        }
+        return cost;
+      };
+
+      const double cost_x0 = eval_cfl_cost(0, inv_dc_x, 0);
+      const double cost_b0 = eval_cfl_cost(2, inv_dc_b, 0);
+      const double min_ch_gain =
+          12.0 + 0.004 * static_cast<double>((xsize - 1) * (ysize - 1));
+      int32_t best_x = 0;
+      double best_cost_x = cost_x0;
+      const int32_t cands_x[] = {est_x / 2, (est_x * 3) / 4, est_x - 1, est_x,
+                                 est_x + 1};
+      for (int32_t raw_cand : cands_x) {
+        const int32_t cand = Clamp1<int32_t>(raw_cand, -128, 127);
+        if (cand == 0 || cand == best_x) continue;
+        const double c = eval_cfl_cost(0, inv_dc_x, cand);
+        if (c < best_cost_x) {
+          best_cost_x = c;
+          best_x = cand;
+        }
+      }
+      if (cost_x0 - best_cost_x < min_ch_gain) {
+        best_x = 0;
+        best_cost_x = cost_x0;
+      }
+      int32_t best_b = 0;
+      double best_cost_b = cost_b0;
+      const int32_t cands_b[] = {est_b / 2, (est_b * 3) / 4, est_b - 1, est_b,
+                                 est_b + 1};
+      for (int32_t raw_cand : cands_b) {
+        const int32_t cand = Clamp1<int32_t>(raw_cand, -128, 127);
+        if (cand == 0 || cand == best_b) continue;
+        const double c = eval_cfl_cost(2, inv_dc_b, cand);
+        if (c < best_cost_b) {
+          best_cost_b = c;
+          best_b = cand;
+        }
+      }
+      if (cost_b0 - best_cost_b < min_ch_gain) {
+        best_b = 0;
+        best_cost_b = cost_b0;
+      }
+      const double min_tot_gain =
+          55.0 + (enc_state->streaming_mode ? 0.015 : 0.004) *
+                     static_cast<double>((xsize - 1) * (ysize - 1));
+      if ((cost_x0 - best_cost_x) + (cost_b0 - best_cost_b) > min_tot_gain) {
+        shared.cmap.base().SetYToXDC(best_x);
+        shared.cmap.base().SetYToBDC(best_b);
+      }
+    }
     auto compute_dc_coeffs = [&](int group_index, int /* thread */) -> Status {
       const Rect r = enc_state->shared.frame_dim.DCGroupRect(group_index);
       int modular_group_index = group_index;
