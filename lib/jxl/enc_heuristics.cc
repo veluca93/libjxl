@@ -1394,7 +1394,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
               /*quantizer=*/enable_rdo ? &quantizer : nullptr, /*fast=*/false,
               thread, &cmap,
               /*shrink_towards_zero=*/!enable_rdo ||
-                  cparams.noise == Override::kOn));
+                  cparams.noise == Override::kOn,
+              enable_rdo ? enc_state->x_qm_multiplier : 1.0f,
+              enable_rdo ? enc_state->b_qm_multiplier : 1.0f));
         }
       }
     }
@@ -1426,7 +1428,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
               &quantizer, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat,
               thread, &cmap,
               /*shrink_towards_zero=*/!enable_rdo ||
-                  cparams.noise == Override::kOn));
+                  cparams.noise == Override::kOn,
+              enable_rdo ? enc_state->x_qm_multiplier : 1.0f,
+              enable_rdo ? enc_state->b_qm_multiplier : 1.0f));
         }
       }
     }

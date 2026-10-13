@@ -57,21 +57,27 @@ struct CFLFunction {
   static constexpr float kThres = 100.0f;
   static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
   CFLFunction(const float* values_m, const float* values_s, size_t num,
-              float base, float distance_mul)
+              float base, float distance_mul, float x_pred = 0.0f,
+              float zero_lambda = 0.0f, float pred_lambda = 0.0f)
       : values_m(values_m),
         values_s(values_s),
         num(num),
         base(base),
-        distance_mul(distance_mul) {
+        distance_mul(distance_mul),
+        x_pred(x_pred),
+        zero_lambda(zero_lambda),
+        pred_lambda(pred_lambda) {
     JXL_DASSERT(num % Lanes(df) == 0);
   }
 
   // Returns f'(x), where f is 1/3 * sum ((|color residual| + 1)^2-1) +
   // distance_mul * x^2 * num.
   float Compute(float x, float eps, float* fpeps, float* fmeps) const {
-    float first_derivative = 2 * distance_mul * num * x;
-    float first_derivative_peps = 2 * distance_mul * num * (x + eps);
-    float first_derivative_meps = 2 * distance_mul * num * (x - eps);
+    const float reg_hess = 2 * distance_mul * num + zero_lambda + pred_lambda;
+    const float first_derivative =
+        (2 * distance_mul * num + zero_lambda) * x + pred_lambda * (x - x_pred);
+    const float first_derivative_peps = first_derivative + reg_hess * eps;
+    const float first_derivative_meps = first_derivative - reg_hess * eps;
 
     const auto inv_color_factor = Set(df, kInvColorFactor);
     const auto thres = Set(df, kThres);
@@ -121,16 +127,22 @@ struct CFLFunction {
   size_t num;
   float base;
   float distance_mul;
+  float x_pred;
+  float zero_lambda;
+  float pred_lambda;
 };
 
 // Chroma-from-luma search, values_m will have luma -- and values_s chroma.
 int32_t FindBestMultiplier(const float* values_m, const float* values_s,
                            size_t num, float base, float distance_mul,
-                           bool fast, bool shrink_towards_zero = false) {
+                           bool fast, bool shrink_towards_zero = false,
+                           float x_pred = 0.0f, float zero_lambda = 0.0f,
+                           float pred_lambda = 0.0f) {
   if (num == 0) {
     return 0;
   }
   float x;
+  float last_ddf = 0.0f;
   if (fast) {
     static constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
     auto ca = Zero(df);
@@ -151,7 +163,8 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   } else {
     constexpr float eps = 100;
     constexpr float kClamp = 20.0f;
-    CFLFunction fn(values_m, values_s, num, base, distance_mul);
+    CFLFunction fn(values_m, values_s, num, base, distance_mul, x_pred,
+                   zero_lambda, pred_lambda);
     x = 0;
     // Up to 20 Newton iterations, with approximate derivatives.
     // Derivatives are approximate due to the high amount of noise in the exact
@@ -161,6 +174,7 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
       float dfmeps;
       float d_f = fn.Compute(x, eps, &dfpeps, &dfmeps);
       float ddf = (dfpeps - dfmeps) / (2 * eps);
+      last_ddf = ddf;
       float kExperimentalInsignificantStabilizer = 0.85;
       float step = d_f / (ddf + kExperimentalInsignificantStabilizer);
       x -= std::min(kClamp, std::max(-kClamp, step));
@@ -176,6 +190,12 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
     } else {
       x += kTowardsZero;
     }
+  } else if (pred_lambda > 0.0f) {
+    const float diff_pred = x - x_pred;
+    if (std::abs(diff_pred) <= 1.05f &&
+        last_ddf * diff_pred * diff_pred < 950.0f) {
+      x = x_pred;
+    }
   }
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
@@ -185,7 +205,8 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const AcStrategyImage* ac_strategy,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
                    const Rect& rect, bool fast, bool use_dct8,
-                   bool shrink_towards_zero, ImageSB* map_x, ImageSB* map_b,
+                   bool shrink_towards_zero, float x_qm_multiplier,
+                   float b_qm_multiplier, ImageSB* map_x, ImageSB* map_b,
                    Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
@@ -270,13 +291,14 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
       float q = (quantizer == nullptr)
                     ? 1.0f
                     : quantizer->Scale() * kStrangeMultiplier * qq;
-      const auto qv = Set(df, q);
+      const auto qv_x = Set(df, q * x_qm_multiplier);
+      const auto qv_b = Set(df, q * b_qm_multiplier);
       for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
         const auto b_y = Load(df, block_y + i);
         const auto b_x = Load(df, block_x + i);
         const auto b_b = Load(df, block_b + i);
-        const auto qqm_x = Mul(qv, Load(df, qm_x + i));
-        const auto qqm_b = Mul(qv, Load(df, qm_b + i));
+        const auto qqm_x = Mul(qv_x, Load(df, qm_x + i));
+        const auto qqm_b = Mul(qv_b, Load(df, qm_b + i));
         Store(Mul(b_y, qqm_x), df, coeffs_yx + num_ac);
         Store(Mul(b_x, qqm_x), df, coeffs_x + num_ac);
         Store(Mul(b_y, qqm_b), df, coeffs_yb + num_ac);
@@ -286,12 +308,44 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
     }
   }
   JXL_ENSURE(num_ac % Lanes(df) == 0);
-  row_out_x[tx] = FindBestMultiplier(coeffs_yx, coeffs_x, num_ac, 0.0f,
-                                     kDistanceMultiplierAC, fast,
-                                     shrink_towards_zero);
-  row_out_b[tx] =
-      FindBestMultiplier(coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio,
-                         kDistanceMultiplierAC, fast, shrink_towards_zero);
+  const bool use_reg = (!fast && !shrink_towards_zero);
+  const bool use_pred = (use_reg && !use_dct8);
+  auto compute_pred = [&](const ImageSB* map, float* out_pred_lambda) -> float {
+    if (!use_pred) {
+      *out_pred_lambda = 0.0f;
+      return 0.0f;
+    }
+    const int lx = tx & 3;
+    const int ly = ty & 3;
+    if (lx == 0 && ly == 0) {
+      *out_pred_lambda = 3.0f;
+      return 0.0f;
+    }
+    const int8_t* row_cur = map->ConstRow(ty);
+    const int8_t* row_top = (ly > 0) ? map->ConstRow(ty - 1) : nullptr;
+    const int32_t left =
+        (lx > 0) ? row_cur[tx - 1] : ((ly > 0) ? row_top[tx] : 0);
+    const int32_t top = (ly > 0) ? row_top[tx] : left;
+    const int32_t topleft = (lx > 0 && ly > 0) ? row_top[tx - 1] : left;
+    const int32_t m = std::min(top, left);
+    const int32_t M = std::max(top, left);
+    const int32_t grad = top + left - topleft;
+    const int32_t spread =
+        std::max(M, topleft) - std::min(m, topleft);
+    *out_pred_lambda = 10.0f / (1.0f + 0.15f * static_cast<float>(spread));
+    return static_cast<float>(std::min(M, std::max(m, grad)));
+  };
+  const float zero_lambda = use_reg ? 2.5f : 0.0f;
+  float pred_lambda_x = 0.0f;
+  float pred_lambda_b = 0.0f;
+  const float pred_x = compute_pred(map_x, &pred_lambda_x);
+  const float pred_b = compute_pred(map_b, &pred_lambda_b);
+  row_out_x[tx] = FindBestMultiplier(
+      coeffs_yx, coeffs_x, num_ac, 0.0f, kDistanceMultiplierAC, fast,
+      shrink_towards_zero, pred_x, zero_lambda, pred_lambda_x);
+  row_out_b[tx] = FindBestMultiplier(
+      coeffs_yb, coeffs_b, num_ac, jxl::cms::kYToBRatio, kDistanceMultiplierAC,
+      fast, shrink_towards_zero, pred_b, zero_lambda, pred_lambda_b);
   return true;
 }
 
@@ -312,14 +366,16 @@ Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
                                   const ImageI* raw_quant_field,
                                   const Quantizer* quantizer, bool fast,
                                   size_t thread, ColorCorrelationMap* cmap,
-                                  bool shrink_towards_zero) {
+                                  bool shrink_towards_zero,
+                                  float x_qm_multiplier,
+                                  float b_qm_multiplier) {
   bool use_dct8 = ac_strategy == nullptr;
   Span<float> scratch(mem.address<float>() + thread * ItemsPerThread(),
                       ItemsPerThread());
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
-      fast, use_dct8, shrink_towards_zero, &cmap->ytox_map, &cmap->ytob_map,
-      scratch);
+      fast, use_dct8, shrink_towards_zero, x_qm_multiplier, b_qm_multiplier,
+      &cmap->ytox_map, &cmap->ytob_map, scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,

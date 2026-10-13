@@ -51,7 +51,9 @@ struct CfLHeuristics {
                      const AcStrategyImage* ac_strategy,
                      const ImageI* raw_quant_field, const Quantizer* quantizer,
                      bool fast, size_t thread, ColorCorrelationMap* cmap,
-                     bool shrink_towards_zero = false);
+                     bool shrink_towards_zero = false,
+                     float x_qm_multiplier = 1.0f,
+                     float b_qm_multiplier = 1.0f);
 
   JxlMemoryManager* memory_manager;
   AlignedMemory mem;
