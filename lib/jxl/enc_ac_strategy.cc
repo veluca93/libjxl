@@ -342,6 +342,22 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   if (num_blocks == 1) {
     quant_norm16 = config.Quant(bx0, by0);
     q_min = q_max = quant_norm16;
+  } else if (config.band_qf_stride > 0) {
+    float q_norm2 = 0.0f;
+    for (size_t iy = 0; iy < cov_y; iy++) {
+      for (size_t ix = 0; ix < cov_x; ix++) {
+        float qval = config.Quant(bx0 + ix, by0 + iy);
+        q_min = std::min(q_min, qval);
+        q_max = std::max(q_max, qval);
+        qval *= qval;
+        q_norm2 += qval;
+        qval *= qval;
+        quant_norm16 += qval * qval;
+      }
+    }
+    quant_norm16 = FastPowf(quant_norm16 / num_blocks, 1.0f / 8.0f);
+    q_norm2 = std::sqrt(q_norm2 / num_blocks);
+    quant_norm16 = 0.86f * quant_norm16 + 0.14f * q_norm2;
   } else if (num_blocks == 2) {
     for (size_t iy = 0; iy < cov_y; ++iy) {
       for (size_t ix = 0; ix < cov_x; ++ix) {

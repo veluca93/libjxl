@@ -1443,11 +1443,13 @@ Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
       float mean = 0.0;
       for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
         for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          mean += quant_row[x + ix + iy * stride];
-          max = std::max(quant_row[x + ix + iy * stride], max);
+          const float q = quant_row[x + ix + iy * stride];
+          mean += has_band_qf ? (q * q) : q;
+          max = std::max(q, max);
         }
       }
       mean /= acs.covered_blocks_y() * acs.covered_blocks_x();
+      if (has_band_qf) mean = std::sqrt(mean);
       if (acs.covered_blocks_y() * acs.covered_blocks_x() >= 4) {
         max *= mean_max_mixer;
         max += (1.0f - mean_max_mixer) * mean;
