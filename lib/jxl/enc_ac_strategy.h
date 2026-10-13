@@ -49,6 +49,7 @@ struct ACSConfig {
   float info_loss_multiplier;
   float cost_delta;
   float zeros_mul;
+  float butteraugli_distance;
   const float& Pixel(size_t c, size_t x, size_t y) const {
     return src_rows[c][y * src_stride + x];
   }

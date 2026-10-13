@@ -305,6 +305,7 @@ using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::IfThenZeroElse;
 using hwy::HWY_NAMESPACE::Lt;
 using hwy::HWY_NAMESPACE::Max;
+using hwy::HWY_NAMESPACE::MulAdd;
 using hwy::HWY_NAMESPACE::Round;
 using hwy::HWY_NAMESPACE::Sqrt;
 
@@ -357,7 +358,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     }
     quant_norm16 = FastPowf(quant_norm16 / num_blocks, 1.0f / 8.0f);
     q_norm2 = std::sqrt(q_norm2 / num_blocks);
-    quant_norm16 = 0.86f * quant_norm16 + 0.14f * q_norm2;
+    quant_norm16 = 0.83f * quant_norm16 + 0.17f * q_norm2;
   } else if (num_blocks == 2) {
     for (size_t iy = 0; iy < cov_y; ++iy) {
       for (size_t ix = 0; ix < cov_x; ++ix) {
@@ -389,6 +390,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   const auto quant = Set(df, quant_norm16);
   HWY_ALIGN float w_row[AcStrategy::kMaxBlockDim];
   HWY_ALIGN float t0_row[AcStrategy::kMaxBlockDim];
+  HWY_ALIGN float cw_row[AcStrategy::kMaxBlockDim];
   auto loss = Zero(df8);
   auto loss2 = Zero(df8);
 
@@ -433,9 +435,14 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
         const float ws = band_w[s] * csf;
         const float dz = (v8 == 0 && u8 == 0) ? 0.0f : zero_thres[4 + s];
         const float t0 = 0.50f + ((dz >= 0.0f) ? dz : (0.5f * dz));
+        const float cw =
+            (!use_csf_w || (v8 == 0 && u8 == 0))
+                ? 1.0f
+                : (0.94f + 0.0085f * static_cast<float>(v8 + u8));
         for (size_t ix = 0; ix < cx; ++ix) {
           w_row[u8 * cx + ix] = ws;
           t0_row[u8 * cx + ix] = t0;
+          cw_row[u8 * cx + ix] = cw;
         }
       }
       for (size_t iy = 0; iy < cy; ++iy) {
@@ -453,7 +460,8 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           Store(Mul(m, diff), df, &mem[off + rx]);
           const auto q_mag = Abs(rval);
           const auto q_is_zero = Eq(q_mag, zero);
-          entropy_v = Add(Sqrt(q_mag), entropy_v);
+          const auto cw = Load(df, cw_row + rx);
+          entropy_v = MulAdd(cw, Sqrt(q_mag), entropy_v);
           nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, one));
         }
       }
@@ -519,8 +527,12 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     if (c == 0 && num_blocks >= 2) {
       // It is X channel (red-green) and we often see ringing
       // in the large blocks. Let's punish that more here.
+      const float x_slope =
+          0.088f +
+          0.014f * Clamp1((config.butteraugli_distance - 0.5f) / 1.5f, 0.0f,
+                          1.0f);
       float w = (config.band_qf_stride > 0)
-                    ? (1.0f + std::min(2.6f, num_blocks * 0.098f))
+                    ? (1.0f + std::min(2.6f, num_blocks * x_slope))
                     : static_cast<float>(1.0 + std::min(3.0, num_blocks / 8.0));
       entropy_c *= w;
       lossc = Mul(lossc, Set(df8, w));
@@ -535,15 +547,17 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       std::pow(GetLane(SumOfLanes(df8, loss)) * inv_npixels, 1.0f / 8.0f);
   const float d2 = std::sqrt(GetLane(SumOfLanes(df8, loss2)) * inv_npixels);
   const float d_blend =
-      (config.band_qf_stride > 0) ? (0.93f * d8 + 0.07f * 2.18f * d2) : d8;
+      (config.band_qf_stride > 0) ? (0.91f * d8 + 0.09f * 2.18f * d2) : d8;
   float loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / quant_norm16;
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
-  if (config.band_qf_stride > 0 && num_blocks >= 2 && num_blocks <= 16 &&
-      q_min > 1e-4f) {
+  if (config.band_qf_stride > 0 && num_blocks >= 2 && q_min > 1e-4f) {
     const float q_ratio = q_max / q_min;
-    if (q_ratio < 1.11f) {
-      entropy *= 1.0f - 0.010f * ((1.11f - q_ratio) / 0.11f);
+    if (num_blocks <= 16 && q_ratio < 1.12f) {
+      entropy *= 1.0f - 0.011f * ((1.12f - q_ratio) / 0.12f);
+    } else if (q_ratio > 1.22f) {
+      entropy *=
+          1.0f + 0.014f * Clamp1((q_ratio - 1.22f) / 0.35f, 0.0f, 1.0f);
     }
   }
   return true;
@@ -624,9 +638,16 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
     if ((tx.type == AcStrategyType::DCT2X2 ||
          tx.type == AcStrategyType::IDENTITY) &&
         butteraugli_target < 5.0) {
-      static const float kFavor2X2AtHighQuality = 0.4;
+      float favor_2x2 = 0.40f;
+      if (config.band_qf_stride > 0) {
+        const float d_ramp =
+            Clamp1((butteraugli_target - 0.5f) / 0.35f, 0.0f, 1.0f);
+        favor_2x2 = (tx.type == AcStrategyType::DCT2X2)
+                        ? (0.385f - 0.125f * d_ramp)
+                        : (0.400f - 0.050f * d_ramp);
+      }
       float weight = pow((5.0f - butteraugli_target) / 5.0f, 2.0f);
-      entropy_mul -= kFavor2X2AtHighQuality * weight;
+      entropy_mul -= favor_2x2 * weight;
     }
     if ((tx.type != AcStrategyType::DCT && tx.type != AcStrategyType::DCT2X2 &&
          tx.type != AcStrategyType::IDENTITY) &&
@@ -710,9 +731,14 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     }
   }
 
+  const bool enable_rdo = (config.band_qf_stride > 0);
   // Favor all 8x8 transforms (against 16x8 and larger transforms) at
   // low butteraugli_target distances.
-  static const float k8x8mul1 = -0.4f;
+  const float k8x8mul1 =
+      enable_rdo
+          ? (-0.375f +
+             0.035f * Clamp1((butteraugli_target - 0.5f) / 0.4f, 0.0f, 1.0f))
+          : -0.4f;
   static const float k8x8mul2 = 1.0f;
   static const float k8x8base = 1.4f;
   const float mul8x8 = k8x8mul2 + k8x8mul1 / (butteraugli_target + k8x8base);
@@ -742,12 +768,17 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     }
   }
 
-  const float entropy_mul16X8 = 1.21f;
-  const float entropy_mul16X16 = 1.34f;
-  const float entropy_mul16X32 = 1.49f;
-  const float entropy_mul32X32 = 1.48f;
-  const float entropy_mul64X32 = 2.25f;
-  const float entropy_mul64X64 = 2.25f;
+  const float mb_scale =
+      enable_rdo
+          ? (0.985f +
+             0.015f * Clamp1((butteraugli_target - 0.5f) / 1.0f, 0.0f, 1.0f))
+          : 1.0f;
+  const float entropy_mul16X8 = 1.21f * mb_scale;
+  const float entropy_mul16X16 = 1.34f * mb_scale;
+  const float entropy_mul16X32 = 1.49f * mb_scale;
+  const float entropy_mul32X32 = 1.48f * mb_scale;
+  const float entropy_mul64X32 = 2.25f * mb_scale;
+  const float entropy_mul64X64 = 2.25f * mb_scale;
 
   // Map 1D intervals [pos, pos + len) in [0, 32) to [0, 528).
   uint16_t iv_idx[32][33] = {};
@@ -764,7 +795,6 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   };
 
   constexpr float kInf = 1e30f;
-  const bool enable_rdo = (config.band_qf_stride > 0);
   const bool allow_16 = (cparams.decoding_speed_tier <= 4);
   const bool allow_16x32 = allow_16;
   const bool allow_32x32 = (cparams.decoding_speed_tier < 4);
@@ -1269,6 +1299,7 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   config.info_loss_multiplier = 1.2;
   config.zeros_mul = 9.3089059022677905;
   config.cost_delta = 10.833273317067883;
+  config.butteraugli_distance = cparams.butteraugli_distance;
 
   static const float kBias = 0.13731742964354549;
   const float ratio = (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
