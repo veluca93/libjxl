@@ -503,7 +503,9 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     if (c == 0 && num_blocks >= 2) {
       // It is X channel (red-green) and we often see ringing
       // in the large blocks. Let's punish that more here.
-      float w = 1.0 + std::min(3.0, num_blocks / 8.0);
+      float w = (config.band_qf_stride > 0)
+                    ? (1.0f + std::min(2.6f, num_blocks * 0.098f))
+                    : static_cast<float>(1.0 + std::min(3.0, num_blocks / 8.0));
       entropy_c *= w;
       lossc = Mul(lossc, Set(df8, w));
       lossc2 = Mul(lossc2, Set(df8, std::pow(w, 0.25f)));
@@ -521,11 +523,11 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   float loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / quant_norm16;
   entropy *= entropy_mul;
   entropy += config.info_loss_multiplier * loss_scalar;
-  if (config.band_qf_stride > 0 && num_blocks >= 2 && num_blocks <= 4 &&
+  if (config.band_qf_stride > 0 && num_blocks >= 2 && num_blocks <= 16 &&
       q_min > 1e-4f) {
     const float q_ratio = q_max / q_min;
-    if (q_ratio < 1.08f) {
-      entropy *= 1.0f - 0.007f * ((1.08f - q_ratio) / 0.08f);
+    if (q_ratio < 1.11f) {
+      entropy *= 1.0f - 0.010f * ((1.11f - q_ratio) / 0.11f);
     }
   }
   return true;
