@@ -214,6 +214,8 @@ namespace {
 
 Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                                const CompressParams& cparams,
+                               const FrameDimensions& frame_dim,
+                               bool enable_rdo,
                                ModularFrameEncoder* modular_frame_encoder,
                                DequantMatrices* dequant_matrices) {
   // TODO(veluca): quant matrices for no-gaborish.
@@ -234,6 +236,128 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     float dc_weights[3] = {1.0f / wp[0], 1.0f / wp[1], 1.0f / wp[2]};
     JXL_RETURN_IF_ERROR(DequantMatricesSetCustomDC(
         memory_manager, dequant_matrices, dc_weights));
+  } else if (enable_rdo) {
+    const size_t num_blocks = frame_dim.xsize_blocks * frame_dim.ysize_blocks;
+    if (num_blocks < 8192) return true;
+
+    const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 3.5f);
+    const float t_d = Clamp1((d - 0.5f) / 2.0f, 0.0f, 1.0f);
+    const float a_mid_base =
+        ((num_blocks >= 16384 && num_blocks < 40000) ? 0.034f : 0.032f) -
+        0.008f * t_d;
+    constexpr float kChannelMid[3] = {0.75f, 1.00f, 0.85f};
+
+    // Scale both the set of customized transform tables and the number of
+    // radial distance bands written to the bitstream with image size
+    // (num_blocks) and transform size (lib_bands):
+    //   < 8192 blocks   : 0 custom bands (library defaults)
+    //   8192..16383     : DCT(6) + DCT16X16(7) + DCT8X16(7) = 20 bands
+    //   16384..27999    : DCT(6) + DCT16X16(7) + DCT32X32(8) = 21 bands
+    //   28000..39999    : + DCT8X16(7) = 28 bands
+    //   >= 40000 blocks : + DCT16X32(8) = 36 bands
+    auto target_bands_for_table = [&](QuantTable table,
+                                      size_t lib_bands) -> size_t {
+      switch (table) {
+        case QuantTable::DCT:
+        case QuantTable::DCT16X16:
+          return lib_bands;
+        case QuantTable::DCT8X16:
+          if (num_blocks >= 16384 && num_blocks < 28000) return 0;
+          return lib_bands;
+        case QuantTable::DCT32X32:
+          if (num_blocks < 16384) return 0;
+          return lib_bands;
+        case QuantTable::DCT16X32:
+          if (num_blocks < 40000) return 0;
+          return lib_bands;
+        default:
+          return 0;
+      }
+    };
+
+    auto mult_step = [](float v) -> float {
+      return (v > 0.0f) ? (1.0f + v) : (1.0f / (1.0f - v));
+    };
+    auto inv_mult_step = [](float r) -> float {
+      return (r >= 1.0f) ? (r - 1.0f) : (1.0f - 1.0f / r);
+    };
+
+    const QuantEncoding* library = DequantMatrices::Library();
+    std::vector<QuantEncoding> encodings(kNumQuantTables,
+                                         QuantEncoding::Library<0>());
+    bool any_custom = false;
+    for (size_t i = 0; i < kNumQuantTables; ++i) {
+      const QuantTable table = static_cast<QuantTable>(i);
+      const QuantEncoding& lib_enc = library[i];
+      if (lib_enc.mode != QuantEncoding::kQuantModeDCT) continue;
+      const size_t lib_bands = lib_enc.dct_params.num_distance_bands;
+      if (lib_bands < 2) continue;
+      const size_t out_bands =
+          std::min(target_bands_for_table(table, lib_bands), lib_bands);
+      if (out_bands < 2) continue;
+
+      float tx_scale = 1.0f;
+      if (table == QuantTable::DCT16X16 || table == QuantTable::DCT8X16) {
+        tx_scale = 0.85f;
+      } else if (table == QuantTable::DCT32X32 ||
+                 table == QuantTable::DCT16X32) {
+        tx_scale = 0.75f;
+      }
+
+      DctQuantWeightParams new_params = lib_enc.dct_params;
+      new_params.num_distance_bands = out_bands;
+      for (size_t c = 0; c < 3; ++c) {
+        float lib_w[DctQuantWeightParams::kMaxDistanceBands];
+        lib_w[0] = lib_enc.dct_params.distance_bands[c][0];
+        for (size_t j = 1; j < lib_bands; ++j) {
+          lib_w[j] =
+              lib_w[j - 1] * mult_step(lib_enc.dct_params.distance_bands[c][j]);
+        }
+
+        const float a_mid = a_mid_base * kChannelMid[c] * tx_scale;
+        float target_w[DctQuantWeightParams::kMaxDistanceBands];
+        for (size_t k = 0; k < out_bands; ++k) {
+          const float u =
+              static_cast<float>(k) / static_cast<float>(out_bands - 1);
+          const float pos = u * static_cast<float>(lib_bands - 1);
+          const size_t idx =
+              std::min<size_t>(static_cast<size_t>(pos), lib_bands - 2);
+          const float frac = pos - static_cast<float>(idx);
+          const float w_u =
+              lib_w[idx] * std::pow(lib_w[idx + 1] / lib_w[idx], frac);
+          float delta_l = 0.0f;
+          if (k >= 2 && out_bands > 2) {
+            const float v =
+                static_cast<float>(k - 1) / static_cast<float>(out_bands - 2);
+            const float c0 =
+                (num_blocks < 16384)
+                    ? 0.38f
+                    : ((num_blocks >= 40000)
+                           ? 0.30f
+                           : (1.58f / static_cast<float>(out_bands - 2)));
+            const float s = v - c0;
+            delta_l = a_mid * s * (1.15f - 0.45f * t_d * v);
+          }
+          target_w[k] = w_u * std::exp(delta_l);
+        }
+
+        new_params.distance_bands[c][0] = target_w[0];
+        for (size_t k = 1; k < out_bands; ++k) {
+          new_params.distance_bands[c][k] =
+              inv_mult_step(target_w[k] / target_w[k - 1]);
+        }
+        for (size_t k = out_bands; k < DctQuantWeightParams::kMaxDistanceBands;
+             ++k) {
+          new_params.distance_bands[c][k] = 0.0f;
+        }
+      }
+      encodings[i] = QuantEncoding::DCT(new_params);
+      any_custom = true;
+    }
+    if (any_custom) {
+      JXL_RETURN_IF_ERROR(DequantMatricesSetCustom(dequant_matrices, encodings,
+                                                   modular_frame_encoder));
+    }
   }
   return true;
 }
@@ -1178,7 +1302,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   if (initialize_global_state) {
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
-        memory_manager, cparams, modular_frame_encoder, &matrices));
+        memory_manager, cparams, frame_dim, enable_rdo, modular_frame_encoder,
+        &matrices));
   }
 
   enc_state->x_qm_multiplier =
