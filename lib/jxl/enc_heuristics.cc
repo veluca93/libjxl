@@ -288,6 +288,37 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     };
 
     const QuantEncoding* library = DequantMatrices::Library();
+    // Precompute log-weights of the square anchor tables (DCT8, DCT16X16,
+    // DCT32X32) so rectangular tables (DCT8X16, DCT16X32) can be regularized
+    // toward uniform perceptual loss at the same physical spatial frequency.
+    constexpr size_t kSquareTables[3] = {
+        static_cast<size_t>(QuantTable::DCT),
+        static_cast<size_t>(QuantTable::DCT16X16),
+        static_cast<size_t>(QuantTable::DCT32X32),
+    };
+    float sq_log_w[3][3][DctQuantWeightParams::kMaxDistanceBands] = {};
+    size_t sq_bands[3] = {};
+    for (size_t s_idx = 0; s_idx < 3; ++s_idx) {
+      const DctQuantWeightParams& sp = library[kSquareTables[s_idx]].dct_params;
+      sq_bands[s_idx] = sp.num_distance_bands;
+      for (size_t c = 0; c < 3; ++c) {
+        float w = sp.distance_bands[c][0];
+        sq_log_w[s_idx][c][0] = std::log(w);
+        for (size_t j = 1; j < sq_bands[s_idx]; ++j) {
+          w *= mult_step(sp.distance_bands[c][j]);
+          sq_log_w[s_idx][c][j] = std::log(w);
+        }
+      }
+    }
+    auto interp_sq_log_w = [&](size_t s_idx, size_t ch, float u_sq) -> float {
+      const size_t nb = sq_bands[s_idx];
+      const float pos = Clamp1(u_sq, 0.0f, 1.0f) * static_cast<float>(nb - 1);
+      const size_t idx = std::min<size_t>(static_cast<size_t>(pos), nb - 2);
+      const float frac = pos - static_cast<float>(idx);
+      return sq_log_w[s_idx][ch][idx] +
+             frac * (sq_log_w[s_idx][ch][idx + 1] - sq_log_w[s_idx][ch][idx]);
+    };
+
     std::vector<QuantEncoding> encodings(kNumQuantTables,
                                          QuantEncoding::Library<0>());
     bool any_custom = false;
@@ -309,6 +340,15 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         tx_scale = 0.75f;
       }
 
+      const bool is_rect =
+          (table == QuantTable::DCT8X16 || table == QuantTable::DCT16X32);
+      const size_t sq_lo = (table == QuantTable::DCT8X16) ? 0 : 1;
+      const size_t sq_hi = sq_lo + 1;
+      const float d_bar =
+          (table == QuantTable::DCT8X16) ? 11.3137085f : 22.627417f;
+      const float d_lo = (table == QuantTable::DCT8X16) ? 8.0f : 16.0f;
+      const float d_hi = (table == QuantTable::DCT8X16) ? 16.0f : 32.0f;
+
       DctQuantWeightParams new_params = lib_enc.dct_params;
       new_params.num_distance_bands = out_bands;
       for (size_t c = 0; c < 3; ++c) {
@@ -319,7 +359,31 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
               lib_w[j - 1] * mult_step(lib_enc.dct_params.distance_bands[c][j]);
         }
 
+        float phys_diffs[DctQuantWeightParams::kMaxDistanceBands] = {};
+        float mean_phys_diff = 0.0f;
+        if (is_rect && out_bands > 2) {
+          for (size_t k = 2; k < out_bands; ++k) {
+            const float u =
+                static_cast<float>(k) / static_cast<float>(out_bands - 1);
+            const float pos = u * static_cast<float>(lib_bands - 1);
+            const size_t idx =
+                std::min<size_t>(static_cast<size_t>(pos), lib_bands - 2);
+            const float frac = pos - static_cast<float>(idx);
+            const float w_u =
+                lib_w[idx] * std::pow(lib_w[idx + 1] / lib_w[idx], frac);
+            const float f_phys = u * ((d_bar - 1.0f) / d_bar);
+            const float u_lo = f_phys * (d_lo / (d_lo - 1.0f));
+            const float u_hi = f_phys * (d_hi / (d_hi - 1.0f));
+            const float l_anchor = 0.5f * interp_sq_log_w(sq_lo, c, u_lo) +
+                                   0.5f * interp_sq_log_w(sq_hi, c, u_hi);
+            phys_diffs[k] = l_anchor - std::log(w_u);
+            mean_phys_diff += phys_diffs[k];
+          }
+          mean_phys_diff /= static_cast<float>(out_bands - 2);
+        }
+
         const float a_mid = a_mid_base * kChannelMid[c] * tx_scale;
+        constexpr float kAlphaRect[3] = {0.20f, 0.25f, 0.20f};
         float target_w[DctQuantWeightParams::kMaxDistanceBands];
         for (size_t k = 0; k < out_bands; ++k) {
           const float u =
@@ -342,8 +406,18 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                            : (1.58f / static_cast<float>(out_bands - 2)));
             const float s = v - c0;
             const float hf_decay =
-                (c == 1 || s <= 0.0f) ? 0.45f : ((c == 0) ? 0.85f : 1.05f);
-            delta_l = a_mid * s * (1.15f - hf_decay * t_d * v);
+                (c == 1 || s <= 0.0f)
+                    ? 0.45f
+                    : ((c == 0) ? ((num_blocks >= 40000) ? 0.95f : 0.85f)
+                                : ((num_blocks >= 40000) ? 1.15f : 1.05f));
+            const float lf_gain = (num_blocks >= 40000) ? 1.16f : 1.15f;
+            delta_l = a_mid * s * (lf_gain - hf_decay * t_d * v);
+            if (is_rect && num_blocks >= 28000) {
+              const float raw_diff =
+                  (c == 1) ? (phys_diffs[k] - mean_phys_diff)
+                           : std::min(0.0f, phys_diffs[k]);
+              delta_l += kAlphaRect[c] * Clamp1(raw_diff, -0.45f, 0.35f);
+            }
           }
           target_w[k] = w_u * std::exp(delta_l);
         }

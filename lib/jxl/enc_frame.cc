@@ -653,27 +653,27 @@ struct PixelStatsForChromacityAdjustment {
     dx = CalcPlane(&opsin->Plane(0), rect);
     CalcExposedBlue(&opsin->Plane(1), &opsin->Plane(2), rect);
   }
-  int HowMuchIsXChannelPixelized() const {
-    if (dx >= 0.026) {
+  int HowMuchIsXChannelPixelized(float d_scale) const {
+    if (dx >= 0.026f * d_scale) {
       return 3;
     }
-    if (dx >= 0.022) {
+    if (dx >= 0.022f * d_scale) {
       return 2;
     }
-    if (dx >= 0.015) {
+    if (dx >= 0.015f) {
       return 1;
     }
     return 0;
   }
-  int HowMuchIsBChannelPixelized() const {
-    int add = exposed_blue >= 0.13 ? 1 : 0;
-    if (db > 0.38) {
+  int HowMuchIsBChannelPixelized(float d_scale) const {
+    int add = exposed_blue >= 0.13f ? 1 : 0;
+    if (db > 0.38f * d_scale) {
       return 2 + add;
     }
-    if (db > 0.33) {
+    if (db > 0.33f * d_scale) {
       return 1 + add;
     }
-    if (db > 0.28) {
+    if (db > 0.28f) {
       return add;
     }
     return 0;
@@ -702,11 +702,16 @@ void ComputeChromacityAdjustments(const CompressParams& cparams,
   if (cparams.speed_tier <= SpeedTier::kSquirrel) {
     pixel_stats.Calc(&opsin, rect);
   }
+  const float d_scale =
+      1.0f +
+      0.26f * Clamp1(cparams.original_butteraugli_distance - 0.72f, 0.0f, 1.05f);
   // For X take the most severe adjustment.
   frame_header->x_qm_scale = std::max<int>(
-      frame_header->x_qm_scale, 2 + pixel_stats.HowMuchIsXChannelPixelized());
+      frame_header->x_qm_scale,
+      2 + pixel_stats.HowMuchIsXChannelPixelized(d_scale));
   // B only adjusted by pixel-based approach.
-  frame_header->b_qm_scale = 2 + pixel_stats.HowMuchIsBChannelPixelized();
+  frame_header->b_qm_scale =
+      2 + pixel_stats.HowMuchIsBChannelPixelized(d_scale);
 }
 
 void ComputeNoiseParams(const CompressParams& cparams, bool streaming_mode,
