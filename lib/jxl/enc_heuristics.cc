@@ -954,7 +954,7 @@ StatusOr<Image3F> ReconstructImage(
   options.use_slow_render_pipeline = false;
   options.coalescing = false;
   options.render_spotcolors = false;
-  options.render_noise = true;
+  options.render_noise = false;
 
   JXL_RETURN_IF_ERROR(dec_state->PreparePipeline(
       frame_header, &shared.metadata->m, &decoded, options));
@@ -980,10 +980,6 @@ StatusOr<Image3F> ReconstructImage(
     JXL_RETURN_IF_ERROR(DecodeGroupForRoundtrip(
         frame_header, coeffs, group_index, dec_state.get(),
         &group_dec_caches[thread], thread, input, nullptr, nullptr));
-    if ((frame_header.flags & FrameHeader::kNoise) != 0) {
-      PrepareNoiseInput(*dec_state, shared.frame_dim, frame_header, group_index,
-                        thread);
-    }
     JXL_RETURN_IF_ERROR(input.Done());
     return true;
   };
@@ -1068,7 +1064,8 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   }
   if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
       cparams.speed_tier > SpeedTier::kWombat ||
-      frame_header.loop_filter.epf_iters == 0) {
+      frame_header.loop_filter.epf_iters == 0 ||
+      frame_header.upsampling != 1) {
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
     return true;
   }
