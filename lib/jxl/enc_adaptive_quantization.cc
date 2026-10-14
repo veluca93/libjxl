@@ -1166,9 +1166,6 @@ Status FindBestQuantization(const FrameHeader& frame_header,
   bool lower_is_better =
       (comparator.GoodQualityScore() < comparator.BadQualityScore());
   const float initial_quant_dc = InitialQuantDC(butteraugli_target);
-  JXL_RETURN_IF_ERROR(AdjustQuantField(enc_state->shared.ac_strategy,
-                                       Rect(quant_field), original_butteraugli,
-                                       &quant_field));
   ImageF tile_distmap;
   JXL_ASSIGN_OR_RETURN(
       ImageF initial_quant_field,
@@ -1337,9 +1334,6 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
   // TODO(veluca): better choice of this value.
   const float initial_quant_dc =
       16 * std::sqrt(0.1f / cparams.butteraugli_distance);
-  JXL_RETURN_IF_ERROR(
-      AdjustQuantField(enc_state->shared.ac_strategy, Rect(quant_field),
-                       cparams.original_butteraugli_distance, &quant_field));
 
   const float inv_max_err[3] = {1.0f / enc_state->cparams.max_error[0],
                                 1.0f / enc_state->cparams.max_error[1],
@@ -1404,80 +1398,6 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
 }
 
 }  // namespace
-
-Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
-                        float butteraugli_target, ImageF* quant_field,
-                        ImageF (*band_qf)[4]) {
-  // Replace the whole quant_field in non-8x8 blocks with the maximum of each
-  // 8x8 block.
-  size_t stride = quant_field->PixelsPerRow();
-  const bool has_band_qf =
-      butteraugli_target < 3.5f &&
-      quant_field->xsize() * quant_field->ysize() > 64 && band_qf != nullptr &&
-      band_qf[0][0].xsize() > 0 && band_qf[0][0].ysize() > 0;
-
-  // At low distances it is great to use max, but mean works better
-  // at high distances. We interpolate between them for a distance
-  // range.
-  float mean_max_mixer = 1.0f;
-  {
-    static const float kLimit = 1.54138f;
-    static const float kMul = 0.56391f;
-    static const float kMin = 0.0f;
-    if (butteraugli_target > kLimit) {
-      mean_max_mixer -= (butteraugli_target - kLimit) * kMul;
-      if (mean_max_mixer < kMin) {
-        mean_max_mixer = kMin;
-      }
-    }
-  }
-  for (size_t y = 0; y < rect.ysize(); ++y) {
-    AcStrategyRow ac_strategy_row = ac_strategy.ConstRow(rect, y);
-    float* JXL_RESTRICT quant_row = rect.Row(quant_field, y);
-    for (size_t x = 0; x < rect.xsize(); ++x) {
-      AcStrategy acs = ac_strategy_row[x];
-      if (!acs.IsFirstBlock()) continue;
-      JXL_ENSURE(x + acs.covered_blocks_x() <= quant_field->xsize());
-      JXL_ENSURE(y + acs.covered_blocks_y() <= quant_field->ysize());
-      float max = quant_row[x];
-      float mean = 0.0;
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          const float q = quant_row[x + ix + iy * stride];
-          mean += has_band_qf ? (q * q) : q;
-          max = std::max(q, max);
-        }
-      }
-      mean /= acs.covered_blocks_y() * acs.covered_blocks_x();
-      if (has_band_qf) mean = std::sqrt(mean);
-      if (acs.covered_blocks_y() * acs.covered_blocks_x() >= 4) {
-        max *= mean_max_mixer;
-        max += (1.0f - mean_max_mixer) * mean;
-      }
-      for (size_t iy = 0; iy < acs.covered_blocks_y(); iy++) {
-        for (size_t ix = 0; ix < acs.covered_blocks_x(); ix++) {
-          const float old_q = std::max(quant_row[x + ix + iy * stride], 1e-4f);
-          const float rescale = max / old_q;
-          quant_row[x + ix + iy * stride] = max;
-          if (has_band_qf) {
-            static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f,
-                                                         1.00f};
-            for (size_t c = 0; c < 3; ++c) {
-              for (size_t s = 0; s < 4; ++s) {
-                const float band_rescale =
-                    (rescale > 1.0f)
-                        ? (1.0f + kBandRescaleMix[s] * (rescale - 1.0f))
-                        : rescale;
-                rect.Row(&band_qf[c][s], y + iy)[x + ix] *= band_rescale;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return true;
-}
 
 float InitialQuantDC(float butteraugli_target) {
   const float kDcMul = 0.3;  // Butteraugli target where non-linearity kicks in.

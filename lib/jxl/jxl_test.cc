@@ -330,7 +330,7 @@ TEST(JxlTest, RoundtripMultiGroup) {
   };
 
   auto run_kitten = std::async(std::launch::async, test, SpeedTier::kKitten,
-                               1.0f, 58737u, 9.1);
+                               1.0f, 57700u, 9.1);
   auto run_wombat = std::async(std::launch::async, test, SpeedTier::kWombat,
                                2.0f, 35561u, 16.5);
 }
@@ -556,7 +556,7 @@ TEST(JxlTest, RoundtripSmallNL) {
   ASSERT_TRUE(t.SetDimensions(xsize, ysize));
 
   PackedPixelFile ppf_out;
-  EXPECT_NEAR(Roundtrip(t.ppf(), {}, {}, pool, &ppf_out), 916, 45);
+  EXPECT_NEAR(Roundtrip(t.ppf(), {}, {}, pool, &ppf_out), 870, 45);
   EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 0.92);
 }
 
@@ -594,7 +594,7 @@ TEST(JxlTest, RoundtripSmallNoGaborish) {
   extras::JXLDecompressParams dparams;
 
   PackedPixelFile ppf_out;
-  EXPECT_NEAR(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out), 1066, 20);
+  EXPECT_NEAR(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out), 986, 20);
   EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 1.0);
 }
 
@@ -1295,7 +1295,7 @@ TEST(JxlTest, RoundtripDisablePerceptual) {
 
   PackedPixelFile ppf_out;
 
-  size_t expected_size = 487778;
+  size_t expected_size = 518365;
   EXPECT_NEAR(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out),
               expected_size, 4000);
   // TODO(veluca): figure out why we can't get below this value.

@@ -33,7 +33,7 @@ class AcStrategyImage;
 
 struct ACSConfig {
   const DequantMatrices* JXL_RESTRICT dequant;
-  const float* JXL_RESTRICT quant_field_row;
+  float* JXL_RESTRICT quant_field_row;
   size_t quant_field_stride;
   const float* JXL_RESTRICT masking_field_row;
   size_t masking_field_stride;
@@ -42,10 +42,12 @@ struct ACSConfig {
   size_t mask1x1_xsize;
   const float* JXL_RESTRICT src_rows[3];
   size_t src_stride;
-  const float* JXL_RESTRICT band_qf_rows[3][4];
+  float* JXL_RESTRICT band_qf_rows[3][4];
   size_t band_qf_stride;
   float csf_w[3][64];
   float qm_multiplier[3];
+  float quant_scale;
+  float inv_global_scale;
   float info_loss_multiplier;
   float cost_delta;
   float zeros_mul;
@@ -65,8 +67,14 @@ struct ACSConfig {
     JXL_DASSERT(quant_field_row[by * quant_field_stride + bx] > 0);
     return quant_field_row[by * quant_field_stride + bx];
   }
+  float& MutableQuant(size_t bx, size_t by) const {
+    return quant_field_row[by * quant_field_stride + bx];
+  }
   float BandQuant(size_t c, size_t s, size_t bx, size_t by) const {
     if (band_qf_rows[c][s] == nullptr) return Quant(bx, by);
+    return band_qf_rows[c][s][by * band_qf_stride + bx];
+  }
+  float& MutableBandQuant(size_t c, size_t s, size_t bx, size_t by) const {
     return band_qf_rows[c][s][by * band_qf_stride + bx];
   }
 };
@@ -78,11 +86,11 @@ struct AcStrategyHeuristics {
         cparams(cparams),
         mem_per_thread(0),
         qmem_per_thread(0) {}
-  Status Init(const Image3F& src, const Rect& rect_in,
-              const ImageF& quant_field, const ImageF& mask,
-              const ImageF& mask1x1, DequantMatrices* matrices,
-              const ImageF (*band_qf)[4] = nullptr,
-              float x_qm_multiplier = 1.0f, float b_qm_multiplier = 1.0f);
+  Status Init(const Image3F& src, const Rect& rect_in, ImageF* quant_field,
+              const ImageF& mask, const ImageF& mask1x1,
+              DequantMatrices* matrices, ImageF (*band_qf)[4] = nullptr,
+              float x_qm_multiplier = 1.0f, float b_qm_multiplier = 1.0f,
+              float quant_scale = 0.0f, float inv_global_scale = 0.0f);
   Status PrepareForThreads(std::size_t num_threads);
   Status ProcessRect(const Rect& rect, const ColorCorrelationMap& cmap,
                      AcStrategyImage* ac_strategy, size_t thread);

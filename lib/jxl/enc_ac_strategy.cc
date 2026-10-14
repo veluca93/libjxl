@@ -300,23 +300,30 @@ using hwy::HWY_NAMESPACE::CopySignToAbs;
 using hwy::HWY_NAMESPACE::Eq;
 using hwy::HWY_NAMESPACE::Floor;
 using hwy::HWY_NAMESPACE::Ge;
+using hwy::HWY_NAMESPACE::Gt;
 using hwy::HWY_NAMESPACE::IfThenElse;
 using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::IfThenZeroElse;
 using hwy::HWY_NAMESPACE::Lt;
 using hwy::HWY_NAMESPACE::Max;
+using hwy::HWY_NAMESPACE::Min;
 using hwy::HWY_NAMESPACE::MulAdd;
 using hwy::HWY_NAMESPACE::Round;
 using hwy::HWY_NAMESPACE::Sqrt;
+#if HWY_TARGET != HWY_SCALAR
+using hwy::HWY_NAMESPACE::Shuffle1032;
+using hwy::HWY_NAMESPACE::Shuffle2301;
+#endif
 
 Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                        size_t y, const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
-                       float& entropy) {
+                       float& entropy, float& q_out, uint8_t& act_out) {
   entropy = 0.0f;
   float* mem = full_scratch_space;
-  float* scratch_space = full_scratch_space + AcStrategy::kMaxCoeffArea;
+  float* pixels_buf = full_scratch_space + AcStrategy::kMaxCoeffArea;
+  float* scratch_space = full_scratch_space + 2 * AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
 
   const size_t cov_x = acs.covered_blocks_x();
@@ -340,9 +347,10 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   float quant_norm16 = 0;
   float q_min = std::numeric_limits<float>::max();
   float q_max = 0.0f;
+  float q_mean = 0.0f;
   if (num_blocks == 1) {
     quant_norm16 = config.Quant(bx0, by0);
-    q_min = q_max = quant_norm16;
+    q_min = q_max = q_mean = quant_norm16;
   } else if (config.band_qf_stride > 0) {
     float q_norm2 = 0.0f;
     for (size_t iy = 0; iy < cov_y; iy++) {
@@ -358,6 +366,7 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     }
     quant_norm16 = FastPowf(quant_norm16 / num_blocks, 1.0f / 8.0f);
     q_norm2 = std::sqrt(q_norm2 / num_blocks);
+    q_mean = q_norm2;
     quant_norm16 = 0.83f * quant_norm16 + 0.17f * q_norm2;
   } else if (num_blocks == 2) {
     for (size_t iy = 0; iy < cov_y; ++iy) {
@@ -365,8 +374,10 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
         const float qval = config.Quant(bx0 + ix, by0 + iy);
         q_min = std::min(q_min, qval);
         q_max = std::max(q_max, qval);
+        q_mean += qval;
       }
     }
+    q_mean /= num_blocks;
     quant_norm16 = q_max;
   } else {
     for (size_t iy = 0; iy < cov_y; iy++) {
@@ -374,38 +385,132 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
         float qval = config.Quant(bx0 + ix, by0 + iy);
         q_min = std::min(q_min, qval);
         q_max = std::max(q_max, qval);
+        q_mean += qval;
         qval *= qval;
         qval *= qval;
         qval *= qval;
         quant_norm16 += qval * qval;
       }
     }
+    q_mean /= num_blocks;
     quant_norm16 /= num_blocks;
     quant_norm16 = FastPowf(quant_norm16, 1.0f / 16.0f);
   }
+  float q_pool = q_max;
+  if (num_blocks >= 4) {
+    float mean_max_mixer = 1.0f;
+    if (config.butteraugli_distance > 1.54138f) {
+      mean_max_mixer = std::max(
+          0.0f, 1.0f - (config.butteraugli_distance - 1.54138f) * 0.56391f);
+    }
+    q_pool = mean_max_mixer * q_max + (1.0f - mean_max_mixer) * q_mean;
+  }
+  if (acs.Strategy() == AcStrategyType::DCT16X8 ||
+      acs.Strategy() == AcStrategyType::DCT8X16) {
+    q_pool *= 0.90390420971782894f;
+  } else if (acs.Strategy() == AcStrategyType::DCT16X16) {
+    q_pool *= 0.89232976007290965f;
+  }
+  q_out = q_pool;
+  act_out = 0;
 
   const HWY_CAPPED(float, 8) df8;
   const auto zero = Zero(df);
   const auto one = Set(df, 1.0f);
   const auto quant = Set(df, quant_norm16);
-  HWY_ALIGN float w_row[AcStrategy::kMaxBlockDim];
-  HWY_ALIGN float t0_row[AcStrategy::kMaxBlockDim];
-  HWY_ALIGN float cw_row[AcStrategy::kMaxBlockDim];
+
+  float* w_row = pixels_buf;
+  float* t0_row = pixels_buf + AcStrategy::kMaxBlockDim;
+  float* cw_row = pixels_buf + 2 * AcStrategy::kMaxBlockDim;
+  float* w_q_row = pixels_buf + 3 * AcStrategy::kMaxBlockDim;
+  float* t_tr_row = pixels_buf + 4 * AcStrategy::kMaxBlockDim;
+  float* t0_q_row = pixels_buf + 5 * AcStrategy::kMaxBlockDim;
   auto loss = Zero(df8);
   auto loss2 = Zero(df8);
 
   const bool is_partial_block =
       ((1 << static_cast<size_t>(acs.Strategy())) & kPartialBlockKinds) != 0;
   const float inv_nblocks = 1.0f / static_cast<float>(num_blocks);
+  const bool use_csf_w = (!is_partial_block && config.band_qf_stride > 0);
+  const bool use_q_rdo = (!is_partial_block && config.quant_scale > 0.0f);
 
-  for (size_t c = 0; c < 3; c++) {
+  static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f, 1.00f};
+  static constexpr float kBandErrWeight[4] = {0.81f, 0.96f, 1.18f, 1.40f};
+  // Per-channel RDO rate weights for stepping q up across transform scales:
+  // scale_ix = 0 (4 blocks: 16x16, 32x8, 8x32), 1 (8 blocks: 32x16, 16x32),
+  // 2 (16 blocks: 32x32), 3 (>=32 blocks: 64x32, 32x64, 64x64).
+  static constexpr float kAlphaBlk[4][3] = {
+      {0.09624f, 0.19962f, 0.13015f},
+      {0.30558f, 0.07055f, 0.06271f},
+      {0.05012f, 0.19465f, 0.04615f},
+      {0.20420f, 0.17975f, 0.03865f},
+  };
+  static constexpr float kAlphaVal[4][3] = {
+      {0.11965f, 0.49060f, 0.43129f},
+      {0.20277f, 0.17847f, 0.15945f},
+      {0.12220f, 0.40024f, 0.67915f},
+      {0.11713f, 0.30015f, 0.52662f},
+  };
+
+  int32_t quant_orig = 1;
+  float q_block_orig = quant_norm16;
+  float dz_w = 0.0f;
+  float dz_w_rt = 0.0f;
+  float hr_w = 1.0f;
+  float dct8_err_min = 0.0f;
+  float zero_thres_q[3][8] = {};
+  float trial_thres[4] = {0.58f, 0.64f, 0.64f, 0.64f};
+  if (use_q_rdo) {
+    quant_orig = Quantizer::ClampVal(q_pool * config.inv_global_scale + 0.5f);
+    q_block_orig = config.quant_scale * quant_orig;
+    const float d = config.butteraugli_distance;
+    dz_w = use_csf_w ? Clamp1((d - 0.35f) / (d + 0.55f) * 1.55f, 0.0f, 1.0f)
+                     : 0.0f;
+    dz_w_rt = Clamp1((d - 0.50f) / (d + 0.55f) * 1.65f, 0.0f, 1.0f);
+    hr_w = 1.0f - dz_w_rt;
+    dct8_err_min =
+        use_csf_w ? (0.42f + 1.85f * Clamp1(d - 0.95f, 0.0f, 1.20f)) : 0.0f;
+    if (cx > 1 || cy > 1) {
+      const float sub = Clamp1(0.003f * cx * cy, 0.0f, 0.08f);
+      for (int i = 0; i < 4; ++i) {
+        trial_thres[i] = std::max(0.54f, trial_thres[i] - sub);
+      }
+    }
+    for (size_t c = 0; c < 3; ++c) {
+      float bq_p[4] = {q_block_orig, q_block_orig, q_block_orig, q_block_orig};
+      if (use_csf_w) {
+        for (size_t s = 0; s < 4; ++s) {
+          float sq_sum = 0.0f;
+          for (size_t iy = 0; iy < cov_y; ++iy) {
+            for (size_t ix = 0; ix < cov_x; ++ix) {
+              const float old_q =
+                  std::max(config.Quant(bx0 + ix, by0 + iy), 1e-4f);
+              const float rescale = q_pool / old_q;
+              const float band_rescale =
+                  (rescale > 1.0f)
+                      ? (1.0f + kBandRescaleMix[s] * (rescale - 1.0f))
+                      : rescale;
+              const float v =
+                  config.BandQuant(c, s, bx0 + ix, by0 + iy) * band_rescale;
+              sq_sum += v * v;
+            }
+          }
+          bq_p[s] = std::sqrt(sq_sum * inv_nblocks);
+        }
+      }
+      ComputeBandThresholds(c, acs.Strategy(), cx, cy, q_block_orig, bq_p,
+                            zero_thres_q[c], dz_w);
+    }
+  }
+
+  int32_t max_quant = 0;
+  for (size_t c : {1, 0, 2}) {
     const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
     const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
     const auto cmap_factor = Set(df, cmap_factors[c]);
 
     float band_w[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float zero_thres[8] = {0.50f, 0.50f, 0.50f, 0.50f, 0.0f, 0.0f, 0.0f, 0.0f};
-    const bool use_csf_w = (!is_partial_block && config.band_qf_stride > 0);
     if (use_csf_w) {
       float bq[4];
       for (size_t s = 0; s < 4; ++s) {
@@ -425,31 +530,68 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       }
     }
 
+    float band_w_q[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if (use_q_rdo) {
+      for (size_t s = 0; s < 4; ++s) {
+        band_w_q[s] =
+            (use_csf_w ? kBandErrWeight[s] : 1.0f) *
+            Clamp1(1.0f - 3.5f * zero_thres_q[c][4 + s], 0.88f, 1.12f);
+      }
+    }
+    const auto q_block_c_v = Set(df, q_block_orig * config.qm_multiplier[c]);
+    const auto bias_c_v = Set(df, kDefaultQuantBias[c]);
+    const auto bias3_v = Set(df, kDefaultQuantBias[3]);
+
     auto entropy_v = Zero(df);
     auto nzeros_v = Zero(df);
+    auto r0_v = Zero(df);
+    auto e0_v = Zero(df);
+    auto quad_v0 = Zero(df);
+    auto quad_v1 = Zero(df);
+    auto quad_v2 = Zero(df);
+    auto quad_v3 = Zero(df);
+    HWY_ALIGN float quad_row8[2][8] = {};
+
     for (size_t v8 = 0; v8 < kBlockDim; ++v8) {
+      const bool v8_hi = (v8 >= 4);
       for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
+        const bool is_llf = (v8 == 0 && u8 == 0);
         const uint8_t s = kCoeffBand[v8][u8];
+        const size_t hfix =
+            (static_cast<size_t>(v8_hi) * 2 + static_cast<size_t>(u8 >= 4));
         const float csf =
             use_csf_w ? config.csf_w[c][v8 * kBlockDim + u8] : 1.0f;
         const float ws = band_w[s] * csf;
-        const float dz = (v8 == 0 && u8 == 0) ? 0.0f : zero_thres[4 + s];
+        const float dz = is_llf ? 0.0f : zero_thres[4 + s];
         const float t0 = 0.50f + ((dz >= 0.0f) ? dz : (0.5f * dz));
         const float cw =
-            (!use_csf_w || (v8 == 0 && u8 == 0))
+            (!use_csf_w || is_llf)
                 ? 1.0f
                 : (0.94f + 0.0085f * static_cast<float>(v8 + u8));
+        const float w_q = is_llf ? 0.0f : band_w_q[s];
+        const float t_tr =
+            is_llf ? 1e30f : (trial_thres[hfix] + zero_thres_q[c][4 + s]);
+        const float t0_q =
+            is_llf ? 1e30f
+                   : (use_csf_w
+                          ? (zero_thres_q[c][hfix] + zero_thres_q[c][4 + s])
+                          : t_tr);
         for (size_t ix = 0; ix < cx; ++ix) {
           w_row[u8 * cx + ix] = ws;
           t0_row[u8 * cx + ix] = t0;
           cw_row[u8 * cx + ix] = cw;
+          w_q_row[u8 * cx + ix] = w_q;
+          t_tr_row[u8 * cx + ix] = t_tr;
+          t0_q_row[u8 * cx + ix] = t0_q;
         }
       }
       for (size_t iy = 0; iy < cy; ++iy) {
         const size_t off = (v8 * cy + iy) * row_stride;
         for (size_t rx = 0; rx < row_stride; rx += Lanes(df)) {
           const auto in = Load(df, block + c * size + off + rx);
-          const auto in_y = Mul(Load(df, block + size + off + rx), cmap_factor);
+          const auto in_y =
+              (c == 1) ? zero
+                       : Mul(Load(df, block + size + off + rx), cmap_factor);
           const auto im = Load(df, inv_matrix + off + rx);
           const auto val = Mul(Sub(in, in_y), Mul(im, quant));
           const auto t0 = Load(df, t0_row + rx);
@@ -463,8 +605,163 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           const auto cw = Load(df, cw_row + rx);
           entropy_v = MulAdd(cw, Sqrt(q_mag), entropy_v);
           nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, one));
+
+          if (use_q_rdo) {
+            const auto v0 = Abs(Mul(in, Mul(im, q_block_c_v)));
+            const auto t0_q = Load(df, t0_q_row + rx);
+            const auto q_nz = IfThenElseZero(Ge(v0, t0_q), Round(v0));
+            if (cx == 1) {
+              const auto prev_q = Load(df, quad_row8[v8_hi] + rx);
+              Store(Add(prev_q, q_nz), df, quad_row8[v8_hi] + rx);
+            } else if (rx < cx * 4) {
+              if (!v8_hi) {
+                quad_v0 = Add(quad_v0, q_nz);
+              } else {
+                quad_v2 = Add(quad_v2, q_nz);
+              }
+            } else {
+              if (!v8_hi) {
+                quad_v1 = Add(quad_v1, q_nz);
+              } else {
+                quad_v3 = Add(quad_v3, q_nz);
+              }
+            }
+
+            const auto w_q = Load(df, w_q_row + rx);
+            const auto t_tr = Load(df, t_tr_row + rx);
+            auto eff_deq = [&](const auto& k) {
+              const auto is_pos = Ge(k, one);
+              const auto is_one = Eq(k, one);
+              const auto adj = IfThenElse(
+                  is_one, bias_c_v,
+                  IfThenElseZero(is_pos, Sub(k, Div(bias3_v, Max(k, one)))));
+              return MulAdd(Set(df, 0.65f), k, Mul(Set(df, 0.35f), adj));
+            };
+
+            const auto is_nz0 = Ge(v0, t_tr);
+            const auto k0 = IfThenElseZero(is_nz0, Round(v0));
+            const auto eff0 = eff_deq(k0);
+            const auto err0 = Mul(w_q, Abs(Sub(v0, eff0)));
+            r0_v = Add(r0_v, eff0);
+            e0_v = Add(e0_v, err0);
+          }
         }
       }
+    }
+
+    if (use_q_rdo) {
+      float hfNonZeros[4] = {};
+      if (cx == 1) {
+        hfNonZeros[0] = quad_row8[0][0] + quad_row8[0][1] + quad_row8[0][2] +
+                        quad_row8[0][3];
+        hfNonZeros[1] = quad_row8[0][4] + quad_row8[0][5] + quad_row8[0][6] +
+                        quad_row8[0][7];
+        hfNonZeros[2] = quad_row8[1][0] + quad_row8[1][1] + quad_row8[1][2] +
+                        quad_row8[1][3];
+        hfNonZeros[3] = quad_row8[1][4] + quad_row8[1][5] + quad_row8[1][6] +
+                        quad_row8[1][7];
+      } else {
+        hfNonZeros[0] = GetLane(SumOfLanes(df, quad_v0));
+        hfNonZeros[1] = GetLane(SumOfLanes(df, quad_v1));
+        hfNonZeros[2] = GetLane(SumOfLanes(df, quad_v2));
+        hfNonZeros[3] = GetLane(SumOfLanes(df, quad_v3));
+      }
+
+      const int32_t div = static_cast<int32_t>(num_blocks);
+      const float min_hf_non_zeros = std::min(
+          {hfNonZeros[0], hfNonZeros[1], hfNonZeros[2], hfNonZeros[3]});
+      int32_t activity = 15;
+      if (min_hf_non_zeros < 15.0f * div) {
+        activity = (static_cast<int32_t>(min_hf_non_zeros) + div / 2) / div;
+      }
+      if (c == 1) {
+        const uint8_t q0_sub =
+            (activity <= 2 && hfNonZeros[0] >= 2.0f * div) ? 1u : 0u;
+        act_out = static_cast<uint8_t>((activity << 1) | q0_sub);
+        const float luma_hf_dz =
+            (activity > 0)
+                ? std::max(0.0f,
+                           -0.002f * hr_w + dz_w_rt * (0.0085f * activity))
+                : 0.0f;
+        for (int cc : {0, 2}) {
+          zero_thres_q[cc][1] += 0.18f * luma_hf_dz;
+          zero_thres_q[cc][2] += 0.18f * luma_hf_dz;
+          zero_thres_q[cc][3] += 0.005f * dz_w_rt + 0.40f * luma_hf_dz;
+        }
+      }
+
+      const float R0 = GetLane(SumOfLanes(df, r0_v));
+      const float E0 = GetLane(SumOfLanes(df, e0_v));
+      const float G1 = E0;
+      const float G2 = E0;
+
+      const float total_nz =
+          hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3];
+      int32_t max_step = 0;
+      float theta1 = 1e30f;
+      float theta2 = 1e30f;
+      if (acs.Strategy() == AcStrategyType::DCT) {
+        if (use_csf_w ? (total_nz < 11.0f) : (R0 < 8.0f)) {
+          max_step = 1;
+          theta1 = use_csf_w ? dct8_err_min : 2.0f;
+        }
+      } else if (acs.Strategy() >= AcStrategyType::DCT16X16) {
+        max_step = 2;
+        const size_t scale_ix =
+            (num_blocks == 4)
+                ? 0
+                : ((num_blocks == 8) ? 1 : ((num_blocks == 16) ? 2 : 3));
+        const float base_cost =
+            kAlphaBlk[scale_ix][c] * num_blocks * kDCTBlockSize +
+            kAlphaVal[scale_ix][c] * R0;
+        theta1 = base_cost;
+        theta2 = 2.0f * base_cost;
+      }
+
+      const float j1 = theta1 - G1;
+      const float j2 = (theta1 < G1)
+                           ? (j1 + (theta2 - G2))
+                           : (j1 + std::max(1.0f, theta2 - G2));
+      const float j_max = (max_step >= 2) ? j2 : ((max_step == 1) ? j1 : 0.0f);
+      auto eval_j_try = [&](int32_t q_try) -> float {
+        const int32_t s = q_try - quant_orig;
+        if (s < 0) {
+          const float dq = static_cast<float>(-s);
+          return 64.0f * num_blocks * dq * dq;
+        }
+        if (s > max_step) {
+          const float ex = static_cast<float>(s - max_step);
+          return j_max + 64.0f * num_blocks * ex * ex;
+        }
+        if (s == 0) return 0.0f;
+        if (s == 1) return j1;
+        return j2;
+      };
+
+      int32_t lo = std::max(1, quant_orig - 2);
+      int32_t hi =
+          std::min<int32_t>(Quantizer::kQuantMax - 1, quant_orig + max_step + 2);
+      while (hi - lo > 2) {
+        const int32_t m1 = lo + (hi - lo) / 3;
+        const int32_t m2 = hi - (hi - lo) / 3;
+        if (eval_j_try(m1) <= eval_j_try(m2)) {
+          hi = m2;
+        } else {
+          lo = m1;
+        }
+      }
+      int32_t q_try_best = quant_orig;
+      float best_j_c = eval_j_try(quant_orig);
+      for (int32_t qt = lo; qt <= hi; ++qt) {
+        const float jc = eval_j_try(qt);
+        if (jc < best_j_c) {
+          best_j_c = jc;
+          q_try_best = qt;
+        }
+      }
+      const int32_t q_c =
+          std::max(std::max(4, q_try_best / 2), q_try_best - activity);
+      max_quant = std::max(q_c, max_quant);
     }
 
     auto lossc = Zero(df8);
@@ -476,28 +773,49 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           4.0,
       };
       auto masku_off = Set(df8, masku_lut[c]);
-      TransformToPixels(acs.Strategy(), &mem[0], block, cov_x * 8,
+      TransformToPixels(acs.Strategy(), &mem[0], pixels_buf, cov_x * 8,
                         scratch_space);
 
       for (size_t iy = 0; iy < cov_y; iy++) {
         for (size_t ix = 0; ix < cov_x; ix++) {
-          for (size_t dy = 0; dy < kBlockDim; ++dy) {
+          for (size_t dy = 0; dy < kBlockDim; dy += 2) {
             for (size_t dx = 0; dx < kBlockDim; dx += Lanes(df8)) {
-              auto in = Load(
-                  df8, block +
-                           (iy * kBlockDim + dy) * (cov_x * kBlockDim) +
-                           ix * kBlockDim + dx);
               if (x + ix * 8 + dx + Lanes(df8) <= config.mask1x1_xsize) {
-                auto masku =
+                const size_t p_off0 =
+                    (iy * kBlockDim + dy) * (cov_x * kBlockDim) +
+                    ix * kBlockDim + dx;
+                const size_t p_off1 = p_off0 + cov_x * kBlockDim;
+                auto masku0 =
                     Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
                                                        y + iy * 8 + dy)),
                         masku_off);
-                in = Mul(masku, in);
-                in = Mul(in, in);
-                lossc2 = Add(lossc2, in);
-                in = Mul(in, in);
-                in = Mul(in, in);
-                lossc = Add(lossc, in);
+                auto masku1 =
+                    Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
+                                                       y + iy * 8 + dy + 1)),
+                        masku_off);
+                auto in0 = Mul(masku0, Load(df8, pixels_buf + p_off0));
+                auto in1 = Mul(masku1, Load(df8, pixels_buf + p_off1));
+#if HWY_TARGET != HWY_SCALAR
+                if (use_csf_w) {
+                  const auto v_sum = Add(in0, in1);
+                  const auto h2_sum = Add(v_sum, Shuffle2301(v_sum));
+                  const auto h4_sum = Add(h2_sum, Shuffle1032(h2_sum));
+                  const auto s_ms =
+                      MulAdd(Set(df8, 0.020f), h2_sum,
+                             Mul(Set(df8, 0.003f), h4_sum));
+                  in0 = MulAdd(Set(df8, 0.948f), in0, s_ms);
+                  in1 = MulAdd(Set(df8, 0.948f), in1, s_ms);
+                  lossc2 = MulAdd(Set(df8, 12.0f), Mul(s_ms, s_ms), lossc2);
+                }
+#endif
+                in0 = Mul(in0, in0);
+                in1 = Mul(in1, in1);
+                lossc2 = Add(lossc2, Add(in0, in1));
+                in0 = Mul(in0, in0);
+                in1 = Mul(in1, in1);
+                in0 = Mul(in0, in0);
+                in1 = Mul(in1, in1);
+                lossc = Add(lossc, Add(in0, in1));
               }
             }
           }
@@ -542,6 +860,10 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     loss = Add(loss, lossc);
     loss2 = Add(loss2, lossc2);
   }
+  if (use_q_rdo) {
+    q_out =
+        q_pool + static_cast<float>(max_quant - quant_orig) * config.quant_scale;
+  }
   const float inv_npixels = 1.0f / (num_blocks * kDCTBlockSize);
   const float d8 =
       std::pow(GetLane(SumOfLanes(df8, loss)) * inv_npixels, 1.0f / 8.0f);
@@ -569,7 +891,8 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
                             AcStrategyImage* JXL_RESTRICT ac_strategy,
                             float* block, float* scratch_space,
                             uint32_t* quantized, float* entropy_out,
-                            AcStrategyType& best_tx) {
+                            AcStrategyType& best_tx, float* q_out,
+                            uint8_t* act_out) {
   struct TransformTry8x8 {
     AcStrategyType type;
     int encoding_speed_tier_max_limit;
@@ -629,6 +952,8 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
   };
   double best = 1e30;
   best_tx = kTransforms8x8[0].type;
+  *q_out = config.Quant(x / 8, y / 8);
+  *act_out = 0;
   for (auto tx : kTransforms8x8) {
     if (tx.encoding_speed_tier_max_limit < encoding_speed_tier) {
       continue;
@@ -660,12 +985,16 @@ Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
       entropy_mul += kAvoidEntropyOfTransforms * mul;
     }
     float entropy;
+    float cand_q = 0.0f;
+    uint8_t cand_act = 0;
     JXL_RETURN_IF_ERROR(EstimateEntropy(acs, entropy_mul, x, y, config,
                                         cmap_factors, block, scratch_space,
-                                        quantized, entropy));
+                                        quantized, entropy, cand_q, cand_act));
     if (entropy < best) {
       best_tx = tx.type;
       best = entropy;
+      *q_out = cand_q;
+      *act_out = cand_act;
     }
   }
   *entropy_out = best;
@@ -690,27 +1019,35 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   struct CandBlock {
     uint8_t x0, y0, w, h;
     AcStrategyType type;
+    uint8_t act;
     float gain;
     float rate;
+    float q;
   };
   struct LocalCand {
     uint64_t mask;
     float gain;
     float rate;
+    float q;
     uint8_t x0, y0;
     AcStrategyType type;
+    uint8_t act;
   };
   struct DPTable {
     float cost[528][528];
     uint16_t split[528][528];
     AcStrategyType leaf[32][32][9][9];
+    uint8_t leaf_act[32][32][9][9];
+    float leaf_q[32][32][9][9];
     AcStrategyType best_8x8_type[32][32];
+    uint8_t best_8x8_act[32][32];
+    float best_8x8_q[32][32];
     float entropy_estimate[32][32];
     float prefix_sum[33][33];
     CandBlock cands[4096];
     LocalCand local_cands[272];
   };
-  static constexpr size_t kQMemWords = 524288;
+  static constexpr size_t kQMemWords = 655360;
   static_assert(sizeof(DPTable) <= kQMemWords * sizeof(uint32_t),
                 "DPTable fits in per-thread quantized buffer");
   DPTable* JXL_RESTRICT dp = reinterpret_cast<DPTable*>(quantized);
@@ -753,16 +1090,21 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     for (size_t ix = 0; ix < rx; ix++) {
       float entropy = 0.0f;
       AcStrategyType best_of_8x8s = AcStrategyType::DCT;
+      float best_q = 0.0f;
+      uint8_t best_act = 0;
       const float* JXL_RESTRICT cmap_factors =
           cmap_factors_tile[iy / kColorTileDimInBlocks]
                            [ix / kColorTileDimInBlocks];
       JXL_RETURN_IF_ERROR(FindBest8x8Transform(
           8 * (bx + ix), 8 * (by + iy), static_cast<int>(cparams.speed_tier),
           butteraugli_target, config, cmap_factors, ac_strategy, block,
-          scratch_space, quantized, &entropy, best_of_8x8s));
+          scratch_space, quantized, &entropy, best_of_8x8s, &best_q,
+          &best_act));
       const float scaled_e = entropy * mul8x8;
       dp->entropy_estimate[iy][ix] = scaled_e;
       dp->best_8x8_type[iy][ix] = best_of_8x8s;
+      dp->best_8x8_q[iy][ix] = best_q;
+      dp->best_8x8_act[iy][ix] = best_act;
       row_sum += scaled_e;
       dp->prefix_sum[iy + 1][ix + 1] = dp->prefix_sum[iy][ix + 1] + row_sum;
     }
@@ -828,7 +1170,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           mask |= (row_bits << ((cb.y0 - ry0 + dy) * 8));
         }
         dp->local_cands[n_loc++] = {
-            mask, cb.gain, cb.rate, cb.x0, cb.y0, cb.type,
+            mask, cb.gain, cb.rate, cb.q, cb.x0, cb.y0, cb.type, cb.act,
         };
       }
     }
@@ -913,6 +1255,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             dp->cost[iy][ix] = dp->entropy_estimate[y0][x0];
             dp->split[iy][ix] = 0;
             dp->leaf[y0][x0][1][1] = dp->best_8x8_type[y0][x0];
+            dp->leaf_q[y0][x0][1][1] = dp->best_8x8_q[y0][x0];
+            dp->leaf_act[y0][x0][1][1] = dp->best_8x8_act[y0][x0];
           }
         }
         continue;
@@ -1063,16 +1407,21 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                     : (x0 % w == 0 && y0 % h == 0);
             if (eval_direct) {
               float cand_entropy = kInf;
+              float cand_q = 0.0f;
+              uint8_t cand_act = 0;
               const float* JXL_RESTRICT cmap_factors =
                   cmap_factors_tile[y0 / kColorTileDimInBlocks]
                                    [x0 / kColorTileDimInBlocks];
               JXL_RETURN_IF_ERROR(EstimateEntropy(
                   acs_direct, direct_mul, (bx + x0) * 8, (by + y0) * 8, config,
-                  cmap_factors, block, scratch_space, quantized, cand_entropy));
+                  cmap_factors, block, scratch_space, quantized, cand_entropy,
+                  cand_q, cand_act));
               if (cand_entropy < best_c) {
                 best_c = cand_entropy;
                 best_s = 0;
                 dp->leaf[y0][x0][h][w] = direct_type;
+                dp->leaf_q[y0][x0][h][w] = cand_q;
+                dp->leaf_act[y0][x0][h][w] = cand_act;
                 const float gain = base_sum - cand_entropy;
                 if (enable_rdo && gain > 0.0f && num_cands < 4096) {
                   dp->cands[num_cands++] = {
@@ -1081,8 +1430,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                       static_cast<uint8_t>(w),
                       static_cast<uint8_t>(h),
                       direct_type,
+                      cand_act,
                       gain,
                       gain / static_cast<float>(w * h),
+                      cand_q,
                   };
                 }
               }
@@ -1110,6 +1461,84 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     }
   }
 
+  auto commit_block_quant = [&](size_t x0, size_t y0, size_t w, size_t h,
+                                AcStrategyType type, float q_val,
+                                uint8_t act_val) {
+    if (config.band_qf_stride > 0) {
+      static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f, 1.00f};
+      float q_max = 0.0f;
+      float q_rms = 0.0f;
+      for (size_t iy = 0; iy < h; ++iy) {
+        for (size_t ix = 0; ix < w; ++ix) {
+          const float qv = config.Quant(bx + x0 + ix, by + y0 + iy);
+          q_max = std::max(q_max, qv);
+          q_rms += qv * qv;
+        }
+      }
+      const float inv_nb = 1.0f / static_cast<float>(w * h);
+      q_rms = std::sqrt(q_rms * inv_nb);
+      float q_pool = q_max;
+      if (w * h >= 4) {
+        float mean_max_mixer = 1.0f;
+        if (config.butteraugli_distance > 1.54138f) {
+          mean_max_mixer = std::max(
+              0.0f,
+              1.0f - (config.butteraugli_distance - 1.54138f) * 0.56391f);
+        }
+        q_pool = mean_max_mixer * q_max + (1.0f - mean_max_mixer) * q_rms;
+      }
+      if (type == AcStrategyType::DCT16X8 || type == AcStrategyType::DCT8X16) {
+        q_pool *= 0.90390420971782894f;
+      } else if (type == AcStrategyType::DCT16X16) {
+        q_pool *= 0.89232976007290965f;
+      }
+      const int32_t quant_orig =
+          Quantizer::ClampVal(q_pool * config.inv_global_scale + 0.5f);
+      const int32_t quant_final =
+          Quantizer::ClampVal(q_val * config.inv_global_scale + 0.5f);
+      const float q_step_ratio =
+          static_cast<float>(quant_final) / static_cast<float>(quant_orig);
+      for (size_t c = 0; c < 3; ++c) {
+        for (size_t s = 0; s < 4; ++s) {
+          if (config.band_qf_rows[c][s] == nullptr) continue;
+          float sq_sum = 0.0f;
+          for (size_t iy = 0; iy < h; ++iy) {
+            for (size_t ix = 0; ix < w; ++ix) {
+              const float old_q =
+                  std::max(config.Quant(bx + x0 + ix, by + y0 + iy), 1e-4f);
+              const float rescale = q_pool / old_q;
+              const float band_rescale =
+                  (rescale > 1.0f)
+                      ? (1.0f + kBandRescaleMix[s] * (rescale - 1.0f))
+                      : rescale;
+              const float v =
+                  config.BandQuant(c, s, bx + x0 + ix, by + y0 + iy) *
+                  band_rescale;
+              sq_sum += v * v;
+            }
+          }
+          float bq = std::sqrt(sq_sum * inv_nb) * q_step_ratio;
+          if (c == 1 && s == 0) {
+            uint32_t bits = 0;
+            memcpy(&bits, &bq, sizeof(bits));
+            bits = (bits & ~31u) | (static_cast<uint32_t>(act_val) & 31u);
+            memcpy(&bq, &bits, sizeof(bq));
+          }
+          config.band_qf_rows[c][s][(by + y0) * config.band_qf_stride +
+                                    (bx + x0)] = bq;
+        }
+      }
+    } else if (config.band_qf_rows[1][0] != nullptr) {
+      float bq = 0.0f;
+      uint32_t bits = static_cast<uint32_t>(act_val) & 31u;
+      memcpy(&bq, &bits, sizeof(bq));
+      config.band_qf_rows[1][0][(by + y0) * config.quant_field_stride +
+                                (bx + x0)] = bq;
+    }
+    config.quant_field_row[(by + y0) * config.quant_field_stride + (bx + x0)] =
+        q_val;
+  };
+
   // Reconstruct the globally optimal partition of [0, rx) x [0, ry).
   struct SubRect {
     uint8_t x0, y0, w, h;
@@ -1123,8 +1552,11 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     const uint16_t ix = iv_idx[cur.x0][cur.w];
     const uint16_t s = dp->split[iy][ix];
     if (s == 0) {
-      JXL_RETURN_IF_ERROR(ac_strategy->Set(
-          bx + cur.x0, by + cur.y0, dp->leaf[cur.y0][cur.x0][cur.h][cur.w]));
+      const AcStrategyType ltype = dp->leaf[cur.y0][cur.x0][cur.h][cur.w];
+      JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cur.x0, by + cur.y0, ltype));
+      commit_block_quant(cur.x0, cur.y0, cur.w, cur.h, ltype,
+                         dp->leaf_q[cur.y0][cur.x0][cur.h][cur.w],
+                         dp->leaf_act[cur.y0][cur.x0][cur.h][cur.w]);
       continue;
     }
     if (enable_rdo && cur.w <= 8 && cur.h <= 8 &&
@@ -1143,13 +1575,20 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           covered |= lc.mask;
           JXL_RETURN_IF_ERROR(
               ac_strategy->Set(bx + lc.x0, by + lc.y0, lc.type));
+          const AcStrategy acs_lc = AcStrategy::FromRawStrategy(lc.type);
+          commit_block_quant(lc.x0, lc.y0, acs_lc.covered_blocks_x(),
+                             acs_lc.covered_blocks_y(), lc.type, lc.q, lc.act);
         }
         for (size_t dy = 0; dy < cur.h; ++dy) {
           for (size_t dx = 0; dx < cur.w; ++dx) {
             if ((covered & (uint64_t{1} << (dy * 8 + dx))) == 0) {
+              const size_t y8 = cur.y0 + dy;
+              const size_t x8 = cur.x0 + dx;
               JXL_RETURN_IF_ERROR(ac_strategy->Set(
-                  bx + cur.x0 + dx, by + cur.y0 + dy,
-                  dp->best_8x8_type[cur.y0 + dy][cur.x0 + dx]));
+                  bx + x8, by + y8, dp->best_8x8_type[y8][x8]));
+              commit_block_quant(x8, y8, 1, 1, dp->best_8x8_type[y8][x8],
+                                 dp->best_8x8_q[y8][x8],
+                                 dp->best_8x8_act[y8][x8]);
             }
           }
         }
@@ -1213,13 +1652,15 @@ namespace jxl {
 HWY_EXPORT(ProcessRectACS);
 
 Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
-                                  const ImageF& quant_field, const ImageF& mask,
+                                  ImageF* quant_field, const ImageF& mask,
                                   const ImageF& mask1x1,
                                   DequantMatrices* matrices,
-                                  const ImageF (*band_qf)[4],
-                                  float x_qm_multiplier,
-                                  float b_qm_multiplier) {
+                                  ImageF (*band_qf)[4], float x_qm_multiplier,
+                                  float b_qm_multiplier, float quant_scale,
+                                  float inv_global_scale) {
   config.dequant = matrices;
+  config.quant_scale = quant_scale;
+  config.inv_global_scale = inv_global_scale;
 
   if (cparams.speed_tier >= SpeedTier::kCheetah) {
     JXL_RETURN_IF_ERROR(
@@ -1235,8 +1676,8 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   }
 
   // Image row pointers and strides.
-  config.quant_field_row = quant_field.Row(0);
-  config.quant_field_stride = quant_field.PixelsPerRow();
+  config.quant_field_row = quant_field->Row(0);
+  config.quant_field_stride = quant_field->PixelsPerRow();
   if (mask.xsize() > 0 && mask.ysize() > 0) {
     config.masking_field_row = mask.Row(0);
     config.masking_field_stride = mask.PixelsPerRow();
@@ -1255,7 +1696,7 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   config.band_qf_stride = 0;
   if (cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
       cparams.gaborish != Override::kOff &&
-      quant_field.xsize() * quant_field.ysize() > 64 && band_qf != nullptr &&
+      quant_field->xsize() * quant_field->ysize() > 64 && band_qf != nullptr &&
       band_qf[0][0].xsize() > 0 && band_qf[0][0].ysize() > 0) {
     config.band_qf_stride = band_qf[0][0].PixelsPerRow();
     for (size_t c = 0; c < 3; ++c) {
@@ -1265,6 +1706,9 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
         }
       }
     }
+  } else if (band_qf != nullptr && band_qf[1][0].xsize() > 0 &&
+             band_qf[1][0].ysize() > 0) {
+    config.band_qf_rows[1][0] = band_qf[1][0].Row(0);
   }
   config.qm_multiplier[0] = x_qm_multiplier;
   config.qm_multiplier[1] = 1.0f;
@@ -1316,10 +1760,10 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
 Status AcStrategyHeuristics::PrepareForThreads(std::size_t num_threads) {
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
-  mem_per_thread = 6 * AcStrategy::kMaxCoeffArea + dct_scratch_size;
+  mem_per_thread = 7 * AcStrategy::kMaxCoeffArea + dct_scratch_size;
   size_t mem_bytes = num_threads * mem_per_thread * sizeof(float);
   JXL_ASSIGN_OR_RETURN(mem, AlignedMemory::Create(memory_manager, mem_bytes));
-  qmem_per_thread = 524288;
+  qmem_per_thread = 655360;
   size_t qmem_bytes = num_threads * qmem_per_thread * sizeof(uint32_t);
   JXL_ASSIGN_OR_RETURN(qmem, AlignedMemory::Create(memory_manager, qmem_bytes));
   return true;

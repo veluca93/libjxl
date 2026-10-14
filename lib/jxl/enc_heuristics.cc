@@ -1287,7 +1287,15 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       enc_state->progressive_splitter.GetNumPasses() == 1 &&
       frame_dim.xsize_blocks * frame_dim.ysize_blocks > 64;
   if (!enable_rdo) {
-    enc_state->band_qf[1][0] = ImageF();
+    enc_state->band_qf[0][0] = ImageF();
+    if (cparams.speed_tier <= SpeedTier::kHare) {
+      JXL_ASSIGN_OR_RETURN(enc_state->band_qf[1][0],
+                           ImageF::Create(memory_manager, frame_dim.xsize_blocks,
+                                          frame_dim.ysize_blocks));
+      FillImage(0.0f, &enc_state->band_qf[1][0]);
+    } else {
+      enc_state->band_qf[1][0] = ImageF();
+    }
   }
 
   // Compute an initial estimate of the quantization field.
@@ -1356,10 +1364,13 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(
-      *opsin, rect, initial_quant_field, initial_quant_masking,
+      *opsin, rect, &initial_quant_field, initial_quant_masking,
       initial_quant_masking1x1, &matrices,
-      enable_rdo ? enc_state->band_qf : nullptr, enc_state->x_qm_multiplier,
-      enc_state->b_qm_multiplier));
+      (enable_rdo || cparams.speed_tier <= SpeedTier::kHare)
+          ? enc_state->band_qf
+          : nullptr,
+      enc_state->x_qm_multiplier, enc_state->b_qm_multiplier, quantizer.Scale(),
+      quantizer.InvGlobalScale()));
 
   const size_t acs_tile_dim_blocks =
       enable_rdo ? kGroupDimInBlocks : kEncTileDimInBlocks;
@@ -1401,18 +1412,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       }
     }
 
-    // Choose block sizes.
+    // Choose block sizes and adjust the quant field in the RDO loop.
     JXL_RETURN_IF_ERROR(
         acs_heuristics.ProcessRect(group_rect, cmap, &ac_strategy, thread));
 
-    // Always set the initial quant field, so we can compute the CfL map with
-    // more accuracy. The initial quant field might change in slower modes, but
-    // adjusting the quant field with butteraugli when all the other encoding
-    // parameters are fixed is likely a more reliable choice anyway.
-    JXL_RETURN_IF_ERROR(
-        AdjustQuantField(ac_strategy, group_rect, cparams.butteraugli_distance,
-                         &initial_quant_field,
-                         enable_rdo ? enc_state->band_qf : nullptr));
     quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
                                 &raw_quant_field);
 

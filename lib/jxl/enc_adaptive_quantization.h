@@ -102,6 +102,63 @@ static JXL_INLINE void ComputeBandThresholds(size_t c,
   }
 }
 
+static JXL_INLINE void ComputeBlockThresholds(
+    AcStrategyType quant_kind, size_t xblocks, size_t yblocks, float q_block,
+    const float band_q[3][4], float butteraugli_distance, float dz_w,
+    float eob_scale, float zero_thres[3][8]) {
+  for (size_t c = 0; c < 3; ++c) {
+    ComputeBandThresholds(c, quant_kind, xblocks, yblocks, q_block, band_q[c],
+                          zero_thres[c], dz_w);
+  }
+  const bool is_partial_block =
+      ((1 << static_cast<size_t>(quant_kind)) & kPartialBlockKinds) != 0;
+  uint32_t act_bits = 0;
+  memcpy(&act_bits, &band_q[1][0], sizeof(act_bits));
+  const int32_t activity = static_cast<int32_t>((act_bits >> 1) & 15u);
+  const bool q0_sub = (act_bits & 1u) != 0;
+  if (eob_scale <= 0.0f) {
+    if (!is_partial_block) {
+      for (int i = 1; i < 4; ++i) {
+        zero_thres[1][i] += 0.01f * activity;
+      }
+    }
+    return;
+  }
+
+  const float dz_w_rt =
+      Clamp1((butteraugli_distance - 0.50f) / (butteraugli_distance + 0.55f) *
+                 1.65f,
+             0.0f, 1.0f);
+  const float hr_w = 1.0f - dz_w_rt;
+  if (!is_partial_block) {
+    if (q0_sub) {
+      zero_thres[1][0] -= 0.003f;
+    }
+    float luma_hf_dz = 0.0f;
+    if (activity > 0) {
+      const float delta_hf = -0.002f * hr_w + dz_w_rt * (0.0085f * activity);
+      zero_thres[1][1] += delta_hf;
+      zero_thres[1][2] += delta_hf;
+      luma_hf_dz = std::max(0.0f, delta_hf);
+    }
+    zero_thres[1][3] +=
+        -0.002f * hr_w + dz_w_rt * (0.002f + 0.0100f * activity);
+    for (int cc : {0, 2}) {
+      zero_thres[cc][1] += 0.18f * luma_hf_dz;
+      zero_thres[cc][2] += 0.18f * luma_hf_dz;
+      zero_thres[cc][3] += 0.005f * dz_w_rt + 0.40f * luma_hf_dz;
+    }
+  }
+  for (int cc : {0, 2}) {
+    const float c_scale = (cc == 0) ? 0.85f : 1.15f;
+    zero_thres[cc][1] += 0.005f * c_scale * dz_w_rt;
+    zero_thres[cc][2] += 0.005f * c_scale * dz_w_rt;
+    zero_thres[cc][3] += 0.003f * c_scale * dz_w_rt;
+    zero_thres[cc][4 + 0] += 0.004f * c_scale * dz_w_rt;
+    zero_thres[cc][4 + 1] += 0.002f * c_scale * dz_w_rt;
+  }
+}
+
 // Returns an image subsampled by kBlockDim in each direction. If the value
 // at pixel (x,y) in the returned image is greater than 1.0, it means that
 // more fine-grained quantization should be used in the corresponding block
@@ -116,10 +173,6 @@ StatusOr<ImageF> InitialQuantField(float butteraugli_target,
                                    ImageF (*band_qf)[4] = nullptr);
 
 float InitialQuantDC(float butteraugli_target);
-
-Status AdjustQuantField(const AcStrategyImage& ac_strategy, const Rect& rect,
-                        float butteraugli_target, ImageF* quant_field,
-                        ImageF (*band_qf)[4] = nullptr);
 
 // Returns a quantizer that uses an adjusted version of the provided
 // quant_field. Also computes the dequant_map corresponding to the given
