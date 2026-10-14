@@ -132,29 +132,21 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
         for (size_t bx = 0; bx < rect.xsize(); ++bx) {
           AcStrategy acs = acs_row[bx];
           if (!acs.IsFirstBlock()) continue;
-          if (!use_sample()) continue;
           size_t size = kDCTBlockSize << acs.log2_covered_blocks();
-          for (size_t c = 0; c < 3; ++c) {
-            const size_t order_offset =
-                CoeffOrderOffset(kStrategyOrder[acs.RawStrategy()], c);
-            if (type == ACType::k16) {
-              for (size_t k = 0; k < size; k++) {
-                bool is_zero = rows[c].ptr16[ac_offset + k] == 0;
-                num_zeros[order_offset + k] += is_zero ? 1 : 0;
-              }
-            } else {
-              for (size_t k = 0; k < size; k++) {
-                bool is_zero = rows[c].ptr32[ac_offset + k] == 0;
-                num_zeros[order_offset + k] += is_zero ? 1 : 0;
-              }
-            }
-            // Ensure LLFs are first in the order.
-            size_t cx = acs.covered_blocks_x();
-            size_t cy = acs.covered_blocks_y();
-            CoefficientLayout(&cy, &cx);
-            for (size_t iy = 0; iy < cy; iy++) {
-              for (size_t ix = 0; ix < cx; ix++) {
-                num_zeros[order_offset + iy * kBlockDim * cx + ix] = -1;
+          if (use_sample()) {
+            for (size_t c = 0; c < 3; ++c) {
+              const size_t order_offset =
+                  CoeffOrderOffset(kStrategyOrder[acs.RawStrategy()], c);
+              if (type == ACType::k16) {
+                for (size_t k = 0; k < size; k++) {
+                  bool is_zero = rows[c].ptr16[ac_offset + k] == 0;
+                  num_zeros[order_offset + k] += is_zero ? 1 : 0;
+                }
+              } else {
+                for (size_t k = 0; k < size; k++) {
+                  bool is_zero = rows[c].ptr32[ac_offset + k] == 0;
+                  num_zeros[order_offset + k] += is_zero ? 1 : 0;
+                }
               }
             }
           }
@@ -174,6 +166,8 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
 
   std::vector<coeff_order_t> natural_order_buffer;
 
+  const bool enable_order_rdo =
+      frame_dim.xsize_blocks * frame_dim.ysize_blocks > 64;
   uint16_t computed = 0;
   for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
     uint8_t ord = kStrategyOrder[o];
@@ -206,14 +200,21 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
       continue;
     }
 
-    const bool enable_order_rdo =
-        frame_dim.xsize_blocks * frame_dim.ysize_blocks > 64;
+    size_t cx = acs.covered_blocks_x();
+    size_t cy = acs.covered_blocks_y();
+    CoefficientLayout(&cy, &cx);
     bool is_nondefault = false;
     for (uint8_t c = 0; c < 3; c++) {
       // Apply zig-zag order.
       PosAndCount* pos_and_val = mem.address<PosAndCount>();
       size_t offset = CoeffOrderOffset(ord, c);
       JXL_ENSURE(CoeffOrderOffset(ord, c + 1) - offset == sz);
+      // Ensure LLFs are first in the order.
+      for (size_t iy = 0; iy < cy; iy++) {
+        for (size_t ix = 0; ix < cx; ix++) {
+          num_zeros[offset + iy * kBlockDim * cx + ix] = -1;
+        }
+      }
       size_t llf = acs.covered_blocks_x() * acs.covered_blocks_y();
       int64_t max_zeros = 0;
       for (size_t i = llf; i < sz; ++i) {
@@ -275,7 +276,8 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& ac_image,
         }
       }
       if (!enable_order_rdo ||
-          (end > llf && scan_gain >= static_cast<int64_t>(2 * (end - llf)))) {
+          (end > llf &&
+           scan_gain >= static_cast<int64_t>(2 * (end - llf) * block_fraction))) {
         for (size_t i = 0; i < sz; ++i) {
           order[offset + i] = pos_and_val[i].pos;
           is_nondefault |= natural_order_buffer[i] != pos_and_val[i].pos;

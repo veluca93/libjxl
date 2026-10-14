@@ -163,12 +163,10 @@ static JXL_INLINE void ComputeBlockThresholds(
 // at pixel (x,y) in the returned image is greater than 1.0, it means that
 // more fine-grained quantization should be used in the corresponding block
 // of the input image, while a value less than 1.0 indicates that less
-// fine-grained quantization should be enough. Returns a mask, too, which
-// can later be used to make better decisions about ac strategy.
+// fine-grained quantization should be enough.
 StatusOr<ImageF> InitialQuantField(float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* initial_quant_mask,
                                    ImageF* initial_quant_mask1x1,
                                    ImageF (*band_qf)[4] = nullptr);
 

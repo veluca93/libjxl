@@ -627,7 +627,7 @@ Status ModularFrameEncoder::Init(const FrameHeader& frame_header,
     // no explicit predictor(s) given, set a good default
     if ((cparams_.speed_tier <= SpeedTier::kGlacier ||
          cparams_.modular_mode == false) &&
-        cparams_.IsLossless() && cparams_.responsive == JXL_FALSE) {
+        cparams_.ModularPartIsLossless() && cparams_.responsive == JXL_FALSE) {
       // TODO(veluca): allow all predictors that don't break residual
       // multipliers in lossy mode.
       cparams_.options.predictor = Predictor::Variable;

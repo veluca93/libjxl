@@ -402,7 +402,9 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
       !cparams.disable_perceptual_optimizations && num_passes == 1 &&
       cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
       cparams.gaborish != Override::kOff &&
-      xsize_blocks * ysize_blocks > 64 &&
+      enc_state->shared.frame_dim.xsize_blocks *
+              enc_state->shared.frame_dim.ysize_blocks >
+          64 &&
       enc_state->band_qf[0][0].xsize() > 0 &&
       enc_state->band_qf[0][0].ysize() > 0;
 
@@ -504,17 +506,19 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
             }
           }
           if (!has_band_qf) {
+            uint32_t act_bits = 0;
             if (cparams.speed_tier <= SpeedTier::kHare &&
                 enc_state->band_qf[1][0].xsize() > 0 &&
                 enc_state->band_qf[1][0].ysize() > 0) {
-              band_q[1][0] =
+              const float bq10 =
                   block_group_rect.ConstRow(enc_state->band_qf[1][0], by)[bx];
-            } else {
-              uint32_t bits = 0;
-              memcpy(&bits, &band_q[1][0], sizeof(bits));
-              bits &= ~31u;
-              memcpy(&band_q[1][0], &bits, sizeof(bits));
+              memcpy(&act_bits, &bq10, sizeof(act_bits));
+              act_bits &= 31u;
             }
+            uint32_t bits = 0;
+            memcpy(&bits, &band_q[1][0], sizeof(bits));
+            bits = (bits & ~31u) | act_bits;
+            memcpy(&band_q[1][0], &bits, sizeof(bits));
           }
           float zero_thres[3][8];
           ComputeBlockThresholds(acs.Strategy(), xblocks, yblocks, q_block,

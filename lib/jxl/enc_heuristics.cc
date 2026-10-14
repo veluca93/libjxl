@@ -129,9 +129,10 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
   size_t last_cut = 256;
   size_t cut = tot * next / num_qf_segments;
   for (uint32_t j = 0; j < 256; j++) {
+    const size_t prev_cumsum = cumsum;
     cumsum += counters->qf_counts[j];
     if (cumsum > cut) {
-      if (j != 0) {
+      if (prev_cumsum > 0 && prev_cumsum < tot) {
         qft.push_back(j);
       }
       last_cut = j;
@@ -140,7 +141,7 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
         cut = tot * next / num_qf_segments;
       }
     } else if (next > qft.size() + 1) {
-      if (j - 1 == last_cut && j != 0) {
+      if (j - 1 == last_cut && prev_cumsum > 0 && prev_cumsum < tot) {
         qft.push_back(j);
       }
     }
@@ -167,7 +168,11 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
   size_t nb_clusters_chroma =
       Clamp1(static_cast<int>(tot / size_for_ctx_model / 3), 1, 5);
   // This is O(n^2 log n), but n is small.
-  while (clusters.size() > nb_clusters) {
+  while (clusters.size() > nb_clusters ||
+         (clusters.size() > 1 &&
+          counts[*std::min_element(
+              clusters.begin(), clusters.end(),
+              [&](int a, int b) { return counts[a] < counts[b]; })] == 0)) {
     std::sort(clusters.begin(), clusters.end(),
               [&](int a, int b) { return counts[a] > counts[b]; });
     counts[clusters[clusters.size() - 2]] += counts[clusters.back()];
@@ -1276,7 +1281,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   AcStrategyHeuristics acs_heuristics(memory_manager, cparams);
   CfLHeuristics cfl_heuristics(memory_manager);
   ImageF initial_quant_field;
-  ImageF initial_quant_masking;
   const bool enable_rdo =
       cparams.speed_tier <= SpeedTier::kSquirrel &&
       !cparams.disable_perceptual_optimizations &&
@@ -1292,7 +1296,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       JXL_ASSIGN_OR_RETURN(enc_state->band_qf[1][0],
                            ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                           frame_dim.ysize_blocks));
-      FillImage(0.0f, &enc_state->band_qf[1][0]);
+      FillImage(1.0f, &enc_state->band_qf[1][0]);
     } else {
       enc_state->band_qf[1][0] = ImageF();
     }
@@ -1307,14 +1311,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(initial_quant_field,
                          ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                         frame_dim.ysize_blocks));
-    JXL_ASSIGN_OR_RETURN(initial_quant_masking,
-                         ImageF::Create(memory_manager, frame_dim.xsize_blocks,
-                                        frame_dim.ysize_blocks));
     float q = 0.79 / cparams.butteraugli_distance;
     FillImage(q, &initial_quant_field);
-    float masking = 1.0f / (q + 0.001f);
-    FillImage(masking, &initial_quant_masking);
     if (cparams.disable_perceptual_optimizations) {
+      float masking = 1.0f / (q + 0.001f);
       JXL_ASSIGN_OR_RETURN(
           initial_quant_masking1x1,
           ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
@@ -1330,8 +1330,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking,
-                          &initial_quant_masking1x1,
+                          1.0f, &initial_quant_masking1x1,
                           enable_rdo ? enc_state->band_qf : nullptr));
     float q = 0.39 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
@@ -1364,8 +1363,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(
-      *opsin, rect, &initial_quant_field, initial_quant_masking,
-      initial_quant_masking1x1, &matrices,
+      *opsin, rect, &initial_quant_field, initial_quant_masking1x1, &matrices,
       (enable_rdo || cparams.speed_tier <= SpeedTier::kHare)
           ? enc_state->band_qf
           : nullptr,

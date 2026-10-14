@@ -83,14 +83,6 @@ using hwy::HWY_NAMESPACE::ZeroIfNegative;
 // The following functions modulate an exponent (out_val) and return the updated
 // value. Their descriptor is limited to 8 lanes for 8x8 blocks.
 
-// Hack for mask estimation. Eventually replace this code with butteraugli's
-// masking.
-float ComputeMaskForAcStrategyUse(const float out_val) {
-  const float kMul = 1.0f;
-  const float kOffset = 0.001f;
-  return kMul / (out_val + kOffset);
-}
-
 template <class D, class V>
 V ComputeMask(const D d, const V out_val) {
   const auto kBase = Set(d, -0.7647f);
@@ -662,7 +654,7 @@ struct AdaptiveQuantizationImpl {
 
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
                      const Rect& rect_in, const Rect& rect_out,
-                     const int thread, ImageF* mask, ImageF* mask1x1,
+                     const int thread, ImageF* mask1x1,
                      ImageF (*band_qf)[4]) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
@@ -813,13 +805,6 @@ struct AdaptiveQuantizationImpl {
                    rect_out.xsize() * 2, rect_out.ysize() * 2);
     JXL_RETURN_IF_ERROR(FuzzyErosion(butteraugli_target, from_rect,
                                      pre_erosion[thread], rect_out, &aq_map));
-    for (size_t y = 0; y < rect_out.ysize(); ++y) {
-      const float* aq_map_row = rect_out.ConstRow(aq_map, y);
-      float* mask_row = rect_out.Row(mask, y);
-      for (size_t x = 0; x < rect_out.xsize(); ++x) {
-        mask_row[x] = ComputeMaskForAcStrategyUse(aq_map_row[x]);
-      }
-    }
     PerBlockModulations(butteraugli_target, xyb.Plane(0), xyb.Plane(1),
                         xyb.Plane(2), rect_in, scale, rect_out, &aq_map,
                         band_qf);
@@ -863,7 +848,7 @@ Status Blur1x1Masking(JxlMemoryManager* memory_manager, ThreadPool* pool,
 StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
                                          const Image3F& xyb, const Rect& rect,
                                          float scale, ThreadPool* pool,
-                                         ImageF* mask, ImageF* mask1x1,
+                                         ImageF* mask1x1,
                                          ImageF (*band_qf)[4]) {
   JXL_ENSURE(rect.xsize() % kBlockDim == 0);
   JXL_ENSURE(rect.ysize() % kBlockDim == 0);
@@ -873,8 +858,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
   JxlMemoryManager* memory_manager = xyb.memory_manager();
   JXL_ASSIGN_OR_RETURN(
       impl.aq_map, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
-  JXL_ASSIGN_OR_RETURN(
-      *mask, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
   JXL_ASSIGN_OR_RETURN(
       *mask1x1, ImageF::Create(memory_manager, xyb.xsize(), xyb.ysize()));
   if (band_qf != nullptr) {
@@ -901,8 +884,7 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
     Rect rect_out(bx0, by0, bx1 - bx0, by1 - by0);
     JXL_RETURN_IF_ERROR(impl.ComputeTile(butteraugli_target, scale, xyb, rect,
-                                         rect_out, thread, mask, mask1x1,
-                                         band_qf));
+                                         rect_out, thread, mask1x1, band_qf));
     return true;
   };
   size_t num_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks) *
@@ -1416,11 +1398,10 @@ float InitialQuantDC(float butteraugli_target) {
 StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* mask, ImageF* mask1x1,
-                                   ImageF (*band_qf)[4]) {
+                                   ImageF* mask1x1, ImageF (*band_qf)[4]) {
   const float quant_ac = kAcQuant / std::max(1e-4f, butteraugli_target);
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
-      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask, mask1x1,
+      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask1x1,
       band_qf);
 }
 

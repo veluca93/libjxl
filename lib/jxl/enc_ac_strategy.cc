@@ -1537,8 +1537,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         }
       }
     } else if (config.band_qf_rows[1][0] != nullptr) {
-      float bq = 0.0f;
-      uint32_t bits = static_cast<uint32_t>(act_val) & 31u;
+      float bq = 1.0f;
+      uint32_t bits = 0;
+      memcpy(&bits, &bq, sizeof(bits));
+      bits = (bits & ~31u) | (static_cast<uint32_t>(act_val) & 31u);
       memcpy(&bq, &bits, sizeof(bq));
       config.band_qf_rows[1][0][(by + y0) * config.quant_field_stride +
                                 (bx + x0)] = bq;
@@ -1660,8 +1662,7 @@ namespace jxl {
 HWY_EXPORT(ProcessRectACS);
 
 Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
-                                  ImageF* quant_field, const ImageF& mask,
-                                  const ImageF& mask1x1,
+                                  ImageF* quant_field, const ImageF& mask1x1,
                                   DequantMatrices* matrices,
                                   ImageF (*band_qf)[4], float x_qm_multiplier,
                                   float b_qm_multiplier, float quant_scale,
@@ -1686,10 +1687,6 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   // Image row pointers and strides.
   config.quant_field_row = quant_field->Row(0);
   config.quant_field_stride = quant_field->PixelsPerRow();
-  if (mask.xsize() > 0 && mask.ysize() > 0) {
-    config.masking_field_row = mask.Row(0);
-    config.masking_field_stride = mask.PixelsPerRow();
-  }
   config.mask1x1_xsize = mask1x1.xsize();
   if (mask1x1.xsize() > 0 && mask1x1.ysize() > 0) {
     config.masking1x1_field_row = mask1x1.Row(0);
