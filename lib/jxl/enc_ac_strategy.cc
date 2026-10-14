@@ -405,11 +405,13 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     }
     q_pool = mean_max_mixer * q_max + (1.0f - mean_max_mixer) * q_mean;
   }
-  if (acs.Strategy() == AcStrategyType::DCT16X8 ||
-      acs.Strategy() == AcStrategyType::DCT8X16) {
-    q_pool *= 0.90390420971782894f;
-  } else if (acs.Strategy() == AcStrategyType::DCT16X16) {
-    q_pool *= 0.89232976007290965f;
+  if (config.band_qf_stride == 0) {
+    if (acs.Strategy() == AcStrategyType::DCT16X8 ||
+        acs.Strategy() == AcStrategyType::DCT8X16) {
+      q_pool *= 0.90390420971782894f;
+    } else if (acs.Strategy() == AcStrategyType::DCT16X16) {
+      q_pool *= 0.89232976007290965f;
+    }
   }
   q_out = q_pool;
   act_out = 0;
@@ -436,9 +438,6 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
   static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f, 1.00f};
   static constexpr float kBandErrWeight[4] = {0.81f, 0.96f, 1.18f, 1.40f};
-  // Per-channel RDO rate weights for stepping q up across transform scales:
-  // scale_ix = 0 (4 blocks: 16x16, 32x8, 8x32), 1 (8 blocks: 32x16, 16x32),
-  // 2 (16 blocks: 32x32), 3 (>=32 blocks: 64x32, 32x64, 64x64).
   static constexpr float kAlphaBlk[4][3] = {
       {0.09624f, 0.19962f, 0.13015f},
       {0.30558f, 0.07055f, 0.06271f},
@@ -446,6 +445,12 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       {0.20420f, 0.17975f, 0.03865f},
   };
   static constexpr float kAlphaVal[4][3] = {
+      {0.27450f, 1.12558f, 0.98950f},
+      {0.46522f, 0.40946f, 0.36582f},
+      {0.28035f, 0.91827f, 1.55815f},
+      {0.26873f, 0.68864f, 1.20822f},
+  };
+  static constexpr float kAlphaValNoRdo[4][3] = {
       {0.11965f, 0.49060f, 0.43129f},
       {0.20277f, 0.17847f, 0.15945f},
       {0.12220f, 0.40024f, 0.67915f},
@@ -711,9 +716,11 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
             (num_blocks == 4)
                 ? 0
                 : ((num_blocks == 8) ? 1 : ((num_blocks == 16) ? 2 : 3));
+        const float val_mul =
+            use_csf_w ? kAlphaVal[scale_ix][c] : kAlphaValNoRdo[scale_ix][c];
         const float base_cost =
             kAlphaBlk[scale_ix][c] * num_blocks * kDCTBlockSize +
-            kAlphaVal[scale_ix][c] * R0;
+            val_mul * R0;
         theta1 = base_cost;
         theta2 = 2.0f * base_cost;
       }
@@ -801,11 +808,11 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
                   const auto h2_sum = Add(v_sum, Shuffle2301(v_sum));
                   const auto h4_sum = Add(h2_sum, Shuffle1032(h2_sum));
                   const auto s_ms =
-                      MulAdd(Set(df8, 0.020f), h2_sum,
-                             Mul(Set(df8, 0.003f), h4_sum));
+                      MulAdd(Set(df8, 0.010f), h2_sum,
+                             Mul(Set(df8, 0.0015f), h4_sum));
                   in0 = MulAdd(Set(df8, 0.948f), in0, s_ms);
                   in1 = MulAdd(Set(df8, 0.948f), in1, s_ms);
-                  lossc2 = MulAdd(Set(df8, 12.0f), Mul(s_ms, s_ms), lossc2);
+                  lossc2 = MulAdd(Set(df8, 10.0f), Mul(s_ms, s_ms), lossc2);
                 }
 #endif
                 in0 = Mul(in0, in0);
@@ -1487,11 +1494,6 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         }
         q_pool = mean_max_mixer * q_max + (1.0f - mean_max_mixer) * q_rms;
       }
-      if (type == AcStrategyType::DCT16X8 || type == AcStrategyType::DCT8X16) {
-        q_pool *= 0.90390420971782894f;
-      } else if (type == AcStrategyType::DCT16X16) {
-        q_pool *= 0.89232976007290965f;
-      }
       const int32_t quant_orig =
           Quantizer::ClampVal(q_pool * config.inv_global_scale + 0.5f);
       const int32_t quant_final =
@@ -1526,6 +1528,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           }
           config.band_qf_rows[c][s][(by + y0) * config.band_qf_stride +
                                     (bx + x0)] = bq;
+        }
+      }
+      for (size_t iy = 0; iy < h; ++iy) {
+        for (size_t ix = 0; ix < w; ++ix) {
+          config.quant_field_row[(by + y0 + iy) * config.quant_field_stride +
+                                 (bx + x0 + ix)] = q_pool;
         }
       }
     } else if (config.band_qf_rows[1][0] != nullptr) {
