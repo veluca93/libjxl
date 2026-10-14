@@ -436,7 +436,8 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
           E[c][2] = std::min(cap, 0.25f * (d2_h0 + d2_h1 + d2_v0 + d2_v1));
         }
 
-        // Scale s=3 (1:8 coarse gradient against adjacent 8x8 blocks):
+        // Scale s=3 (1:8 coarse isotropic 4-neighbor gradient against adjacent
+        // 8x8 blocks):
         const size_t xm = (x >= 4) ? x - 4 : x;
         const size_t xp = (x + 11 < xsize) ? x + 11 : x + 7;
         const size_t ym = (y >= 4) ? y - 4 : y;
@@ -446,18 +447,32 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
           for (size_t dx : {size_t(2), size_t(5)}) {
             const float vx_l = 10.0f * rect_in.ConstRow(xyb_x, y + dy)[xm];
             const float vx_r = 10.0f * rect_in.ConstRow(xyb_x, y + dy)[xp];
+            const float vx_t = 10.0f * rect_in.ConstRow(xyb_x, ym)[x + dx];
+            const float vx_b = 10.0f * rect_in.ConstRow(xyb_x, yp)[x + dx];
+            const float vy_l = rect_in.ConstRow(xyb_y, y + dy)[xm];
+            const float vy_r = rect_in.ConstRow(xyb_y, y + dy)[xp];
             const float vy_t = rect_in.ConstRow(xyb_y, ym)[x + dx];
             const float vy_b = rect_in.ConstRow(xyb_y, yp)[x + dx];
+            const float vb_l =
+                0.55f * (rect_in.ConstRow(xyb_b, y + dy)[xm] - vy_l);
+            const float vb_r =
+                0.55f * (rect_in.ConstRow(xyb_b, y + dy)[xp] - vy_r);
             const float vb_t =
                 0.55f * (rect_in.ConstRow(xyb_b, ym)[x + dx] - vy_t);
             const float vb_b =
                 0.55f * (rect_in.ConstRow(xyb_b, yp)[x + dx] - vy_b);
-            nb_mean[0] += 0.125f * (std::abs(vx_l - block_mean[0]) +
-                                    std::abs(vx_r - block_mean[0]));
-            nb_mean[1] += 0.125f * (std::abs(vy_t - block_mean[1]) +
-                                    std::abs(vy_b - block_mean[1]));
-            nb_mean[2] += 0.125f * (std::abs(vb_t - block_mean[2]) +
-                                    std::abs(vb_b - block_mean[2]));
+            nb_mean[0] += 0.0625f * (std::abs(vx_l - block_mean[0]) +
+                                     std::abs(vx_r - block_mean[0]) +
+                                     std::abs(vx_t - block_mean[0]) +
+                                     std::abs(vx_b - block_mean[0]));
+            nb_mean[1] += 0.0625f * (std::abs(vy_l - block_mean[1]) +
+                                     std::abs(vy_r - block_mean[1]) +
+                                     std::abs(vy_t - block_mean[1]) +
+                                     std::abs(vy_b - block_mean[1]));
+            nb_mean[2] += 0.0625f * (std::abs(vb_l - block_mean[2]) +
+                                     std::abs(vb_r - block_mean[2]) +
+                                     std::abs(vb_t - block_mean[2]) +
+                                     std::abs(vb_b - block_mean[2]));
           }
         }
         for (size_t c = 0; c < 3; ++c) {

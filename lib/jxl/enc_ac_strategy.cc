@@ -573,21 +573,25 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
             (!use_csf_w || is_llf)
                 ? 1.0f
                 : (0.94f + 0.0085f * static_cast<float>(v8 + u8));
-        const float w_q = is_llf ? 0.0f : band_w_q[s];
-        const float t_tr =
-            is_llf ? 1e30f : (trial_thres[hfix] + zero_thres_q[c][4 + s]);
-        const float t0_q =
-            is_llf ? 1e30f
-                   : (use_csf_w
-                          ? (zero_thres_q[c][hfix] + zero_thres_q[c][4 + s])
-                          : t_tr);
         for (size_t ix = 0; ix < cx; ++ix) {
           w_row[u8 * cx + ix] = ws;
           t0_row[u8 * cx + ix] = t0;
           cw_row[u8 * cx + ix] = cw;
-          w_q_row[u8 * cx + ix] = w_q;
-          t_tr_row[u8 * cx + ix] = t_tr;
-          t0_q_row[u8 * cx + ix] = t0_q;
+        }
+        if (use_q_rdo) {
+          const float w_q = is_llf ? 0.0f : band_w_q[s];
+          const float t_tr =
+              is_llf ? 1e30f : (trial_thres[hfix] + zero_thres_q[c][4 + s]);
+          const float t0_q =
+              is_llf ? 1e30f
+                     : (use_csf_w
+                            ? (zero_thres_q[c][hfix] + zero_thres_q[c][4 + s])
+                            : t_tr);
+          for (size_t ix = 0; ix < cx; ++ix) {
+            w_q_row[u8 * cx + ix] = w_q;
+            t_tr_row[u8 * cx + ix] = t_tr;
+            t0_q_row[u8 * cx + ix] = t0_q;
+          }
         }
       }
       for (size_t iy = 0; iy < cy; ++iy) {
@@ -697,8 +701,6 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
 
       const float R0 = GetLane(SumOfLanes(df, r0_v));
       const float E0 = GetLane(SumOfLanes(df, e0_v));
-      const float G1 = E0;
-      const float G2 = E0;
 
       const float total_nz =
           hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3];
@@ -725,47 +727,12 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
         theta2 = 2.0f * base_cost;
       }
 
-      const float j1 = theta1 - G1;
-      const float j2 = (theta1 < G1)
-                           ? (j1 + (theta2 - G2))
-                           : (j1 + std::max(1.0f, theta2 - G2));
-      const float j_max = (max_step >= 2) ? j2 : ((max_step == 1) ? j1 : 0.0f);
-      auto eval_j_try = [&](int32_t q_try) -> float {
-        const int32_t s = q_try - quant_orig;
-        if (s < 0) {
-          const float dq = static_cast<float>(-s);
-          return 64.0f * num_blocks * dq * dq;
-        }
-        if (s > max_step) {
-          const float ex = static_cast<float>(s - max_step);
-          return j_max + 64.0f * num_blocks * ex * ex;
-        }
-        if (s == 0) return 0.0f;
-        if (s == 1) return j1;
-        return j2;
-      };
-
-      int32_t lo = std::max(1, quant_orig - 2);
-      int32_t hi =
-          std::min<int32_t>(Quantizer::kQuantMax - 1, quant_orig + max_step + 2);
-      while (hi - lo > 2) {
-        const int32_t m1 = lo + (hi - lo) / 3;
-        const int32_t m2 = hi - (hi - lo) / 3;
-        if (eval_j_try(m1) <= eval_j_try(m2)) {
-          hi = m2;
-        } else {
-          lo = m1;
-        }
+      int32_t step = 0;
+      if (max_step >= 1 && E0 > theta1) {
+        step = (max_step >= 2 && E0 > theta2) ? 2 : 1;
       }
-      int32_t q_try_best = quant_orig;
-      float best_j_c = eval_j_try(quant_orig);
-      for (int32_t qt = lo; qt <= hi; ++qt) {
-        const float jc = eval_j_try(qt);
-        if (jc < best_j_c) {
-          best_j_c = jc;
-          q_try_best = qt;
-        }
-      }
+      const int32_t q_try_best =
+          std::min<int32_t>(Quantizer::kQuantMax - 1, quant_orig + step);
       const int32_t q_c =
           std::max(std::max(4, q_try_best / 2), q_try_best - activity);
       max_quant = std::max(q_c, max_quant);
@@ -1051,8 +1018,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     float best_8x8_q[32][32];
     float entropy_estimate[32][32];
     float prefix_sum[33][33];
-    CandBlock cands[4096];
-    LocalCand local_cands[272];
+    CandBlock cands[6144];
+    LocalCand local_cands[352];
   };
   static constexpr size_t kQMemWords = 655360;
   static_assert(sizeof(DPTable) <= kQMemWords * sizeof(uint32_t),
@@ -1124,6 +1091,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           : 1.0f;
   const float entropy_mul16X8 = 1.21f * mb_scale;
   const float entropy_mul16X16 = 1.34f * mb_scale;
+  const float entropy_mul8X32 = 1.46f * mb_scale;
   const float entropy_mul16X32 = 1.49f * mb_scale;
   const float entropy_mul32X32 = 1.48f * mb_scale;
   const float entropy_mul64X32 = 2.25f * mb_scale;
@@ -1156,7 +1124,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   // [rx0, rx0 + rw) x [ry0, ry0 + rh) with rw <= 8, rh <= 8.
   auto solve_non_guillotine_subrect = [&](size_t rx0, size_t ry0, size_t rw,
                                           size_t rh, float dp_sub_cost,
-                                          uint8_t* out_best_chosen,
+                                          uint16_t* out_best_chosen,
                                           size_t* out_best_num,
                                           float* out_best_gain) -> void {
     *out_best_num = 0;
@@ -1169,7 +1137,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       const CandBlock& cb = dp->cands[i];
       if (cb.x0 >= rx0 && cb.y0 >= ry0 && cb.x0 + cb.w <= rx0 + rw &&
           cb.y0 + cb.h <= ry0 + rh &&
-          !(cb.w == rw && cb.h == rh) && n_loc < 272) {
+          !(cb.w == rw && cb.h == rh) && n_loc < 352) {
         uint64_t mask = 0;
         const uint64_t row_bits =
             ((uint64_t{1} << cb.w) - 1) << (cb.x0 - rx0);
@@ -1188,7 +1156,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                 return a.rate > b.rate;
               });
     float best_ng_gain = dp_sub_gain + 1e-3f;
-    uint8_t cur_chosen[64];
+    uint16_t cur_chosen[64];
     size_t cur_num = 0;
     size_t nodes = 0;
     constexpr size_t kMaxNodes = 2048;
@@ -1223,7 +1191,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       if (max_possible <= best_ng_gain) return;
 
       const LocalCand& lc = dp->local_cands[idx];
-      cur_chosen[cur_num++] = static_cast<uint8_t>(idx);
+      cur_chosen[cur_num++] = static_cast<uint16_t>(idx);
       self(self, idx + 1, used | lc.mask, cur_gain + lc.gain);
       --cur_num;
       if (nodes <= kMaxNodes) {
@@ -1299,6 +1267,14 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         has_direct = true;
         direct_type = AcStrategyType::DCT16X16;
         direct_mul = entropy_mul16X16;
+      } else if (w == 4 && h == 1 && allow_16x32) {
+        has_direct = true;
+        direct_type = AcStrategyType::DCT8X32;
+        direct_mul = entropy_mul8X32;
+      } else if (w == 1 && h == 4 && allow_16x32) {
+        has_direct = true;
+        direct_type = AcStrategyType::DCT32X8;
+        direct_mul = entropy_mul8X32;
       } else if (w == 4 && h == 2 && allow_16x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT16X32;
@@ -1407,10 +1383,13 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
 
           if (has_direct) {
             const float base_sum = rect_base_sum(x0, y0, w, h);
+            const bool is_8x32 = (w == 4 && h == 1) || (w == 1 && h == 4);
             const bool eval_direct =
                 enable_rdo
-                    ? ((w * h <= 16) || ((x0 & 1) == 0 && (y0 & 1) == 0) ||
-                       (best_c < base_sum - 1e-4f))
+                    ? (is_8x32 ? (best_c < base_sum - 1e-4f)
+                               : ((w * h <= 16) ||
+                                  ((x0 & 1) == 0 && (y0 & 1) == 0) ||
+                                  (best_c < base_sum - 1e-4f)))
                     : (x0 % w == 0 && y0 % h == 0);
             if (eval_direct) {
               float cand_entropy = kInf;
@@ -1430,7 +1409,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                 dp->leaf_q[y0][x0][h][w] = cand_q;
                 dp->leaf_act[y0][x0][h][w] = cand_act;
                 const float gain = base_sum - cand_entropy;
-                if (enable_rdo && gain > 0.0f && num_cands < 4096) {
+                if (enable_rdo && gain > 0.0f && num_cands < 6144) {
                   dp->cands[num_cands++] = {
                       static_cast<uint8_t>(x0),
                       static_cast<uint8_t>(y0),
@@ -1450,7 +1429,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           if (enable_rdo &&
               ((w == 8 && h == 8) || (w == rx && h == ry && rx <= 8 && ry <= 8)) &&
               best_s != 0 && ((x0 % 4 == 0 && y0 % 4 == 0) || (w == rx && h == ry))) {
-            uint8_t ng_chosen[64];
+            uint16_t ng_chosen[64];
             size_t ng_num = 0;
             float ng_gain = 0.0f;
             solve_non_guillotine_subrect(x0, y0, w, h, best_c, ng_chosen,
@@ -1571,7 +1550,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     }
     if (enable_rdo && cur.w <= 8 && cur.h <= 8 &&
         (s == 0x3FFFu || (cur.w >= 4 && cur.h >= 4))) {
-      uint8_t ng_chosen[64];
+      uint16_t ng_chosen[64];
       size_t ng_num = 0;
       float ng_gain = 0.0f;
       const float compare_cost =
