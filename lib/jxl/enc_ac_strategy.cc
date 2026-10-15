@@ -65,7 +65,7 @@
 namespace jxl {
 namespace {
 
-// Debugging utilities.
+ // Debugging utilities.
 
 // Returns a linear sRGB color (as bytes) for each AC strategy.
 const uint8_t* TypeColor(uint8_t raw_strategy) {
@@ -306,6 +306,7 @@ using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::IfThenZeroElse;
 using hwy::HWY_NAMESPACE::Lt;
 using hwy::HWY_NAMESPACE::Max;
+using hwy::HWY_NAMESPACE::MaxOfLanes;
 using hwy::HWY_NAMESPACE::Min;
 using hwy::HWY_NAMESPACE::MulAdd;
 using hwy::HWY_NAMESPACE::Round;
@@ -315,8 +316,8 @@ using hwy::HWY_NAMESPACE::Shuffle1032;
 using hwy::HWY_NAMESPACE::Shuffle2301;
 #endif
 
-Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
-                       size_t y, const ACSConfig& config,
+Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
+                       const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
                        float& entropy, float& q_out, uint8_t& act_out) {
@@ -405,14 +406,6 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     }
     q_pool = mean_max_mixer * q_max + (1.0f - mean_max_mixer) * q_mean;
   }
-  if (config.band_qf_stride == 0) {
-    if (acs.Strategy() == AcStrategyType::DCT16X8 ||
-        acs.Strategy() == AcStrategyType::DCT8X16) {
-      q_pool *= 0.90390420971782894f;
-    } else if (acs.Strategy() == AcStrategyType::DCT16X16) {
-      q_pool *= 0.89232976007290965f;
-    }
-  }
   q_out = q_pool;
   act_out = 0;
 
@@ -427,14 +420,15 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
   float* w_q_row = pixels_buf + 3 * AcStrategy::kMaxBlockDim;
   float* t_tr_row = pixels_buf + 4 * AcStrategy::kMaxBlockDim;
   float* t0_q_row = pixels_buf + 5 * AcStrategy::kMaxBlockDim;
-  auto loss = Zero(df8);
-  auto loss2 = Zero(df8);
+  float loss = 0.0f;
+  float loss2 = 0.0f;
 
   const bool is_partial_block =
-      ((1 << static_cast<size_t>(acs.Strategy())) & kPartialBlockKinds) != 0;
+      (kPartialBlockKinds &
+       (1u << static_cast<uint32_t>(acs.Strategy()))) != 0;
   const float inv_nblocks = 1.0f / static_cast<float>(num_blocks);
-  const bool use_csf_w = (!is_partial_block && config.band_qf_stride > 0);
-  const bool use_q_rdo = (!is_partial_block && config.quant_scale > 0.0f);
+  const bool use_csf_w = (config.band_qf_stride > 0) && !is_partial_block;
+  const bool use_q_rdo = (config.quant_scale > 0.0f) && !is_partial_block;
 
   static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f, 1.00f};
   static constexpr float kBandErrWeight[4] = {0.81f, 0.96f, 1.18f, 1.40f};
@@ -611,9 +605,10 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           Store(Mul(m, diff), df, &mem[off + rx]);
           const auto q_mag = Abs(rval);
           const auto q_is_zero = Eq(q_mag, zero);
+          const auto nz_one = IfThenZeroElse(q_is_zero, one);
           const auto cw = Load(df, cw_row + rx);
           entropy_v = MulAdd(cw, Sqrt(q_mag), entropy_v);
-          nzeros_v = Add(nzeros_v, IfThenZeroElse(q_is_zero, one));
+          nzeros_v = Add(nzeros_v, nz_one);
 
           if (use_q_rdo) {
             const auto v0 = Abs(Mul(in, Mul(im, q_block_c_v)));
@@ -707,12 +702,12 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       int32_t max_step = 0;
       float theta1 = 1e30f;
       float theta2 = 1e30f;
-      if (acs.Strategy() == AcStrategyType::DCT) {
+      if (num_blocks == 1) {
         if (use_csf_w ? (total_nz < 11.0f) : (R0 < 8.0f)) {
           max_step = 1;
           theta1 = use_csf_w ? dct8_err_min : 2.0f;
         }
-      } else if (acs.Strategy() >= AcStrategyType::DCT16X16) {
+      } else if (num_blocks >= 2) {
         max_step = 2;
         const size_t scale_ix =
             (num_blocks == 4)
@@ -733,13 +728,13 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       }
       const int32_t q_try_best =
           std::min<int32_t>(Quantizer::kQuantMax - 1, quant_orig + step);
-      const int32_t q_c =
-          std::max(std::max(4, q_try_best / 2), q_try_best - activity);
+      const int32_t q_floor = (config.butteraugli_distance < 0.25f)
+                                  ? quant_orig
+                                  : std::max(4, q_try_best / 2);
+      const int32_t q_c = std::max(q_floor, q_try_best - activity);
       max_quant = std::max(q_c, max_quant);
     }
 
-    auto lossc = Zero(df8);
-    auto lossc2 = Zero(df8);
     {
       float masku_lut[3] = {
           12.0,
@@ -750,6 +745,19 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
       TransformToPixels(acs.Strategy(), &mem[0], pixels_buf, cov_x * 8,
                         scratch_space);
 
+      static const float kChannelMul[3] = {
+          static_cast<float>(pow(8.2, 8.0)),
+          static_cast<float>(pow(1.0, 8.0)),
+          static_cast<float>(pow(1.03, 8.0)),
+      };
+      static const float kChannelMul2[3] = {
+          2.2f * 2.2f,
+          1.0f,
+          0.90f * 0.90f,
+      };
+
+      auto lossc = Zero(df8);
+      auto lossc2 = Zero(df8);
       for (size_t iy = 0; iy < cov_y; iy++) {
         for (size_t ix = 0; ix < cov_x; ix++) {
           for (size_t dy = 0; dy < kBlockDim; dy += 2) {
@@ -795,18 +803,19 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
           }
         }
       }
-      static const double kChannelMul[3] = {
-          pow(8.2, 8.0),
-          pow(1.0, 8.0),
-          pow(1.03, 8.0),
-      };
-      static const float kChannelMul2[3] = {
-          2.2f * 2.2f,
-          1.0f,
-          0.90f * 0.90f,
-      };
-      lossc = Mul(Set(df8, kChannelMul[c]), lossc);
-      lossc2 = Mul(Set(df8, kChannelMul2[c]), lossc2);
+      float w = 1.0f;
+      if (c == 0 && num_blocks >= 2) {
+        const float x_slope =
+            use_csf_w
+                ? (0.088f +
+                   0.014f * Clamp1((config.butteraugli_distance - 0.5f) / 1.5f,
+                                   0.0f, 1.0f))
+                : 0.125f;
+        w += std::min(2.6f, static_cast<float>(num_blocks) * x_slope);
+      }
+      loss += GetLane(SumOfLanes(df8, lossc)) * (kChannelMul[c] * w);
+      loss2 += GetLane(SumOfLanes(df8, lossc2)) *
+               (kChannelMul2[c] * ((w > 1.0f) ? std::pow(w, 0.25f) : 1.0f));
     }
     float entropy_c = config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
     size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
@@ -817,161 +826,90 @@ Status EstimateEntropy(const AcStrategy& acs, float entropy_mul, size_t x,
     // bias.
     entropy_c += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
     if (c == 0 && num_blocks >= 2) {
-      // It is X channel (red-green) and we often see ringing
-      // in the large blocks. Let's punish that more here.
       const float x_slope =
-          0.088f +
-          0.014f * Clamp1((config.butteraugli_distance - 0.5f) / 1.5f, 0.0f,
-                          1.0f);
-      float w = (config.band_qf_stride > 0)
-                    ? (1.0f + std::min(2.6f, num_blocks * x_slope))
-                    : static_cast<float>(1.0 + std::min(3.0, num_blocks / 8.0));
-      entropy_c *= w;
-      lossc = Mul(lossc, Set(df8, w));
-      lossc2 = Mul(lossc2, Set(df8, std::pow(w, 0.25f)));
+          use_csf_w
+              ? (0.088f +
+                 0.014f * Clamp1((config.butteraugli_distance - 0.5f) / 1.5f,
+                                 0.0f, 1.0f))
+              : 0.125f;
+      entropy_c *= 1.0f + std::min(2.6f, static_cast<float>(num_blocks) * x_slope);
     }
     entropy += entropy_c;
-    loss = Add(loss, lossc);
-    loss2 = Add(loss2, lossc2);
   }
   if (use_q_rdo) {
     q_out =
         q_pool + static_cast<float>(max_quant - quant_orig) * config.quant_scale;
   }
-  const float inv_npixels = 1.0f / (num_blocks * kDCTBlockSize);
-  const float d8 =
-      std::pow(GetLane(SumOfLanes(df8, loss)) * inv_npixels, 1.0f / 8.0f);
-  const float d2 = std::sqrt(GetLane(SumOfLanes(df8, loss2)) * inv_npixels);
+  const float d = config.butteraugli_distance;
+  float rate_scale = 1.0f;
+  float dist_scale = 1.0f;
+  if (!is_partial_block) {
+    const float b = 0.5f * static_cast<float>(acs.log2_covered_blocks());
+    const float a = 0.5f * static_cast<float>(FloorLog2Nonzero(cx / cy));
+    if (b > 0.0f) {
+      const float k_d =
+          use_csf_w
+              ? (-0.372f + 0.042f * Clamp1((d - 0.5f) / 0.35f, 0.0f, 1.0f))
+              : -0.40f;
+      dist_scale = 1.0f / (1.0f + k_d / (d + 1.4f));
+      const float mb_d =
+          use_csf_w
+              ? (0.985f + 0.015f * Clamp1((d - 0.5f) / 1.0f, 0.0f, 1.0f))
+              : 1.0f;
+      const float b_hi = std::max(0.0f, b - 2.0f);
+      rate_scale =
+          dist_scale * mb_d *
+          (1.0f + 0.540f * (b * b) / (0.65f + b * b) + 0.110f * a +
+           0.74f * b_hi / (0.06f + b_hi));
+    }
+  } else {
+    const AcStrategyType st = acs.Strategy();
+    const float s = (st == AcStrategyType::IDENTITY) ? 3.0f
+                    : (st == AcStrategyType::DCT2X2) ? 2.0f
+                    : (st == AcStrategyType::DCT4X4) ? 1.0f
+                                                     : 0.5f;
+    const float a =
+        (st == AcStrategyType::DCT4X8 || st == AcStrategyType::DCT8X4) ? 0.5f
+                                                                       : 0.0f;
+    if (s <= 1.0f) {
+      const float s2 = s * s;
+      rate_scale = 1.0f + (0.002f + 0.348f * s2) * s2 + 0.104f * a;
+      if (d > 4.0f) {
+        rate_scale += 0.5f * std::min(1.0f, 8.0f / (d - 4.0f));
+      }
+    } else {
+      rate_scale = 0.9556f + 0.11595f * s;
+      if (d < 5.0f) {
+        const float d_ramp =
+            (config.band_qf_stride > 0)
+                ? Clamp1((d - 0.5f) / 0.35f, 0.0f, 1.0f)
+                : 0.0f;
+        const float loc_favor =
+            (config.band_qf_stride > 0)
+                ? ((0.400f - 0.015f * (3.0f - s)) -
+                   (0.050f + 0.075f * (3.0f - s)) * d_ramp)
+                : 0.400f;
+        const float w_d = (5.0f - d) / 5.0f;
+        rate_scale -= loc_favor * w_d * w_d;
+      }
+    }
+  }
+  const float inv_npixels = 1.0f / static_cast<float>(num_blocks * kDCTBlockSize);
+  const float d8 = std::pow(loss * inv_npixels, 1.0f / 8.0f);
+  const float d2 = std::sqrt(loss2 * inv_npixels);
   const float d_blend =
       (config.band_qf_stride > 0) ? (0.91f * d8 + 0.09f * 2.18f * d2) : d8;
   float loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / quant_norm16;
-  entropy *= entropy_mul;
-  entropy += config.info_loss_multiplier * loss_scalar;
+  entropy = rate_scale * entropy +
+            dist_scale * config.info_loss_multiplier * loss_scalar;
   if (config.band_qf_stride > 0 && num_blocks >= 2 && q_min > 1e-4f) {
     const float q_ratio = q_max / q_min;
     if (num_blocks <= 16 && q_ratio < 1.12f) {
       entropy *= 1.0f - 0.011f * ((1.12f - q_ratio) / 0.12f);
     } else if (q_ratio > 1.22f) {
-      entropy *=
-          1.0f + 0.014f * Clamp1((q_ratio - 1.22f) / 0.35f, 0.0f, 1.0f);
+      entropy *= 1.0f + 0.014f * Clamp1((q_ratio - 1.22f) / 0.35f, 0.0f, 1.0f);
     }
   }
-  return true;
-}
-
-Status FindBest8x8Transform(size_t x, size_t y, int encoding_speed_tier,
-                            float butteraugli_target, const ACSConfig& config,
-                            const float* JXL_RESTRICT cmap_factors,
-                            AcStrategyImage* JXL_RESTRICT ac_strategy,
-                            float* block, float* scratch_space,
-                            uint32_t* quantized, float* entropy_out,
-                            AcStrategyType& best_tx, float* q_out,
-                            uint8_t* act_out) {
-  struct TransformTry8x8 {
-    AcStrategyType type;
-    int encoding_speed_tier_max_limit;
-    double entropy_mul;
-  };
-  static const TransformTry8x8 kTransforms8x8[] = {
-      {
-          AcStrategyType::DCT,
-          9,
-          0.8,
-      },
-      {
-          AcStrategyType::DCT4X4,
-          5,
-          1.08,
-      },
-      {
-          AcStrategyType::DCT2X2,
-          5,
-          0.95,
-      },
-      {
-          AcStrategyType::DCT4X8,
-          4,
-          0.85931637428340035,
-      },
-      {
-          AcStrategyType::DCT8X4,
-          4,
-          0.85931637428340035,
-      },
-      {
-          AcStrategyType::IDENTITY,
-          5,
-          1.0427542510634957,
-      },
-      {
-          AcStrategyType::AFV0,
-          4,
-          0.81779489591359944,
-      },
-      {
-          AcStrategyType::AFV1,
-          4,
-          0.81779489591359944,
-      },
-      {
-          AcStrategyType::AFV2,
-          4,
-          0.81779489591359944,
-      },
-      {
-          AcStrategyType::AFV3,
-          4,
-          0.81779489591359944,
-      },
-  };
-  double best = 1e30;
-  best_tx = kTransforms8x8[0].type;
-  *q_out = config.Quant(x / 8, y / 8);
-  *act_out = 0;
-  for (auto tx : kTransforms8x8) {
-    if (tx.encoding_speed_tier_max_limit < encoding_speed_tier) {
-      continue;
-    }
-    AcStrategy acs = AcStrategy::FromRawStrategy(tx.type);
-    float entropy_mul = tx.entropy_mul / kTransforms8x8[0].entropy_mul;
-    if ((tx.type == AcStrategyType::DCT2X2 ||
-         tx.type == AcStrategyType::IDENTITY) &&
-        butteraugli_target < 5.0) {
-      float favor_2x2 = 0.40f;
-      if (config.band_qf_stride > 0) {
-        const float d_ramp =
-            Clamp1((butteraugli_target - 0.5f) / 0.35f, 0.0f, 1.0f);
-        favor_2x2 = (tx.type == AcStrategyType::DCT2X2)
-                        ? (0.385f - 0.125f * d_ramp)
-                        : (0.400f - 0.050f * d_ramp);
-      }
-      float weight = pow((5.0f - butteraugli_target) / 5.0f, 2.0f);
-      entropy_mul -= favor_2x2 * weight;
-    }
-    if ((tx.type != AcStrategyType::DCT && tx.type != AcStrategyType::DCT2X2 &&
-         tx.type != AcStrategyType::IDENTITY) &&
-        butteraugli_target > 4.0) {
-      static const float kAvoidEntropyOfTransforms = 0.5;
-      float mul = 1.0;
-      if (butteraugli_target < 12.0) {
-        mul *= (12.0 - 4.0) / (butteraugli_target - 4.0);
-      }
-      entropy_mul += kAvoidEntropyOfTransforms * mul;
-    }
-    float entropy;
-    float cand_q = 0.0f;
-    uint8_t cand_act = 0;
-    JXL_RETURN_IF_ERROR(EstimateEntropy(acs, entropy_mul, x, y, config,
-                                        cmap_factors, block, scratch_space,
-                                        quantized, entropy, cand_q, cand_act));
-    if (entropy < best) {
-      best_tx = tx.type;
-      best = entropy;
-      *q_out = cand_q;
-      *act_out = cand_act;
-    }
-  }
-  *entropy_out = best;
   return true;
 }
 
@@ -980,7 +918,6 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                       float* JXL_RESTRICT block,
                       uint32_t* JXL_RESTRICT quantized,
                       AcStrategyImage* ac_strategy) {
-  const float butteraugli_target = cparams.butteraugli_distance;
   float* JXL_RESTRICT scratch_space = block + 3 * AcStrategy::kMaxCoeffArea;
   const size_t bx = rect.x0();
   const size_t by = rect.y0();
@@ -1043,16 +980,18 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   }
 
   const bool enable_rdo = (config.band_qf_stride > 0);
-  // Favor all 8x8 transforms (against 16x8 and larger transforms) at
-  // low butteraugli_target distances.
-  const float k8x8mul1 =
-      enable_rdo
-          ? (-0.375f +
-             0.035f * Clamp1((butteraugli_target - 0.5f) / 0.4f, 0.0f, 1.0f))
-          : -0.4f;
-  static const float k8x8mul2 = 1.0f;
-  static const float k8x8base = 1.4f;
-  const float mul8x8 = k8x8mul2 + k8x8mul1 / (butteraugli_target + k8x8base);
+  struct Transform1x1 {
+    AcStrategyType type;
+    int max_speed_tier;
+  };
+  static constexpr Transform1x1 kTransforms1x1[] = {
+      {AcStrategyType::DCT, 9},      {AcStrategyType::DCT4X4, 5},
+      {AcStrategyType::DCT2X2, 5},   {AcStrategyType::DCT4X8, 4},
+      {AcStrategyType::DCT8X4, 4},   {AcStrategyType::IDENTITY, 5},
+      {AcStrategyType::AFV0, 4},     {AcStrategyType::AFV1, 4},
+      {AcStrategyType::AFV2, 4},     {AcStrategyType::AFV3, 4},
+  };
+  const int speed_tier = static_cast<int>(cparams.speed_tier);
   for (size_t iy = 0; iy <= ry; ++iy) {
     dp->prefix_sum[iy][0] = 0.0f;
   }
@@ -1062,40 +1001,37 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
   for (size_t iy = 0; iy < ry; iy++) {
     float row_sum = 0.0f;
     for (size_t ix = 0; ix < rx; ix++) {
-      float entropy = 0.0f;
+      float best_entropy = 1e30f;
       AcStrategyType best_of_8x8s = AcStrategyType::DCT;
-      float best_q = 0.0f;
+      float best_q = config.Quant(bx + ix, by + iy);
       uint8_t best_act = 0;
       const float* JXL_RESTRICT cmap_factors =
           cmap_factors_tile[iy / kColorTileDimInBlocks]
                            [ix / kColorTileDimInBlocks];
-      JXL_RETURN_IF_ERROR(FindBest8x8Transform(
-          8 * (bx + ix), 8 * (by + iy), static_cast<int>(cparams.speed_tier),
-          butteraugli_target, config, cmap_factors, ac_strategy, block,
-          scratch_space, quantized, &entropy, best_of_8x8s, &best_q,
-          &best_act));
-      const float scaled_e = entropy * mul8x8;
-      dp->entropy_estimate[iy][ix] = scaled_e;
+      for (const auto& tx : kTransforms1x1) {
+        if (tx.max_speed_tier < speed_tier) continue;
+        float cand_entropy = 1e30f;
+        float cand_q = 0.0f;
+        uint8_t cand_act = 0;
+        JXL_RETURN_IF_ERROR(EstimateEntropy(
+            AcStrategy::FromRawStrategy(tx.type), 8 * (bx + ix), 8 * (by + iy),
+            config, cmap_factors, block, scratch_space, quantized,
+            cand_entropy, cand_q, cand_act));
+        if (cand_entropy < best_entropy) {
+          best_entropy = cand_entropy;
+          best_of_8x8s = tx.type;
+          best_q = cand_q;
+          best_act = cand_act;
+        }
+      }
+      dp->entropy_estimate[iy][ix] = best_entropy;
       dp->best_8x8_type[iy][ix] = best_of_8x8s;
       dp->best_8x8_q[iy][ix] = best_q;
       dp->best_8x8_act[iy][ix] = best_act;
-      row_sum += scaled_e;
+      row_sum += best_entropy;
       dp->prefix_sum[iy + 1][ix + 1] = dp->prefix_sum[iy][ix + 1] + row_sum;
     }
   }
-
-  const float mb_scale =
-      enable_rdo
-          ? (0.985f +
-             0.015f * Clamp1((butteraugli_target - 0.5f) / 1.0f, 0.0f, 1.0f))
-          : 1.0f;
-  const float entropy_mul16X8 = 1.21f * mb_scale;
-  const float entropy_mul16X16 = 1.34f * mb_scale;
-  const float entropy_mul8X32 = 1.46f * mb_scale;
-  const float entropy_mul16X32 = 1.49f * mb_scale;
-  const float entropy_mul32X32 = 1.48f * mb_scale;
-  const float entropy_mul64X32 = 2.25f * mb_scale;
-  const float entropy_mul64X64 = 2.25f * mb_scale;
 
   // Map 1D intervals [pos, pos + len) in [0, 32) to [0, 528).
   uint16_t iv_idx[32][33] = {};
@@ -1254,51 +1190,39 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       // Check if (w, h) corresponds to a valid single multi-block transform.
       bool has_direct = false;
       AcStrategyType direct_type = AcStrategyType::DCT;
-      float direct_mul = 1.0f;
       if (w == 1 && h == 2 && allow_16) {
         has_direct = true;
         direct_type = AcStrategyType::DCT16X8;
-        direct_mul = entropy_mul16X8;
       } else if (w == 2 && h == 1 && allow_16) {
         has_direct = true;
         direct_type = AcStrategyType::DCT8X16;
-        direct_mul = entropy_mul16X8;
       } else if (w == 2 && h == 2 && allow_16) {
         has_direct = true;
         direct_type = AcStrategyType::DCT16X16;
-        direct_mul = entropy_mul16X16;
       } else if (w == 4 && h == 1 && allow_16x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT8X32;
-        direct_mul = entropy_mul8X32;
       } else if (w == 1 && h == 4 && allow_16x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT32X8;
-        direct_mul = entropy_mul8X32;
       } else if (w == 4 && h == 2 && allow_16x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT16X32;
-        direct_mul = entropy_mul16X32;
       } else if (w == 2 && h == 4 && allow_16x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT32X16;
-        direct_mul = entropy_mul16X32;
       } else if (w == 4 && h == 4 && allow_32x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT32X32;
-        direct_mul = entropy_mul32X32;
       } else if (w == 4 && h == 8 && allow_64x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT64X32;
-        direct_mul = entropy_mul64X32;
       } else if (w == 8 && h == 4 && allow_64x32) {
         has_direct = true;
         direct_type = AcStrategyType::DCT32X64;
-        direct_mul = entropy_mul64X32;
       } else if (w == 8 && h == 8 && allow_64x64) {
         has_direct = true;
         direct_type = AcStrategyType::DCT64X64;
-        direct_mul = entropy_mul64X64;
       }
 
       const AcStrategy acs_direct = AcStrategy::FromRawStrategy(direct_type);
@@ -1317,7 +1241,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
 
           // Vertical splits: [x0, x0 + k) and [x0 + k, x0 + w)
           for (size_t k = 1; k < w; ++k) {
-            if (!enable_rdo && (w < h || k != k_dyadic_w)) continue;
+            if (!enable_rdo && k != k_dyadic_w) continue;
             const float c = dp->cost[iy][iv_idx[x0][k]] +
                             dp->cost[iy][iv_idx[x0 + k][w - k]];
             if (c < best_c) {
@@ -1327,7 +1251,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           }
           // Horizontal splits: [y0, y0 + k) and [y0 + k, y0 + h)
           for (size_t k = 1; k < h; ++k) {
-            if (!enable_rdo && (h < w || k != k_dyadic_h)) continue;
+            if (!enable_rdo && k != k_dyadic_h) continue;
             const float c = dp->cost[iv_idx[y0][k]][ix] +
                             dp->cost[iv_idx[y0 + k][h - k]][ix];
             if (c < best_c) {
@@ -1399,7 +1323,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                   cmap_factors_tile[y0 / kColorTileDimInBlocks]
                                    [x0 / kColorTileDimInBlocks];
               JXL_RETURN_IF_ERROR(EstimateEntropy(
-                  acs_direct, direct_mul, (bx + x0) * 8, (by + y0) * 8, config,
+                  acs_direct, (bx + x0) * 8, (by + y0) * 8, config,
                   cmap_factors, block, scratch_space, quantized, cand_entropy,
                   cand_q, cand_act));
               if (cand_entropy < best_c) {

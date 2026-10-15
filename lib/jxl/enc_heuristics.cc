@@ -361,6 +361,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       encodings[static_cast<size_t>(spec.table)] =
           QuantEncoding::DCT(new_params);
     }
+
     JXL_RETURN_IF_ERROR(DequantMatricesSetCustom(dequant_matrices, encodings,
                                                  modular_frame_encoder));
   }
@@ -1443,6 +1444,21 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
+
+  if (!streaming_mode && initialize_global_state) {
+    uint32_t used_tables_mask = 0;
+    for (size_t y = 0; y < ac_strategy.ysize(); ++y) {
+      AcStrategyRow row = ac_strategy.ConstRow(y);
+      for (size_t x = 0; x < ac_strategy.xsize(); ++x) {
+        AcStrategy acs = row[x];
+        if (!acs.IsFirstBlock()) continue;
+        const size_t table_idx = static_cast<size_t>(
+            kAcStrategyToQuantTableMap[static_cast<size_t>(acs.Strategy())]);
+        used_tables_mask |= (1u << table_idx);
+      }
+    }
+    matrices.PruneUnusedEncodings(used_tables_mask);
+  }
 
   // Refine quantization levels.
   if (!streaming_mode && !cparams.disable_perceptual_optimizations) {

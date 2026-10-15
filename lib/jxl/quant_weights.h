@@ -384,6 +384,16 @@ class DequantMatrices {
     computed_mask_ = 0;
   }
 
+  // Reset encodings of tables not present in `used_tables_mask` to Library<0>()
+  // so unused custom tables do not cost bits in the frame header.
+  void PruneUnusedEncodings(uint32_t used_tables_mask) {
+    for (size_t i = 0; i < encodings_.size(); ++i) {
+      if ((used_tables_mask & (1u << i)) == 0) {
+        encodings_[i] = QuantEncoding::Library<0>();
+      }
+    }
+  }
+
   // For encoder.
   void SetDCQuant(const float dc[3]) {
     for (size_t c = 0; c < 3; c++) {
