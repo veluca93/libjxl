@@ -13,7 +13,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -242,184 +241,115 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     JXL_RETURN_IF_ERROR(DequantMatricesSetCustomDC(
         memory_manager, dequant_matrices, dc_weights));
   } else if (enable_rdo) {
-    const size_t num_blocks = frame_dim.xsize_blocks * frame_dim.ysize_blocks;
-    if (num_blocks < 8192) return true;
+    (void)frame_dim;
+    // 8 VarDCT kQuantModeDCT tables ordered by log-block-scale b:
+    //   idx 0: DCT8     (b=0.0, a=0.0)
+    //   idx 1: DCT8X16  (b=0.5, a=0.5)
+    //   idx 2: DCT16X16 (b=1.0, a=0.0)
+    //   idx 3: DCT8X32  (b=1.0, a=1.0)
+    //   idx 4: DCT16X32 (b=1.5, a=0.5)
+    //   idx 5: DCT32X32 (b=2.0, a=0.0)
+    //   idx 6: DCT32X64 (b=2.5, a=0.5)
+    //   idx 7: DCT64X64 (b=3.0, a=0.0)
+    struct DctTableSpec {
+      QuantTable table;
+      float b;
+      float a;
+      size_t num_bands;
+    };
+    static constexpr DctTableSpec kDctTables[8] = {
+        {QuantTable::DCT, 0.0f, 0.0f, 6},
+        {QuantTable::DCT8X16, 0.5f, 0.5f, 7},
+        {QuantTable::DCT16X16, 1.0f, 0.0f, 7},
+        {QuantTable::DCT8X32, 1.0f, 1.0f, 8},
+        {QuantTable::DCT16X32, 1.5f, 0.5f, 8},
+        {QuantTable::DCT32X32, 2.0f, 0.0f, 8},
+        {QuantTable::DCT32X64, 2.5f, 0.5f, 8},
+        {QuantTable::DCT64X64, 3.0f, 0.0f, 8},
+    };
+
+    struct ChannelQMParams {
+      float W0;
+      float s1;
+      float s2;
+      float rho;
+      float D0;
+      float Db;
+      float k0;
+      float kb;
+      float gamma_d;
+      float beta_blk;
+      float eta_d;
+      float a_mid0;
+      float a_mid_d;
+    };
+    // Principled from-scratch parametric DCT quantization model for X, Y, B.
+    static constexpr ChannelQMParams kChannelParams[3] = {
+        // c = 0 (X):
+        {3068.0f, 0.628f, -0.185f, 0.055f, 2.03f, 0.885f, 1.10f, 1.53f, 0.010f,
+         0.003f, 0.012f, 0.022f, 0.004f},
+        // c = 1 (Y):
+        {597.0f, 0.667f, 0.966f, 0.242f, 1.12f, 1.269f, 0.14f, 0.67f, 0.000f,
+         0.004f, 0.007f, 0.029f, 0.005f},
+        // c = 2 (B):
+        {223.0f, 0.747f, 0.280f, 0.090f, 2.68f, 1.310f, 0.66f, 1.25f, 0.014f,
+         0.004f, 0.014f, 0.026f, 0.005f},
+    };
 
     const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 3.5f);
     const float t_d = Clamp1((d - 0.5f) / 2.0f, 0.0f, 1.0f);
-    const float a_mid_base =
-        ((num_blocks >= 16384 && num_blocks < 40000) ? 0.034f : 0.032f) -
-        0.008f * t_d;
-    constexpr float kChannelMid[3] = {0.75f, 1.00f, 0.85f};
+    constexpr float kU0 = 0.10f;
 
-    // Scale both the set of customized transform tables and the number of
-    // radial distance bands written to the bitstream with image size
-    // (num_blocks) and transform size (lib_bands):
-    //   < 8192 blocks   : 0 custom bands (library defaults)
-    //   8192..16383     : DCT(6) + DCT16X16(7) + DCT8X16(7) = 20 bands
-    //   16384..27999    : DCT(6) + DCT16X16(7) + DCT32X32(8) = 21 bands
-    //   28000..39999    : + DCT8X16(7) = 28 bands
-    //   >= 40000 blocks : + DCT16X32(8) = 36 bands
-    auto target_bands_for_table = [&](QuantTable table,
-                                      size_t lib_bands) -> size_t {
-      switch (table) {
-        case QuantTable::DCT:
-        case QuantTable::DCT16X16:
-          return lib_bands;
-        case QuantTable::DCT8X16:
-          if (num_blocks >= 16384 && num_blocks < 28000) return 0;
-          return lib_bands;
-        case QuantTable::DCT32X32:
-          if (num_blocks < 16384) return 0;
-          return lib_bands;
-        case QuantTable::DCT16X32:
-          if (num_blocks < 40000) return 0;
-          return lib_bands;
-        default:
-          return 0;
-      }
-    };
-
-    auto mult_step = [](float v) -> float {
-      return (v > 0.0f) ? (1.0f + v) : (1.0f / (1.0f - v));
-    };
     auto inv_mult_step = [](float r) -> float {
       return (r >= 1.0f) ? (r - 1.0f) : (1.0f - 1.0f / r);
     };
 
-    const QuantEncoding* library = DequantMatrices::Library();
-    // Precompute log-weights of the square anchor tables (DCT8, DCT16X16,
-    // DCT32X32) so rectangular tables (DCT8X16, DCT16X32) can be regularized
-    // toward uniform perceptual loss at the same physical spatial frequency.
-    constexpr size_t kSquareTables[3] = {
-        static_cast<size_t>(QuantTable::DCT),
-        static_cast<size_t>(QuantTable::DCT16X16),
-        static_cast<size_t>(QuantTable::DCT32X32),
-    };
-    float sq_log_w[3][3][DctQuantWeightParams::kMaxDistanceBands] = {};
-    size_t sq_bands[3] = {};
-    for (size_t s_idx = 0; s_idx < 3; ++s_idx) {
-      const DctQuantWeightParams& sp = library[kSquareTables[s_idx]].dct_params;
-      sq_bands[s_idx] = sp.num_distance_bands;
-      for (size_t c = 0; c < 3; ++c) {
-        float w = sp.distance_bands[c][0];
-        sq_log_w[s_idx][c][0] = std::log(w);
-        for (size_t j = 1; j < sq_bands[s_idx]; ++j) {
-          w *= mult_step(sp.distance_bands[c][j]);
-          sq_log_w[s_idx][c][j] = std::log(w);
-        }
-      }
-    }
-    auto interp_sq_log_w = [&](size_t s_idx, size_t ch, float u_sq) -> float {
-      const size_t nb = sq_bands[s_idx];
-      const float pos = Clamp1(u_sq, 0.0f, 1.0f) * static_cast<float>(nb - 1);
-      const size_t idx = std::min<size_t>(static_cast<size_t>(pos), nb - 2);
-      const float frac = pos - static_cast<float>(idx);
-      return sq_log_w[s_idx][ch][idx] +
-             frac * (sq_log_w[s_idx][ch][idx + 1] - sq_log_w[s_idx][ch][idx]);
-    };
-
     std::vector<QuantEncoding> encodings(kNumQuantTables,
                                          QuantEncoding::Library<0>());
-    bool any_custom = false;
-    for (size_t i = 0; i < kNumQuantTables; ++i) {
-      const QuantTable table = static_cast<QuantTable>(i);
-      const QuantEncoding& lib_enc = library[i];
-      if (lib_enc.mode != QuantEncoding::kQuantModeDCT) continue;
-      const size_t lib_bands = lib_enc.dct_params.num_distance_bands;
-      if (lib_bands < 2) continue;
-      const size_t out_bands =
-          std::min(target_bands_for_table(table, lib_bands), lib_bands);
-      if (out_bands < 2) continue;
-
-      float tx_scale = 1.0f;
-      if (table == QuantTable::DCT16X16 || table == QuantTable::DCT8X16) {
-        tx_scale = 0.85f;
-      } else if (table == QuantTable::DCT32X32 ||
-                 table == QuantTable::DCT16X32) {
-        tx_scale = 0.75f;
-      }
-
-      const bool is_rect =
-          (table == QuantTable::DCT8X16 || table == QuantTable::DCT16X32);
-      const size_t sq_lo = (table == QuantTable::DCT8X16) ? 0 : 1;
-      const size_t sq_hi = sq_lo + 1;
-      const float d_bar =
-          (table == QuantTable::DCT8X16) ? 11.3137085f : 22.627417f;
-      const float d_lo = (table == QuantTable::DCT8X16) ? 8.0f : 16.0f;
-      const float d_hi = (table == QuantTable::DCT8X16) ? 16.0f : 32.0f;
-
-      DctQuantWeightParams new_params = lib_enc.dct_params;
+    for (size_t idx = 0; idx < 8; ++idx) {
+      const DctTableSpec& spec = kDctTables[idx];
+      const size_t out_bands = spec.num_bands;
+      const float b = spec.b;
+      const float a = spec.a;
+      const float tx_decay = std::exp(-0.18f * b);
+      DctQuantWeightParams new_params;
       new_params.num_distance_bands = out_bands;
+
       for (size_t c = 0; c < 3; ++c) {
-        float lib_w[DctQuantWeightParams::kMaxDistanceBands];
-        lib_w[0] = lib_enc.dct_params.distance_bands[c][0];
-        for (size_t j = 1; j < lib_bands; ++j) {
-          lib_w[j] =
-              lib_w[j - 1] * mult_step(lib_enc.dct_params.distance_bands[c][j]);
-        }
+        const ChannelQMParams& p = kChannelParams[c];
+        const float ln_w_u0 =
+            std::log(p.W0) + p.gamma_d * t_d +
+            (p.s1 * b + p.s2 * (b / (0.5f + b)) -
+             p.rho * (a / (0.20f + b))) *
+                (1.0f - p.beta_blk * t_d);
+        const float D =
+            (p.D0 + p.Db * std::log(1.0f + b)) * (1.0f + p.eta_d * t_d);
+        const float kap = p.k0 - p.kb * (b / (0.25f + b));
+        const float a_mid = (p.a_mid0 - p.a_mid_d * t_d) * tx_decay;
 
-        float phys_diffs[DctQuantWeightParams::kMaxDistanceBands] = {};
-        float mean_phys_diff = 0.0f;
-        if (is_rect && out_bands > 2) {
-          for (size_t k = 2; k < out_bands; ++k) {
-            const float u =
-                static_cast<float>(k) / static_cast<float>(out_bands - 1);
-            const float pos = u * static_cast<float>(lib_bands - 1);
-            const size_t idx =
-                std::min<size_t>(static_cast<size_t>(pos), lib_bands - 2);
-            const float frac = pos - static_cast<float>(idx);
-            const float w_u =
-                lib_w[idx] * std::pow(lib_w[idx + 1] / lib_w[idx], frac);
-            const float f_phys = u * ((d_bar - 1.0f) / d_bar);
-            const float u_lo = f_phys * (d_lo / (d_lo - 1.0f));
-            const float u_hi = f_phys * (d_hi / (d_hi - 1.0f));
-            const float l_anchor = 0.5f * interp_sq_log_w(sq_lo, c, u_lo) +
-                                   0.5f * interp_sq_log_w(sq_hi, c, u_hi);
-            phys_diffs[k] = l_anchor - std::log(w_u);
-            mean_phys_diff += phys_diffs[k];
-          }
-          mean_phys_diff /= static_cast<float>(out_bands - 2);
-        }
+        auto eval_ln_w = [&](float u) -> float {
+          const float v = (u - kU0) / (1.0f - kU0);
+          const float phi = (1.0f - kap) * v + kap * v * std::abs(v);
+          const float s = v - 0.34f;
+          const float hf_dec =
+              (c == 1 || s <= 0.0f) ? 0.45f : ((c == 0) ? 0.90f : 1.10f);
+          const float psi = a_mid * s * (1.15f - hf_dec * t_d * v);
+          return ln_w_u0 - D * phi + psi;
+        };
 
-        const float a_mid = a_mid_base * kChannelMid[c] * tx_scale;
-        constexpr float kAlphaRect[3] = {0.20f, 0.25f, 0.20f};
-        float target_w[DctQuantWeightParams::kMaxDistanceBands];
-        for (size_t k = 0; k < out_bands; ++k) {
+        float target_w[DctQuantWeightParams::kMaxDistanceBands] = {};
+        const float u1 = 1.0f / static_cast<float>(out_bands - 1);
+        const float ln_w_1 = eval_ln_w(u1);
+        const float ln_w_0 =
+            (u1 > kU0 + 1e-4f)
+                ? (ln_w_u0 - (kU0 / (u1 - kU0)) * (ln_w_1 - ln_w_u0))
+                : eval_ln_w(0.0f);
+        target_w[0] = std::exp(ln_w_0);
+        target_w[1] = std::exp(ln_w_1);
+        for (size_t k = 2; k < out_bands; ++k) {
           const float u =
               static_cast<float>(k) / static_cast<float>(out_bands - 1);
-          const float pos = u * static_cast<float>(lib_bands - 1);
-          const size_t idx =
-              std::min<size_t>(static_cast<size_t>(pos), lib_bands - 2);
-          const float frac = pos - static_cast<float>(idx);
-          const float w_u =
-              lib_w[idx] * std::pow(lib_w[idx + 1] / lib_w[idx], frac);
-          float delta_l = 0.0f;
-          if (k >= 2 && out_bands > 2) {
-            const float v =
-                static_cast<float>(k - 1) / static_cast<float>(out_bands - 2);
-            const float c0 =
-                (num_blocks < 16384)
-                    ? 0.38f
-                    : ((num_blocks >= 40000)
-                           ? 0.30f
-                           : (1.58f / static_cast<float>(out_bands - 2)));
-            const float s = v - c0;
-            const float hf_decay =
-                (c == 1 || s <= 0.0f)
-                    ? 0.45f
-                    : ((c == 0) ? ((num_blocks >= 40000) ? 0.95f : 0.85f)
-                                : ((num_blocks >= 40000) ? 1.15f : 1.05f));
-            const float lf_gain = (num_blocks >= 40000) ? 1.16f : 1.15f;
-            delta_l = a_mid * s * (lf_gain - hf_decay * t_d * v);
-            if (is_rect && num_blocks >= 28000) {
-              const float raw_diff =
-                  (c == 1) ? (phys_diffs[k] - mean_phys_diff)
-                           : std::min(0.0f, phys_diffs[k]);
-              delta_l += kAlphaRect[c] * Clamp1(raw_diff, -0.45f, 0.35f);
-            }
-          }
-          target_w[k] = w_u * std::exp(delta_l);
+          target_w[k] = std::exp(eval_ln_w(u));
         }
 
         new_params.distance_bands[c][0] = target_w[0];
@@ -427,18 +357,12 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
           new_params.distance_bands[c][k] =
               inv_mult_step(target_w[k] / target_w[k - 1]);
         }
-        for (size_t k = out_bands; k < DctQuantWeightParams::kMaxDistanceBands;
-             ++k) {
-          new_params.distance_bands[c][k] = 0.0f;
-        }
       }
-      encodings[i] = QuantEncoding::DCT(new_params);
-      any_custom = true;
+      encodings[static_cast<size_t>(spec.table)] =
+          QuantEncoding::DCT(new_params);
     }
-    if (any_custom) {
-      JXL_RETURN_IF_ERROR(DequantMatricesSetCustom(dequant_matrices, encodings,
-                                                   modular_frame_encoder));
-    }
+    JXL_RETURN_IF_ERROR(DequantMatricesSetCustom(dequant_matrices, encodings,
+                                                 modular_frame_encoder));
   }
   return true;
 }

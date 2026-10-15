@@ -594,100 +594,15 @@ void SimplifyInvisible(Image3F* image, const ImageF& alpha, bool lossless) {
   }
 }
 
-struct PixelStatsForChromacityAdjustment {
-  float dx = 0;
-  float db = 0;
-  float exposed_blue = 0;
-  static constexpr size_t kTopK = 8;
-  static inline void InsertTopK(float v, float top[kTopK]) {
-    if (v <= top[kTopK - 1]) return;
-    size_t i = kTopK - 1;
-    while (i > 0 && v > top[i - 1]) {
-      top[i] = top[i - 1];
-      --i;
-    }
-    top[i] = v;
-  }
-  static float CalcPlane(const ImageF* JXL_RESTRICT plane, const Rect& rect) {
-    float xtop[kTopK] = {};
-    float ytop[kTopK] = {};
-    for (size_t ty = 1; ty < rect.ysize(); ++ty) {
-      for (size_t tx = 1; tx < rect.xsize(); ++tx) {
-        float cur = rect.Row(plane, ty)[tx];
-        float prev_row = rect.Row(plane, ty - 1)[tx];
-        float prev = rect.Row(plane, ty)[tx - 1];
-        InsertTopK(std::abs(cur - prev), xtop);
-        InsertTopK(std::abs(cur - prev_row), ytop);
-      }
-    }
-    const size_t idx = (rect.xsize() * rect.ysize() >= 64) ? (kTopK - 1) : 0;
-    return std::max(xtop[idx], ytop[idx]);
-  }
-  void CalcExposedBlue(const ImageF* JXL_RESTRICT plane_y,
-                       const ImageF* JXL_RESTRICT plane_b, const Rect& rect) {
-    float eb = 0;
-    float xmax = 0;
-    float ymax = 0;
-    for (size_t ty = 1; ty < rect.ysize(); ++ty) {
-      for (size_t tx = 1; tx < rect.xsize(); ++tx) {
-        float cur_y = rect.Row(plane_y, ty)[tx];
-        float cur_b = rect.Row(plane_b, ty)[tx];
-        float exposed_b = cur_b - cur_y * 1.2;
-        float diff_b = cur_b - cur_y;
-        float prev_row = rect.Row(plane_b, ty - 1)[tx];
-        float prev = rect.Row(plane_b, ty)[tx - 1];
-        float diff_prev_row = prev_row - rect.Row(plane_y, ty - 1)[tx];
-        float diff_prev = prev - rect.Row(plane_y, ty)[tx - 1];
-        xmax = std::max(xmax, std::abs(diff_b - diff_prev));
-        ymax = std::max(ymax, std::abs(diff_b - diff_prev_row));
-        if (exposed_b >= 0) {
-          exposed_b *= std::abs(cur_b - prev) + std::abs(cur_b - prev_row);
-          eb = std::max(eb, exposed_b);
-        }
-      }
-    }
-    exposed_blue = eb;
-    db = std::max(xmax, ymax);
-  }
-  void Calc(const Image3F* JXL_RESTRICT opsin, const Rect& rect) {
-    dx = CalcPlane(&opsin->Plane(0), rect);
-    CalcExposedBlue(&opsin->Plane(1), &opsin->Plane(2), rect);
-  }
-  int HowMuchIsXChannelPixelized(float d_scale) const {
-    if (dx >= 0.026f * d_scale) {
-      return 3;
-    }
-    if (dx >= 0.022f * d_scale) {
-      return 2;
-    }
-    if (dx >= 0.015f) {
-      return 1;
-    }
-    return 0;
-  }
-  int HowMuchIsBChannelPixelized(float d_scale) const {
-    int add = exposed_blue >= 0.13f ? 1 : 0;
-    if (db > 0.38f * d_scale) {
-      return 2 + add;
-    }
-    if (db > 0.33f * d_scale) {
-      return 1 + add;
-    }
-    if (db > 0.28f) {
-      return add;
-    }
-    return 0;
-  }
-};
-
 void ComputeChromacityAdjustments(const CompressParams& cparams,
                                   const Image3F& opsin, const Rect& rect,
                                   FrameHeader* frame_header) {
+  (void)opsin;
+  (void)rect;
   if (frame_header->encoding != FrameEncoding::kVarDCT ||
       cparams.max_error_mode) {
     return;
   }
-  // 1) Distance based approach for chromacity adjustment:
   float x_qm_scale_steps[3] = {2.5f, 5.5f, 9.5f};
   frame_header->x_qm_scale = 3;
   for (float x_qm_scale_step : x_qm_scale_steps) {
@@ -695,23 +610,7 @@ void ComputeChromacityAdjustments(const CompressParams& cparams,
       frame_header->x_qm_scale++;
     }
   }
-  // 2) Pixel-based approach for chromacity adjustment:
-  // look at the individual pixels and make a guess how difficult
-  // the image would be based on the worst case pixel.
-  PixelStatsForChromacityAdjustment pixel_stats;
-  if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-    pixel_stats.Calc(&opsin, rect);
-  }
-  const float d_scale =
-      1.0f +
-      0.26f * Clamp1(cparams.original_butteraugli_distance - 0.72f, 0.0f, 1.05f);
-  // For X take the most severe adjustment.
-  frame_header->x_qm_scale = std::max<int>(
-      frame_header->x_qm_scale,
-      2 + pixel_stats.HowMuchIsXChannelPixelized(d_scale));
-  // B only adjusted by pixel-based approach.
-  frame_header->b_qm_scale =
-      2 + pixel_stats.HowMuchIsBChannelPixelized(d_scale);
+  frame_header->b_qm_scale = 2;
 }
 
 void ComputeNoiseParams(const CompressParams& cparams, bool streaming_mode,
@@ -1279,9 +1178,11 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
                           ModularFrameEncoder* enc_modular, AuxOut* aux_out) {
   PassesSharedState& shared = enc_state->shared;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
-  JXL_RETURN_IF_ERROR(DequantMatricesEncode(memory_manager, shared.matrices,
-                                            writer, LayerType::Quant, aux_out,
-                                            enc_modular));
+  if (!enc_state->streaming_mode) {
+    JXL_RETURN_IF_ERROR(DequantMatricesEncode(memory_manager, shared.matrices,
+                                              writer, LayerType::Quant, aux_out,
+                                              enc_modular));
+  }
   size_t num_histo_bits = CeilLog2Nonzero(shared.frame_dim.num_groups);
   if (!enc_state->streaming_mode && num_histo_bits != 0) {
     JXL_RETURN_IF_ERROR(
@@ -2034,21 +1935,23 @@ void RemoveUnusedHistograms(EntropyEncodingData& codes) {
 
 StatusOr<std::unique_ptr<BitWriter>> OutputAcGlobal(
     PassesEncoderState& enc_state, const FrameDimensions& frame_dim,
-    AuxOut* aux_out) {
+    ModularFrameEncoder* enc_modular, AuxOut* aux_out) {
   JXL_ENSURE(frame_dim.num_groups > 1);
   JxlMemoryManager* memory_manager = enc_state.memory_manager();
+  const PassesSharedState& shared = enc_state.shared;
   std::unique_ptr<BitWriter> writer =
       jxl::make_unique<BitWriter>(memory_manager);
+  JXL_RETURN_IF_ERROR(DequantMatricesEncode(memory_manager, shared.matrices,
+                                            writer.get(), LayerType::Quant,
+                                            aux_out, enc_modular));
   {
     size_t num_histo_bits = CeilLog2Nonzero(frame_dim.num_groups);
     JXL_RETURN_IF_ERROR(
-        writer->WithMaxBits(num_histo_bits + 1, LayerType::Ac, aux_out, [&] {
-          writer->Write(1, 1);  // default dequant matrices
+        writer->WithMaxBits(num_histo_bits, LayerType::Ac, aux_out, [&] {
           writer->Write(num_histo_bits, frame_dim.num_dc_groups - 1);
           return true;
         }));
   }
-  const PassesSharedState& shared = enc_state.shared;
   for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
     // Encode coefficient orders.
     size_t order_bits = 0;
@@ -2249,7 +2152,8 @@ JXL_NOINLINE Status EncodeFrameStreaming(
   if (frame_header.encoding == FrameEncoding::kVarDCT) {
     JXL_ASSIGN_OR_RETURN(
         std::unique_ptr<BitWriter> writer,
-        OutputAcGlobal(*enc_state, frame_header.ToFrameDimensions(), aux_out));
+        OutputAcGlobal(*enc_state, frame_header.ToFrameDimensions(),
+                       enc_modular.get(), aux_out));
     JXL_RETURN_IF_ERROR(writer->Shrink());
     if (streaming) {
       JXL_RETURN_IF_ERROR(write_group_section(std::move(*writer).TakeBytes()));

@@ -1295,11 +1295,10 @@ TEST(JxlTest, RoundtripDisablePerceptual) {
 
   PackedPixelFile ppf_out;
 
-  size_t expected_size = 518365;
+  size_t expected_size = 419699;
   EXPECT_NEAR(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out),
               expected_size, 4000);
-  // TODO(veluca): figure out why we can't get below this value.
-  EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 11.0);
+  EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 3.5);
 }
 
 TEST(JxlTest, RoundtripNoise) {
