@@ -41,9 +41,14 @@
 #include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/enc_ac_strategy.h"
 #include "lib/jxl/enc_adaptive_quantization.h"
+#include "lib/jxl/enc_ans.h"
+#include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_chroma_from_luma.h"
+#include "lib/jxl/enc_coeff_order.h"
+#include "lib/jxl/enc_entropy_coder.h"
 #include "lib/jxl/enc_gaborish.h"
+#include "lib/jxl/enc_group.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_noise.h"
 #include "lib/jxl/enc_params.h"
@@ -1063,6 +1068,7 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   }
   if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
       cparams.speed_tier > SpeedTier::kWombat ||
+      !cparams.use_full_image_heuristics ||
       frame_header.loop_filter.epf_iters == 0 ||
       frame_header.upsampling != 1) {
     FillPlane(static_cast<uint8_t>(4), &epf_sharpness, Rect(epf_sharpness));
@@ -1205,6 +1211,245 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     }
   }
 
+  return true;
+}
+
+Status BuildPass1TokenCostModel(const FrameHeader& frame_header,
+                                PassesEncoderState* enc_state,
+                                const Image3F& opsin, const Rect& rect,
+                                float cost_delta, ThreadPool* pool,
+                                AcTokenCostModel* token_cost_model) {
+  const CompressParams& cparams = enc_state->cparams;
+  PassesSharedState& shared = enc_state->shared;
+  const FrameDimensions& frame_dim = shared.frame_dim;
+  ImageI& raw_quant_field = shared.raw_quant_field;
+  AcStrategyImage& ac_strategy = shared.ac_strategy;
+  BlockCtxMap& block_ctx_map = shared.block_ctx_map;
+  JxlMemoryManager* memory_manager = enc_state->memory_manager();
+
+  FindBestBlockEntropyModel(cparams, raw_quant_field, ac_strategy,
+                            &block_ctx_map);
+  if (enc_state->coeffs.empty()) {
+    JXL_ASSIGN_OR_RETURN(
+        std::unique_ptr<ACImageT<int32_t>> coeffs,
+        ACImageT<int32_t>::Make(memory_manager, kGroupDim * kGroupDim,
+                                frame_dim.num_groups));
+    enc_state->coeffs.emplace_back(std::move(coeffs));
+  }
+  JXL_ASSIGN_OR_RETURN(
+      Image3F pass1_dc,
+      Image3F::Create(memory_manager, frame_dim.xsize_blocks,
+                      frame_dim.ysize_blocks));
+  const auto compute_pass1_coeffs = [&](size_t group_idx,
+                                        size_t /*thread*/) -> Status {
+    return ComputeCoefficients(group_idx, enc_state, opsin, rect, &pass1_dc);
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups,
+                                ThreadPool::NoInit, compute_pass1_coeffs,
+                                "Pass1 ComputeCoeffs"));
+
+  token_cost_model->coeff_orders.resize(kCoeffOrderMaxSize);
+  auto used_orders_info =
+      ComputeUsedOrders(cparams.speed_tier, ac_strategy, Rect(raw_quant_field));
+  uint32_t pass1_used_orders = 0;
+  constexpr uint32_t kAllOrdersMask = (1u << kNumOrders) - 1u;
+  JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
+      cparams.speed_tier, *enc_state->coeffs[0], ac_strategy, frame_dim,
+      pass1_used_orders, /*prev_used_acs=*/0, kAllOrdersMask,
+      used_orders_info.second, token_cost_model->coeff_orders.data()));
+
+  ZeroFillImage(&shared.quant_dc);
+  JXL_ASSIGN_OR_RETURN(
+      token_cost_model->pass1_nzeros,
+      Image3I::Create(memory_manager, frame_dim.xsize_blocks,
+                      frame_dim.ysize_blocks));
+  std::vector<std::vector<Token>> pass1_tokens(frame_dim.num_groups);
+  std::vector<Image3I> pass1_tmp_nzeros;
+  const auto tok_init = [&](const size_t num_threads) -> Status {
+    pass1_tmp_nzeros.resize(num_threads);
+    return true;
+  };
+  const auto tok_group = [&](const uint32_t group_index,
+                             const size_t thread) -> Status {
+    if (pass1_tmp_nzeros[thread].xsize() == 0) {
+      JXL_ASSIGN_OR_RETURN(
+          pass1_tmp_nzeros[thread],
+          Image3I::Create(memory_manager, kGroupDimInBlocks,
+                          kGroupDimInBlocks));
+    }
+    const Rect grect = frame_dim.BlockGroupRect(group_index);
+    const int32_t* JXL_RESTRICT ac_rows[3] = {
+        enc_state->coeffs[0]->PlaneRow(0, group_index, 0).ptr32,
+        enc_state->coeffs[0]->PlaneRow(1, group_index, 0).ptr32,
+        enc_state->coeffs[0]->PlaneRow(2, group_index, 0).ptr32,
+    };
+    JXL_RETURN_IF_ERROR(TokenizeCoefficients(
+        token_cost_model->coeff_orders.data(), grect, ac_rows, ac_strategy,
+        frame_header.chroma_subsampling, &pass1_tmp_nzeros[thread],
+        &pass1_tokens[group_index], shared.quant_dc, raw_quant_field,
+        block_ctx_map));
+    for (size_t c = 0; c < 3; ++c) {
+      for (size_t by = 0; by < grect.ysize(); ++by) {
+        const int32_t* JXL_RESTRICT src_r =
+            pass1_tmp_nzeros[thread].ConstPlaneRow(c, by);
+        int32_t* JXL_RESTRICT dst_r =
+            token_cost_model->pass1_nzeros.PlaneRow(c, grect.y0() + by) +
+            grect.x0();
+        memcpy(dst_r, src_r, grect.xsize() * sizeof(int32_t));
+      }
+    }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups, tok_init,
+                                tok_group, "Pass1 Tokenize"));
+
+  HistogramParams hist_params(cparams.speed_tier,
+                              block_ctx_map.NumACContexts());
+  if (cparams.speed_tier > SpeedTier::kTortoise) {
+    hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
+  }
+  if (cparams.decoding_speed_tier >= 1) {
+    hist_params.max_histograms = 6;
+  }
+  EntropyEncodingData pass1_codes;
+  JXL_ASSIGN_OR_RETURN(
+      size_t pass1_ac_bits,
+      BuildAndEncodeHistograms(memory_manager, hist_params,
+                               block_ctx_map.NumACContexts(), pass1_tokens,
+                               &pass1_codes, /*writer=*/nullptr, LayerType::Ac,
+                               /*aux_out=*/nullptr));
+  (void)pass1_ac_bits;
+
+  token_cost_model->block_ctx_map = block_ctx_map;
+  token_cost_model->cluster_of_ctx = pass1_codes.context_map;
+  token_cost_model->uint_config = pass1_codes.uint_config;
+  const size_t num_clusters = pass1_codes.encoding_info.size();
+  token_cost_model->tok_bits.assign(
+      num_clusters * AcTokenCostModel::kMaxTokenAlphabet, 12.5f);
+  token_cost_model->small_val_bits.resize(
+      num_clusters * AcTokenCostModel::kSmallValLimit);
+  for (size_t cl = 0; cl < num_clusters; ++cl) {
+    const auto& info_vec = pass1_codes.encoding_info[cl];
+    const float unseen_bits = pass1_codes.use_prefix_code ? 14.0f : 12.5f;
+    for (size_t tok = 0; tok < AcTokenCostModel::kMaxTokenAlphabet; ++tok) {
+      float b = unseen_bits;
+      if (tok < info_vec.size()) {
+        if (pass1_codes.use_prefix_code) {
+          if (info_vec.size() <= 1) {
+            b = 0.0f;
+          } else if (info_vec[tok].depth > 0) {
+            b = static_cast<float>(info_vec[tok].depth);
+          }
+        } else if (info_vec[tok].freq_ > 0) {
+          b = 12.0f - std::log2(static_cast<float>(info_vec[tok].freq_));
+        }
+      }
+      token_cost_model->tok_bits[cl * AcTokenCostModel::kMaxTokenAlphabet +
+                                 tok] = b;
+    }
+    for (uint32_t val = 0; val < AcTokenCostModel::kSmallValLimit; ++val) {
+      token_cost_model
+          ->small_val_bits[cl * AcTokenCostModel::kSmallValLimit + val] =
+          token_cost_model->LargeValBits(cl, val);
+    }
+  }
+
+  std::vector<size_t> strat_count(27, 0);
+  std::vector<size_t> qf_res_count(512, 0);
+  size_t total_first_blocks = 0;
+  for (size_t by = 0; by < frame_dim.ysize_blocks; ++by) {
+    AcStrategyRow acs_row = ac_strategy.ConstRow(by);
+    const int32_t* qf_row = raw_quant_field.ConstRow(by);
+    const int32_t* qf_top =
+        (by > 0) ? raw_quant_field.ConstRow(by - 1) : nullptr;
+    for (size_t bx = 0; bx < frame_dim.xsize_blocks; ++bx) {
+      AcStrategy acs = acs_row[bx];
+      if (!acs.IsFirstBlock()) continue;
+      const uint8_t st = acs.RawStrategy();
+      if (st < 27) strat_count[st]++;
+      int32_t pred_qf = qf_row[bx];
+      if (bx > 0 && by > 0) {
+        pred_qf = (qf_row[bx - 1] + qf_top[bx] + 1) >> 1;
+      } else if (bx > 0) {
+        pred_qf = qf_row[bx - 1];
+      } else if (by > 0) {
+        pred_qf = qf_top[bx];
+      }
+      const int32_t res_idx =
+          Clamp1<int32_t>(qf_row[bx] - pred_qf + 256, 0, 511);
+      qf_res_count[res_idx]++;
+      total_first_blocks++;
+    }
+  }
+  const float fb_denom = static_cast<float>(total_first_blocks) + 13.5f;
+  for (size_t st = 0; st < 27; ++st) {
+    token_cost_model->acs_strategy_bits[st] = -std::log2(
+        (static_cast<float>(strat_count[st]) + 0.5f) / fb_denom);
+  }
+  double qf_bits_sum = 0.0;
+  if (total_first_blocks > 0) {
+    const double inv_fb = 1.0 / static_cast<double>(total_first_blocks);
+    for (size_t i = 0; i < 512; ++i) {
+      if (qf_res_count[i] > 0) {
+        const double p = static_cast<double>(qf_res_count[i]) * inv_fb;
+        qf_bits_sum -= p * std::log2(p);
+      }
+    }
+  }
+  token_cost_model->qf_block_bits =
+      Clamp1(static_cast<float>(qf_bits_sum), 1.0f, 3.8f);
+
+  const size_t num_ctxs = block_ctx_map.num_ctxs;
+  token_cost_model->rdo_nzero_bits.resize(num_ctxs * kNonZeroBuckets * 65);
+  for (size_t nzero_ctx = 0; nzero_ctx < num_ctxs * kNonZeroBuckets;
+       ++nzero_ctx) {
+    const uint8_t cl = token_cost_model->cluster_of_ctx[nzero_ctx];
+    for (uint32_t nz = 0; nz <= 64; ++nz) {
+      token_cost_model->rdo_nzero_bits[nzero_ctx * 65 + nz] =
+          token_cost_model->ValBits(cl, nz);
+    }
+  }
+
+  token_cost_model->rdo_c_one.assign(num_ctxs * 32, 2.0f);
+  token_cost_model->rdo_c_slope.assign(num_ctxs * 32, 1.5f);
+  static constexpr size_t kNzSample[5] = {1, 2, 4, 8, 16};
+  static constexpr float kNzWeight[5] = {0.30f, 0.25f, 0.20f, 0.15f, 0.10f};
+  static constexpr float kPrevWeight[2] = {0.60f, 0.40f};
+  for (size_t bctx = 0; bctx < num_ctxs; ++bctx) {
+    const size_t z_off = block_ctx_map.ZeroDensityContextsOffset(bctx);
+    for (size_t kf = 0; kf < 31; ++kf) {
+      float b0_avg = 0.0f;
+      float b1_avg = 0.0f;
+      float b4_avg = 0.0f;
+      for (size_t ni = 0; ni < 5; ++ni) {
+        const size_t nz_ctx_off = kCoeffNumNonzeroContext[kNzSample[ni]];
+        for (size_t prev = 0; prev < 2; ++prev) {
+          const float w = kNzWeight[ni] * kPrevWeight[prev];
+          const size_t ctx = z_off + (nz_ctx_off + kf) * 2 + prev;
+          const uint8_t cl = token_cost_model->cluster_of_ctx[ctx];
+          b0_avg += w * token_cost_model->ValBits(cl, 0);
+          b1_avg += w * 0.5f *
+                    (token_cost_model->ValBits(cl, 1) +
+                     token_cost_model->ValBits(cl, 2));
+          b4_avg += w * 0.5f *
+                    (token_cost_model->ValBits(cl, 7) +
+                     token_cost_model->ValBits(cl, 8));
+        }
+      }
+      const float c_one =
+          Clamp1((b1_avg - b0_avg) +
+                     (0.25f + 0.035f * static_cast<float>(kf)) * b0_avg,
+                 0.85f, 6.0f);
+      const float c_slope = Clamp1(b4_avg - b1_avg, 0.65f, 4.5f);
+      token_cost_model->rdo_c_one[bctx * 32 + kf] = c_one;
+      token_cost_model->rdo_c_slope[bctx * 32 + kf] = c_slope;
+    }
+  }
+  static const float kBias = 0.13731742964354549f;
+  const float ratio = (cparams.butteraugli_distance + kBias) / (1.0f + kBias);
+  token_cost_model->bits_to_cost_mul =
+      0.428f * cost_delta * std::pow(ratio, 0.14f);
+  block_ctx_map = BlockCtxMap();
   return true;
 }
 
@@ -1433,6 +1678,33 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     }
     return true;
   };
+  const bool use_two_pass_rdo =
+      enable_rdo && !streaming_mode && cparams.use_full_image_heuristics;
+  ImageF initial_quant_field_base;
+  std::vector<ImageF> band_qf_base;
+  if (use_two_pass_rdo) {
+    band_qf_base.resize(12);
+    JXL_ASSIGN_OR_RETURN(
+        initial_quant_field_base,
+        ImageF::Create(memory_manager, initial_quant_field.xsize(),
+                       initial_quant_field.ysize()));
+    JXL_RETURN_IF_ERROR(
+        CopyImageTo(initial_quant_field, &initial_quant_field_base));
+    for (size_t c = 0; c < 3; ++c) {
+      for (size_t s = 0; s < 4; ++s) {
+        if (enc_state->band_qf[c][s].xsize() > 0 &&
+            enc_state->band_qf[c][s].ysize() > 0) {
+          JXL_ASSIGN_OR_RETURN(
+              band_qf_base[c * 4 + s],
+              ImageF::Create(memory_manager, enc_state->band_qf[c][s].xsize(),
+                             enc_state->band_qf[c][s].ysize()));
+          JXL_RETURN_IF_ERROR(
+              CopyImageTo(enc_state->band_qf[c][s], &band_qf_base[c * 4 + s]));
+        }
+      }
+    }
+  }
+
   size_t num_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks) *
                      DivCeil(frame_dim.ysize_blocks, acs_tile_dim_blocks);
   const auto prepare = [&](const size_t num_threads) -> Status {
@@ -1442,6 +1714,66 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   };
   JXL_RETURN_IF_ERROR(
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
+
+  if (use_two_pass_rdo) {
+    auto token_cost_model = jxl::make_unique<AcTokenCostModel>();
+    JXL_RETURN_IF_ERROR(BuildPass1TokenCostModel(
+        frame_header, enc_state, *opsin, rect, acs_heuristics.config.cost_delta,
+        pool, token_cost_model.get()));
+
+    JXL_RETURN_IF_ERROR(
+        CopyImageTo(initial_quant_field_base, &initial_quant_field));
+    for (size_t c = 0; c < 3; ++c) {
+      for (size_t s = 0; s < 4; ++s) {
+        if (band_qf_base[c * 4 + s].xsize() > 0 &&
+            band_qf_base[c * 4 + s].ysize() > 0) {
+          JXL_RETURN_IF_ERROR(
+              CopyImageTo(band_qf_base[c * 4 + s], &enc_state->band_qf[c][s]));
+        }
+      }
+    }
+    acs_heuristics.config.token_cost_model = token_cost_model.get();
+
+    auto process_tile_pass2 = [&](const uint32_t tid,
+                                  const size_t thread) -> Status {
+      size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks);
+      size_t tx = tid % n_enc_tiles;
+      size_t ty = tid / n_enc_tiles;
+      size_t gby0 = ty * acs_tile_dim_blocks;
+      size_t gby1 =
+          std::min((ty + 1) * acs_tile_dim_blocks, frame_dim.ysize_blocks);
+      size_t gbx0 = tx * acs_tile_dim_blocks;
+      size_t gbx1 =
+          std::min((tx + 1) * acs_tile_dim_blocks, frame_dim.xsize_blocks);
+      Rect group_rect(gbx0, gby0, gbx1 - gbx0, gby1 - gby0);
+
+      JXL_RETURN_IF_ERROR(
+          acs_heuristics.ProcessRect(group_rect, cmap, &ac_strategy, thread));
+
+      quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                  &raw_quant_field);
+
+      if (cparams.speed_tier <= SpeedTier::kHare) {
+        for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+          size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+          for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+            size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+            Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+            JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+                r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+                &quantizer, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat,
+                thread, &cmap,
+                /*shrink_towards_zero=*/cparams.noise == Override::kOn,
+                enc_state->x_qm_multiplier, enc_state->b_qm_multiplier));
+          }
+        }
+      }
+      return true;
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
+                                  process_tile_pass2, "Enc Heuristics P2"));
+    acs_heuristics.config.token_cost_model = nullptr;
+  }
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
 

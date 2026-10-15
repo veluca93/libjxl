@@ -13,10 +13,12 @@
 #include <limits>
 
 #include "lib/jxl/chroma_from_luma.h"
+#include "lib/jxl/coeff_order.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/frame_dimensions.h"
 #include "lib/jxl/image.h"
 #include "lib/jxl/memory_manager_internal.h"
+#include "lib/jxl/pack_signed.h"
 #include "lib/jxl/quant_weights.h"
 
 #undef HWY_TARGET_INCLUDE
@@ -296,6 +298,7 @@ namespace HWY_NAMESPACE {
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Abs;
 using hwy::HWY_NAMESPACE::AbsDiff;
+using hwy::HWY_NAMESPACE::ConvertTo;
 using hwy::HWY_NAMESPACE::CopySignToAbs;
 using hwy::HWY_NAMESPACE::Eq;
 using hwy::HWY_NAMESPACE::Floor;
@@ -320,11 +323,13 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                        const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
                        float* full_scratch_space, uint32_t* quantized,
-                       float& entropy, float& q_out, uint8_t& act_out) {
+                       float best_cost_bound, float& entropy, float& q_out,
+                       uint8_t& act_out) {
   entropy = 0.0f;
   float* mem = full_scratch_space;
   float* pixels_buf = full_scratch_space + AcStrategy::kMaxCoeffArea;
   float* scratch_space = full_scratch_space + 2 * AcStrategy::kMaxCoeffArea;
+  float* row_buf = full_scratch_space + 3 * AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
 
   const size_t cov_x = acs.covered_blocks_x();
@@ -410,18 +415,14 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
   act_out = 0;
 
   const HWY_CAPPED(float, 8) df8;
+  const HWY_CAPPED(int32_t, kBlockDim) di;
   const auto zero = Zero(df);
   const auto one = Set(df, 1.0f);
-  const auto quant = Set(df, quant_norm16);
 
-  float* w_row = pixels_buf;
-  float* t0_row = pixels_buf + AcStrategy::kMaxBlockDim;
-  float* cw_row = pixels_buf + 2 * AcStrategy::kMaxBlockDim;
-  float* w_q_row = pixels_buf + 3 * AcStrategy::kMaxBlockDim;
-  float* t_tr_row = pixels_buf + 4 * AcStrategy::kMaxBlockDim;
-  float* t0_q_row = pixels_buf + 5 * AcStrategy::kMaxBlockDim;
-  float loss = 0.0f;
-  float loss2 = 0.0f;
+  float* w_row = row_buf;
+  float* t0_row = row_buf + AcStrategy::kMaxBlockDim;
+  float* cw_row = row_buf + 2 * AcStrategy::kMaxBlockDim;
+  float* cs_row = row_buf + 3 * AcStrategy::kMaxBlockDim;
 
   const bool is_partial_block =
       (kPartialBlockKinds &
@@ -429,89 +430,90 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
   const float inv_nblocks = 1.0f / static_cast<float>(num_blocks);
   const bool use_csf_w = (config.band_qf_stride > 0) && !is_partial_block;
   const bool use_q_rdo = (config.quant_scale > 0.0f) && !is_partial_block;
+  const AcTokenCostModel* JXL_RESTRICT tcm = config.token_cost_model;
+  const bool use_tcm = (tcm != nullptr);
 
-  static constexpr float kBandRescaleMix[4] = {0.72f, 0.84f, 0.96f, 1.00f};
-  static constexpr float kBandErrWeight[4] = {0.81f, 0.96f, 1.18f, 1.40f};
-  static constexpr float kAlphaBlk[4][3] = {
-      {0.09624f, 0.19962f, 0.13015f},
-      {0.30558f, 0.07055f, 0.06271f},
-      {0.05012f, 0.19465f, 0.04615f},
-      {0.20420f, 0.17975f, 0.03865f},
-  };
-  static constexpr float kAlphaVal[4][3] = {
-      {0.27450f, 1.12558f, 0.98950f},
-      {0.46522f, 0.40946f, 0.36582f},
-      {0.28035f, 0.91827f, 1.55815f},
-      {0.26873f, 0.68864f, 1.20822f},
-  };
-  static constexpr float kAlphaValNoRdo[4][3] = {
-      {0.11965f, 0.49060f, 0.43129f},
-      {0.20277f, 0.17847f, 0.15945f},
-      {0.12220f, 0.40024f, 0.67915f},
-      {0.11713f, 0.30015f, 0.52662f},
-  };
-
-  int32_t quant_orig = 1;
-  float q_block_orig = quant_norm16;
-  float dz_w = 0.0f;
-  float dz_w_rt = 0.0f;
-  float hr_w = 1.0f;
-  float dct8_err_min = 0.0f;
-  float zero_thres_q[3][8] = {};
-  float trial_thres[4] = {0.58f, 0.64f, 0.64f, 0.64f};
-  if (use_q_rdo) {
-    quant_orig = Quantizer::ClampVal(q_pool * config.inv_global_scale + 0.5f);
-    q_block_orig = config.quant_scale * quant_orig;
-    const float d = config.butteraugli_distance;
-    dz_w = use_csf_w ? Clamp1((d - 0.35f) / (d + 0.55f) * 1.55f, 0.0f, 1.0f)
-                     : 0.0f;
-    dz_w_rt = Clamp1((d - 0.50f) / (d + 0.55f) * 1.65f, 0.0f, 1.0f);
-    hr_w = 1.0f - dz_w_rt;
-    dct8_err_min =
-        use_csf_w ? (0.42f + 1.85f * Clamp1(d - 0.95f, 0.0f, 1.20f)) : 0.0f;
-    if (cx > 1 || cy > 1) {
-      const float sub = Clamp1(0.003f * cx * cy, 0.0f, 0.08f);
-      for (int i = 0; i < 4; ++i) {
-        trial_thres[i] = std::max(0.54f, trial_thres[i] - sub);
+  const float d = config.butteraugli_distance;
+  float rate_scale = 1.0f;
+  float dist_scale = 1.0f;
+  if (!is_partial_block) {
+    const float b = 0.5f * static_cast<float>(acs.log2_covered_blocks());
+    const float a = 0.5f * static_cast<float>(FloorLog2Nonzero(cx / cy));
+    if (b > 0.0f) {
+      const float k_d =
+          use_csf_w
+              ? (-0.372f + 0.042f * Clamp1((d - 0.5f) / 0.35f, 0.0f, 1.0f))
+              : -0.40f;
+      dist_scale = 1.0f / (1.0f + k_d / (d + 1.4f));
+      const float b_hi = std::max(0.0f, b - 2.0f);
+      if (use_tcm) {
+        const float d_ramp = Clamp1((d - 0.50f) / 0.35f, 0.0f, 1.0f);
+        const float hq_mb = 1.0f + 0.18f * (1.0f - d_ramp);
+        rate_scale =
+            hq_mb * (1.0f + 0.05f * a + 0.25f * b_hi / (0.06f + b_hi));
+      } else {
+        const float mb_d =
+            use_csf_w
+                ? (0.985f + 0.015f * Clamp1((d - 0.5f) / 1.0f, 0.0f, 1.0f))
+                : 1.0f;
+        rate_scale =
+            dist_scale * mb_d *
+            (1.0f + 0.540f * (b * b) / (0.65f + b * b) + 0.110f * a +
+             0.74f * b_hi / (0.06f + b_hi));
       }
     }
-    for (size_t c = 0; c < 3; ++c) {
-      float bq_p[4] = {q_block_orig, q_block_orig, q_block_orig, q_block_orig};
-      if (use_csf_w) {
-        for (size_t s = 0; s < 4; ++s) {
-          float sq_sum = 0.0f;
-          for (size_t iy = 0; iy < cov_y; ++iy) {
-            for (size_t ix = 0; ix < cov_x; ++ix) {
-              const float old_q =
-                  std::max(config.Quant(bx0 + ix, by0 + iy), 1e-4f);
-              const float rescale = q_pool / old_q;
-              const float band_rescale =
-                  (rescale > 1.0f)
-                      ? (1.0f + kBandRescaleMix[s] * (rescale - 1.0f))
-                      : rescale;
-              const float v =
-                  config.BandQuant(c, s, bx0 + ix, by0 + iy) * band_rescale;
-              sq_sum += v * v;
-            }
-          }
-          bq_p[s] = std::sqrt(sq_sum * inv_nblocks);
-        }
+  } else {
+    const AcStrategyType st = acs.Strategy();
+    const float s = (st == AcStrategyType::IDENTITY) ? 3.0f
+                    : (st == AcStrategyType::DCT2X2) ? 2.0f
+                    : (st == AcStrategyType::DCT4X4) ? 1.0f
+                                                     : 0.5f;
+    const float a =
+        (st == AcStrategyType::DCT4X8 || st == AcStrategyType::DCT8X4) ? 0.5f
+                                                                       : 0.0f;
+    if (use_tcm) {
+      rate_scale = 1.0f + 0.04f * a;
+      if (s > 1.0f && d < 5.0f) {
+        const float d_ramp = Clamp1((d - 0.50f) / 0.35f, 0.0f, 1.0f);
+        const float loc_favor = 0.08f + 0.10f * (1.0f - d_ramp);
+        const float w_d = (5.0f - d) / 5.0f;
+        rate_scale -= loc_favor * w_d * w_d;
       }
-      ComputeBandThresholds(c, acs.Strategy(), cx, cy, q_block_orig, bq_p,
-                            zero_thres_q[c], dz_w);
+    } else if (s <= 1.0f) {
+      const float s2 = s * s;
+      rate_scale = 1.0f + (0.002f + 0.348f * s2) * s2 + 0.104f * a;
+      if (d > 4.0f) {
+        rate_scale += 0.5f * std::min(1.0f, 8.0f / (d - 4.0f));
+      }
+    } else {
+      rate_scale = 0.9556f + 0.11595f * s;
+      if (d < 5.0f) {
+        const float d_ramp =
+            (config.band_qf_stride > 0)
+                ? Clamp1((d - 0.5f) / 0.35f, 0.0f, 1.0f)
+                : 0.0f;
+        const float loc_favor =
+            (config.band_qf_stride > 0)
+                ? ((0.400f - 0.015f * (3.0f - s)) -
+                   (0.050f + 0.075f * (3.0f - s)) * d_ramp)
+                : 0.400f;
+        const float w_d = (5.0f - d) / 5.0f;
+        rate_scale -= loc_favor * w_d * w_d;
+      }
     }
   }
 
-  int32_t max_quant = 0;
-  for (size_t c : {1, 0, 2}) {
-    const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
-    const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
-    const auto cmap_factor = Set(df, cmap_factors[c]);
-
-    float band_w[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float zero_thres[8] = {0.50f, 0.50f, 0.50f, 0.50f, 0.0f, 0.0f, 0.0f, 0.0f};
+  float bq_c[3][4] = {};
+  float q_all_c[3] = {quant_norm16, quant_norm16, quant_norm16};
+  float band_w_c[3][4];
+  float zero_thres_c[3][8];
+  for (size_t c = 0; c < 3; ++c) {
+    for (size_t s = 0; s < 4; ++s) {
+      band_w_c[c][s] = 1.0f;
+      zero_thres_c[c][s] = 0.50f;
+      zero_thres_c[c][4 + s] = 0.0f;
+    }
     if (use_csf_w) {
-      float bq[4];
       for (size_t s = 0; s < 4; ++s) {
         float sq_sum = 0.0f;
         for (size_t iy = 0; iy < cov_y; ++iy) {
@@ -520,227 +522,180 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
             sq_sum += v * v;
           }
         }
-        bq[s] = std::sqrt(sq_sum * inv_nblocks);
+        bq_c[c][s] = std::sqrt(sq_sum * inv_nblocks);
       }
-      ComputeBandThresholds(c, acs.Strategy(), cx, cy, quant_norm16, bq,
-                            zero_thres);
+      q_all_c[c] = 0.30f * bq_c[c][0] + 0.30f * bq_c[c][1] +
+                   0.25f * bq_c[c][2] + 0.15f * bq_c[c][3];
+      ComputeBandThresholds(c, acs.Strategy(), cx, cy, q_all_c[c], bq_c[c],
+                            zero_thres_c[c]);
       for (size_t s = 0; s < 4; ++s) {
-        band_w[s] = Clamp1(1.0f - 2.2f * zero_thres[4 + s], 0.88f, 1.12f);
+        band_w_c[c][s] =
+            Clamp1(1.0f - 2.2f * zero_thres_c[c][4 + s], 0.88f, 1.12f);
       }
     }
+  }
 
-    float band_w_q[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    if (use_q_rdo) {
-      for (size_t s = 0; s < 4; ++s) {
-        band_w_q[s] =
-            (use_csf_w ? kBandErrWeight[s] : 1.0f) *
-            Clamp1(1.0f - 3.5f * zero_thres_q[c][4 + s], 0.88f, 1.12f);
-      }
-    }
-    const auto q_block_c_v = Set(df, q_block_orig * config.qm_multiplier[c]);
-    const auto bias_c_v = Set(df, kDefaultQuantBias[c]);
-    const auto bias3_v = Set(df, kDefaultQuantBias[3]);
+  const float inv_npixels =
+      1.0f / static_cast<float>(num_blocks * kDCTBlockSize);
+  const float q_base = std::max(config.base_quant, 1e-4f);
+  const float q_llf_fixed =
+      (num_blocks == 1) ? (use_csf_w ? std::max(q_all_c[1], 1e-4f) : q_base)
+                        : quant_norm16;
 
-    auto entropy_v = Zero(df);
-    auto nzeros_v = Zero(df);
-    auto r0_v = Zero(df);
-    auto e0_v = Zero(df);
-    auto quad_v0 = Zero(df);
-    auto quad_v1 = Zero(df);
-    auto quad_v2 = Zero(df);
-    auto quad_v3 = Zero(df);
-    HWY_ALIGN float quad_row8[2][8] = {};
+  auto eval_q = [&](float q_cand, bool rdo_mode, float& out_rate,
+                    float& out_loss_scalar) {
+    out_rate = 0.0f;
+    float loss = 0.0f;
+    float loss2 = 0.0f;
+    const auto quant_ac_v = Set(df, q_cand);
+    const auto q_llf_v = Set(df, q_llf_fixed);
+    const uint32_t qf_cand =
+        use_tcm ? Clamp1<uint32_t>(
+                      static_cast<uint32_t>(
+                          std::lround(q_cand * config.inv_global_scale)),
+                      1u, 255u)
+                : 1u;
+    const int ord = kStrategyOrder[acs.RawStrategy()];
+    int32_t* JXL_RESTRICT q_coeffs = reinterpret_cast<int32_t*>(pixels_buf);
 
-    for (size_t v8 = 0; v8 < kBlockDim; ++v8) {
-      const bool v8_hi = (v8 >= 4);
-      for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
-        const bool is_llf = (v8 == 0 && u8 == 0);
-        const uint8_t s = kCoeffBand[v8][u8];
-        const size_t hfix =
-            (static_cast<size_t>(v8_hi) * 2 + static_cast<size_t>(u8 >= 4));
-        const float csf =
-            use_csf_w ? config.csf_w[c][v8 * kBlockDim + u8] : 1.0f;
-        const float ws = band_w[s] * csf;
-        const float dz = is_llf ? 0.0f : zero_thres[4 + s];
-        const float t0 = 0.50f + ((dz >= 0.0f) ? dz : (0.5f * dz));
-        const float cw =
-            (!use_csf_w || is_llf)
-                ? 1.0f
-                : (0.94f + 0.0085f * static_cast<float>(v8 + u8));
-        for (size_t ix = 0; ix < cx; ++ix) {
-          w_row[u8 * cx + ix] = ws;
-          t0_row[u8 * cx + ix] = t0;
-          cw_row[u8 * cx + ix] = cw;
-        }
-        if (use_q_rdo) {
-          const float w_q = is_llf ? 0.0f : band_w_q[s];
-          const float t_tr =
-              is_llf ? 1e30f : (trial_thres[hfix] + zero_thres_q[c][4 + s]);
-          const float t0_q =
-              is_llf ? 1e30f
-                     : (use_csf_w
-                            ? (zero_thres_q[c][hfix] + zero_thres_q[c][4 + s])
-                            : t_tr);
+    for (size_t c : {1, 0, 2}) {
+      const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
+      const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
+      const auto cmap_factor = Set(df, cmap_factors[c]);
+      auto entropy_v = Zero(df);
+      auto nzeros_v = Zero(df);
+      const size_t block_ctx =
+          use_tcm ? tcm->block_ctx_map.Context(/*dc_idx=*/0, qf_cand, ord, c)
+                  : 0;
+      const uint32_t nzero_ctx =
+          use_tcm ? tcm->block_ctx_map.NonZeroContext(
+                        tcm->PredictNzeros(c, bx0, by0), block_ctx)
+                  : 0;
+
+      for (size_t v8 = 0; v8 < kBlockDim; ++v8) {
+        for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
+          const bool is_llf = (v8 == 0 && u8 == 0);
+          const uint8_t s = kCoeffBand[v8][u8];
+          const float csf =
+              use_csf_w ? config.csf_w[c][v8 * kBlockDim + u8] : 1.0f;
+          const float ws = band_w_c[c][s] * csf;
+          const float dz = is_llf ? 0.0f : zero_thres_c[c][4 + s];
+          const float t0 = 0.50f + ((dz >= 0.0f) ? dz : (0.5f * dz));
+          float cw =
+              (!use_csf_w || is_llf)
+                  ? 1.0f
+                  : (0.94f + 0.0085f * static_cast<float>(v8 + u8));
+          float cs = 0.0f;
+          if (rdo_mode && use_tcm) {
+            const size_t k_approx = v8 * kBlockDim + u8;
+            const size_t k_freq = is_llf ? 0 : kCoeffFreqContext[k_approx];
+            cw = is_llf ? 0.0f : tcm->rdo_c_one[block_ctx * 32 + k_freq];
+            cs = is_llf ? 0.0f : tcm->rdo_c_slope[block_ctx * 32 + k_freq];
+          }
           for (size_t ix = 0; ix < cx; ++ix) {
-            w_q_row[u8 * cx + ix] = w_q;
-            t_tr_row[u8 * cx + ix] = t_tr;
-            t0_q_row[u8 * cx + ix] = t0_q;
+            w_row[u8 * cx + ix] = ws;
+            t0_row[u8 * cx + ix] = t0;
+            cw_row[u8 * cx + ix] = cw;
+            cs_row[u8 * cx + ix] = cs;
           }
         }
-      }
-      for (size_t iy = 0; iy < cy; ++iy) {
-        const size_t off = (v8 * cy + iy) * row_stride;
-        for (size_t rx = 0; rx < row_stride; rx += Lanes(df)) {
-          const auto in = Load(df, block + c * size + off + rx);
-          const auto in_y =
-              (c == 1) ? zero
-                       : Mul(Load(df, block + size + off + rx), cmap_factor);
-          const auto im = Load(df, inv_matrix + off + rx);
-          const auto val = Mul(Sub(in, in_y), Mul(im, quant));
-          const auto t0 = Load(df, t0_row + rx);
-          const auto rval = IfThenElseZero(Ge(Abs(val), t0), Round(val));
-          const auto ws = Load(df, w_row + rx);
-          const auto diff = Mul(ws, Sub(val, rval));
-          const auto m = Load(df, matrix + off + rx);
-          Store(Mul(m, diff), df, &mem[off + rx]);
-          const auto q_mag = Abs(rval);
-          const auto q_is_zero = Eq(q_mag, zero);
-          const auto nz_one = IfThenZeroElse(q_is_zero, one);
-          const auto cw = Load(df, cw_row + rx);
-          entropy_v = MulAdd(cw, Sqrt(q_mag), entropy_v);
-          nzeros_v = Add(nzeros_v, nz_one);
+        for (size_t iy = 0; iy < cy; ++iy) {
+          const size_t off = (v8 * cy + iy) * row_stride;
+          for (size_t rx = 0; rx < row_stride; rx += Lanes(df)) {
+            const auto in = Load(df, block + c * size + off + rx);
+            const auto in_y =
+                (c == 1) ? zero
+                         : Mul(Load(df, block + size + off + rx), cmap_factor);
+            const auto im = Load(df, inv_matrix + off + rx);
+            const auto t0 = Load(df, t0_row + rx);
+            const auto ws = Load(df, w_row + rx);
+            const auto m = Load(df, matrix + off + rx);
+            const auto cw = Load(df, cw_row + rx);
 
-          if (use_q_rdo) {
-            const auto v0 = Abs(Mul(in, Mul(im, q_block_c_v)));
-            const auto t0_q = Load(df, t0_q_row + rx);
-            const auto q_nz = IfThenElseZero(Ge(v0, t0_q), Round(v0));
-            if (cx == 1) {
-              const auto prev_q = Load(df, quad_row8[v8_hi] + rx);
-              Store(Add(prev_q, q_nz), df, quad_row8[v8_hi] + rx);
-            } else if (rx < cx * 4) {
-              if (!v8_hi) {
-                quad_v0 = Add(quad_v0, q_nz);
+            const auto u_coeff = Mul(Sub(in, in_y), im);
+            const auto val = Mul(u_coeff, quant_ac_v);
+            if (rdo_mode) {
+              const auto val0 = Mul(u_coeff, q_llf_v);
+              const auto z = Div(Abs(val), t0);
+              const auto z2 = Mul(z, z);
+              const auto z4 = Mul(z2, z2);
+              const auto w_act = Div(z4, Add(one, z4));
+              const auto err_denom =
+                  Sqrt(Add(one, Mul(Set(df, 1.8f), z2)));
+              const auto err = Div(val0, err_denom);
+              Store(Mul(m, Mul(ws, err)), df, &mem[off + rx]);
+
+              const auto r_vec =
+                  use_tcm ? Mul(w_act, MulAdd(Load(df, cs_row + rx),
+                                              Sub(Sqrt(Max(one, Abs(val))),
+                                                  one),
+                                              cw))
+                          : Mul(cw, Mul(w_act, Sqrt(Abs(val))));
+              if (v8 == 0 && rx < cx) {
+                HWY_ALIGN float r_arr[kBlockDim];
+                HWY_ALIGN float w_arr[kBlockDim];
+                Store(r_vec, df, r_arr);
+                Store(w_act, df, w_arr);
+                for (size_t lx = 0; lx < std::min(cx, Lanes(df)); ++lx) {
+                  mem[off + rx + lx] = 0.0f;
+                  r_arr[lx] = 0.0f;
+                  w_arr[lx] = 0.0f;
+                }
+                entropy_v = Add(entropy_v, Load(df, r_arr));
+                nzeros_v = Add(nzeros_v, Load(df, w_arr));
               } else {
-                quad_v2 = Add(quad_v2, q_nz);
+                entropy_v = Add(entropy_v, r_vec);
+                nzeros_v = Add(nzeros_v, w_act);
               }
             } else {
-              if (!v8_hi) {
-                quad_v1 = Add(quad_v1, q_nz);
+              const auto rval = IfThenElseZero(Ge(Abs(val), t0), Round(val));
+              const auto q_mag = Abs(rval);
+              const auto q_is_zero = Eq(q_mag, zero);
+              const auto diff = Mul(ws, Sub(val, rval));
+              Store(Mul(m, diff), df, &mem[off + rx]);
+              const auto nz_one = IfThenZeroElse(q_is_zero, one);
+              if (use_tcm) {
+                Store(ConvertTo(di, rval), di, &q_coeffs[off + rx]);
               } else {
-                quad_v3 = Add(quad_v3, q_nz);
+                entropy_v = MulAdd(cw, Sqrt(q_mag), entropy_v);
               }
+              nzeros_v = Add(nzeros_v, nz_one);
             }
-
-            const auto w_q = Load(df, w_q_row + rx);
-            const auto t_tr = Load(df, t_tr_row + rx);
-            auto eff_deq = [&](const auto& k) {
-              const auto is_pos = Ge(k, one);
-              const auto is_one = Eq(k, one);
-              const auto adj = IfThenElse(
-                  is_one, bias_c_v,
-                  IfThenElseZero(is_pos, Sub(k, Div(bias3_v, Max(k, one)))));
-              return MulAdd(Set(df, 0.65f), k, Mul(Set(df, 0.35f), adj));
-            };
-
-            const auto is_nz0 = Ge(v0, t_tr);
-            const auto k0 = IfThenElseZero(is_nz0, Round(v0));
-            const auto eff0 = eff_deq(k0);
-            const auto err0 = Mul(w_q, Abs(Sub(v0, eff0)));
-            r0_v = Add(r0_v, eff0);
-            e0_v = Add(e0_v, err0);
           }
         }
       }
-    }
 
-    if (use_q_rdo) {
-      float hfNonZeros[4] = {};
-      if (cx == 1) {
-        hfNonZeros[0] = quad_row8[0][0] + quad_row8[0][1] + quad_row8[0][2] +
-                        quad_row8[0][3];
-        hfNonZeros[1] = quad_row8[0][4] + quad_row8[0][5] + quad_row8[0][6] +
-                        quad_row8[0][7];
-        hfNonZeros[2] = quad_row8[1][0] + quad_row8[1][1] + quad_row8[1][2] +
-                        quad_row8[1][3];
-        hfNonZeros[3] = quad_row8[1][4] + quad_row8[1][5] + quad_row8[1][6] +
-                        quad_row8[1][7];
-      } else {
-        hfNonZeros[0] = GetLane(SumOfLanes(df, quad_v0));
-        hfNonZeros[1] = GetLane(SumOfLanes(df, quad_v1));
-        hfNonZeros[2] = GetLane(SumOfLanes(df, quad_v2));
-        hfNonZeros[3] = GetLane(SumOfLanes(df, quad_v3));
-      }
-
-      const int32_t div = static_cast<int32_t>(num_blocks);
-      const float min_hf_non_zeros = std::min(
-          {hfNonZeros[0], hfNonZeros[1], hfNonZeros[2], hfNonZeros[3]});
-      int32_t activity = 15;
-      if (min_hf_non_zeros < 15.0f * div) {
-        activity = (static_cast<int32_t>(min_hf_non_zeros) + div / 2) / div;
-      }
-      if (c == 1) {
-        const uint8_t q0_sub =
-            (activity <= 2 && hfNonZeros[0] >= 2.0f * div) ? 1u : 0u;
-        act_out = static_cast<uint8_t>((activity << 1) | q0_sub);
-        const float luma_hf_dz =
-            (activity > 0)
-                ? std::max(0.0f,
-                           -0.002f * hr_w + dz_w_rt * (0.0085f * activity))
-                : 0.0f;
-        for (int cc : {0, 2}) {
-          zero_thres_q[cc][1] += 0.18f * luma_hf_dz;
-          zero_thres_q[cc][2] += 0.18f * luma_hf_dz;
-          zero_thres_q[cc][3] += 0.005f * dz_w_rt + 0.40f * luma_hf_dz;
+      const float f_nzeros = GetLane(SumOfLanes(df, nzeros_v));
+      float entropy_c = 0.0f;
+      if (!rdo_mode && use_tcm) {
+        const int32_t nzeros = static_cast<int32_t>(f_nzeros);
+        float bits_c = tcm->ValBits(tcm->cluster_of_ctx[nzero_ctx],
+                                    static_cast<uint32_t>(nzeros));
+        if (nzeros > 0) {
+          const size_t log2_blocks = acs.log2_covered_blocks();
+          const size_t histo_offset =
+              tcm->block_ctx_map.ZeroDensityContextsOffset(block_ctx);
+          const coeff_order_t* JXL_RESTRICT order =
+              &tcm->coeff_orders[CoeffOrderOffset(ord, c)];
+          size_t prev =
+              (nzeros > static_cast<int32_t>(size / 16)) ? 0 : 1;
+          int32_t nzeros_left = nzeros;
+          for (size_t k = num_blocks; k < size && nzeros_left != 0; ++k) {
+            const int32_t coeff = q_coeffs[order[k]];
+            const size_t ctx =
+                histo_offset + ZeroDensityContext(nzeros_left, k, num_blocks,
+                                                  log2_blocks, prev);
+            const uint32_t u_coeff = PackSigned(coeff);
+            bits_c += tcm->ValBits(tcm->cluster_of_ctx[ctx], u_coeff);
+            const int32_t is_nz = (coeff != 0) ? 1 : 0;
+            prev = static_cast<size_t>(is_nz);
+            nzeros_left -= is_nz;
+          }
         }
+        entropy_c = tcm->bits_to_cost_mul * bits_c;
       }
 
-      const float R0 = GetLane(SumOfLanes(df, r0_v));
-      const float E0 = GetLane(SumOfLanes(df, e0_v));
-
-      const float total_nz =
-          hfNonZeros[0] + hfNonZeros[1] + hfNonZeros[2] + hfNonZeros[3];
-      int32_t max_step = 0;
-      float theta1 = 1e30f;
-      float theta2 = 1e30f;
-      if (num_blocks == 1) {
-        if (use_csf_w ? (total_nz < 11.0f) : (R0 < 8.0f)) {
-          max_step = 1;
-          theta1 = use_csf_w ? dct8_err_min : 2.0f;
-        }
-      } else if (num_blocks >= 2) {
-        max_step = 2;
-        const size_t scale_ix =
-            (num_blocks == 4)
-                ? 0
-                : ((num_blocks == 8) ? 1 : ((num_blocks == 16) ? 2 : 3));
-        const float val_mul =
-            use_csf_w ? kAlphaVal[scale_ix][c] : kAlphaValNoRdo[scale_ix][c];
-        const float base_cost =
-            kAlphaBlk[scale_ix][c] * num_blocks * kDCTBlockSize +
-            val_mul * R0;
-        theta1 = base_cost;
-        theta2 = 2.0f * base_cost;
-      }
-
-      int32_t step = 0;
-      if (max_step >= 1 && E0 > theta1) {
-        step = (max_step >= 2 && E0 > theta2) ? 2 : 1;
-      }
-      const int32_t q_try_best =
-          std::min<int32_t>(Quantizer::kQuantMax - 1, quant_orig + step);
-      const int32_t q_floor = (config.butteraugli_distance < 0.25f)
-                                  ? quant_orig
-                                  : std::max(4, q_try_best / 2);
-      const int32_t q_c = std::max(q_floor, q_try_best - activity);
-      max_quant = std::max(q_c, max_quant);
-    }
-
-    {
-      float masku_lut[3] = {
-          12.0,
-          0.0,
-          4.0,
-      };
+      float masku_lut[3] = {12.0f, rdo_mode ? 16.0f : 0.0f, 4.0f};
       auto masku_off = Set(df8, masku_lut[c]);
       TransformToPixels(acs.Strategy(), &mem[0], pixels_buf, cov_x * 8,
                         scratch_space);
@@ -816,92 +771,136 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
       loss += GetLane(SumOfLanes(df8, lossc)) * (kChannelMul[c] * w);
       loss2 += GetLane(SumOfLanes(df8, lossc2)) *
                (kChannelMul2[c] * ((w > 1.0f) ? std::pow(w, 0.25f) : 1.0f));
-    }
-    float entropy_c = config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
-    size_t num_nzeros = GetLane(SumOfLanes(df, nzeros_v));
-    // Add #bit of num_nonzeros, as an estimate of the cost for encoding the
-    // number of non-zeros of the block.
-    size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
-    // Also add #bit of #bit of num_nonzeros, to estimate the ANS cost, with a
-    // bias.
-    entropy_c += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
-    if (c == 0 && num_blocks >= 2) {
-      const float x_slope =
-          use_csf_w
-              ? (0.088f +
-                 0.014f * Clamp1((config.butteraugli_distance - 0.5f) / 1.5f,
-                                 0.0f, 1.0f))
-              : 0.125f;
-      entropy_c *= 1.0f + std::min(2.6f, static_cast<float>(num_blocks) * x_slope);
-    }
-    entropy += entropy_c;
-  }
-  if (use_q_rdo) {
-    q_out =
-        q_pool + static_cast<float>(max_quant - quant_orig) * config.quant_scale;
-  }
-  const float d = config.butteraugli_distance;
-  float rate_scale = 1.0f;
-  float dist_scale = 1.0f;
-  if (!is_partial_block) {
-    const float b = 0.5f * static_cast<float>(acs.log2_covered_blocks());
-    const float a = 0.5f * static_cast<float>(FloorLog2Nonzero(cx / cy));
-    if (b > 0.0f) {
-      const float k_d =
-          use_csf_w
-              ? (-0.372f + 0.042f * Clamp1((d - 0.5f) / 0.35f, 0.0f, 1.0f))
-              : -0.40f;
-      dist_scale = 1.0f / (1.0f + k_d / (d + 1.4f));
-      const float mb_d =
-          use_csf_w
-              ? (0.985f + 0.015f * Clamp1((d - 0.5f) / 1.0f, 0.0f, 1.0f))
-              : 1.0f;
-      const float b_hi = std::max(0.0f, b - 2.0f);
-      rate_scale =
-          dist_scale * mb_d *
-          (1.0f + 0.540f * (b * b) / (0.65f + b * b) + 0.110f * a +
-           0.74f * b_hi / (0.06f + b_hi));
-    }
-  } else {
-    const AcStrategyType st = acs.Strategy();
-    const float s = (st == AcStrategyType::IDENTITY) ? 3.0f
-                    : (st == AcStrategyType::DCT2X2) ? 2.0f
-                    : (st == AcStrategyType::DCT4X4) ? 1.0f
-                                                     : 0.5f;
-    const float a =
-        (st == AcStrategyType::DCT4X8 || st == AcStrategyType::DCT8X4) ? 0.5f
-                                                                       : 0.0f;
-    if (s <= 1.0f) {
-      const float s2 = s * s;
-      rate_scale = 1.0f + (0.002f + 0.348f * s2) * s2 + 0.104f * a;
-      if (d > 4.0f) {
-        rate_scale += 0.5f * std::min(1.0f, 8.0f / (d - 4.0f));
+
+      if (rdo_mode && use_tcm) {
+        const float dof_norm =
+            1.0f / std::sqrt(1.0f + 0.35f * f_nzeros * inv_nblocks);
+        const float nz_per_block = Clamp1(f_nzeros * inv_nblocks, 0.0f, 64.0f);
+        const size_t nz_lo = static_cast<size_t>(nz_per_block);
+        const size_t nz_hi = std::min<size_t>(nz_lo + 1, 64);
+        const float nz_frac = nz_per_block - static_cast<float>(nz_lo);
+        const float nz_bits =
+            (1.0f - nz_frac) * tcm->rdo_nzero_bits[nzero_ctx * 65 + nz_lo] +
+            nz_frac * tcm->rdo_nzero_bits[nzero_ctx * 65 + nz_hi];
+        const float coeff_bits =
+            dof_norm * GetLane(SumOfLanes(df, entropy_v));
+        entropy_c = tcm->bits_to_cost_mul * (coeff_bits + nz_bits);
+      } else if (!use_tcm) {
+        entropy_c = config.cost_delta * GetLane(SumOfLanes(df, entropy_v));
+        if (rdo_mode) {
+          const float dof_norm =
+              1.0f / std::sqrt(1.0f + 0.35f * f_nzeros * inv_nblocks);
+          entropy_c *= dof_norm;
+          const float f_nbits = std::log2(f_nzeros + 2.0f) - 1.0f;
+          entropy_c += 0.45f * config.zeros_mul * f_nbits;
+        } else {
+          size_t num_nzeros = static_cast<size_t>(f_nzeros);
+          size_t nbits = CeilLog2Nonzero(num_nzeros + 1) + 1;
+          entropy_c += config.zeros_mul * (CeilLog2Nonzero(nbits + 17) + nbits);
+        }
+        if (c == 0 && num_blocks >= 2) {
+          const float x_slope =
+              use_csf_w
+                  ? (0.088f +
+                     0.014f *
+                         Clamp1((config.butteraugli_distance - 0.5f) / 1.5f,
+                                0.0f, 1.0f))
+                  : 0.125f;
+          entropy_c *=
+              1.0f + std::min(2.6f, static_cast<float>(num_blocks) * x_slope);
+        }
       }
-    } else {
-      rate_scale = 0.9556f + 0.11595f * s;
-      if (d < 5.0f) {
-        const float d_ramp =
-            (config.band_qf_stride > 0)
-                ? Clamp1((d - 0.5f) / 0.35f, 0.0f, 1.0f)
-                : 0.0f;
-        const float loc_favor =
-            (config.band_qf_stride > 0)
-                ? ((0.400f - 0.015f * (3.0f - s)) -
-                   (0.050f + 0.075f * (3.0f - s)) * d_ramp)
-                : 0.400f;
-        const float w_d = (5.0f - d) / 5.0f;
-        rate_scale -= loc_favor * w_d * w_d;
+      out_rate += entropy_c;
+    }
+
+    if (!rdo_mode && use_tcm) {
+      out_rate += tcm->bits_to_cost_mul *
+                  (tcm->acs_strategy_bits[acs.RawStrategy()] +
+                   tcm->qf_block_bits);
+    }
+
+    const float d8 = std::pow(loss * inv_npixels, 1.0f / 8.0f);
+    const float d2 = std::sqrt(loss2 * inv_npixels);
+    const float d_blend =
+        (config.band_qf_stride > 0) ? (0.91f * d8 + 0.09f * 2.18f * d2) : d8;
+    const float q_norm =
+        rdo_mode ? q_llf_fixed : std::max(q_cand, 1e-4f);
+    out_loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / q_norm;
+  };
+
+  const float d_rdo_norm = std::pow(std::max(d, 0.35f), -0.38f);
+  const float q_min_floor =
+      std::max(3.5f * config.quant_scale, 0.34f * q_base);
+  const float q_max_ceil = std::min(
+      static_cast<float>(Quantizer::kQuantMax - 1) * config.quant_scale,
+      1.65f * q_base);
+
+  if (use_q_rdo && num_blocks == 1) {
+    const float q_0 = Clamp1(use_csf_w ? q_all_c[1] : q_base, q_min_floor,
+                             q_max_ceil);
+    const float step = std::max(0.5f * config.quant_scale, 0.14f * q_0);
+    const float q_minus = std::max(q_min_floor, q_0 - step);
+    const float q_plus = std::min(q_max_ceil, q_0 + step);
+    const float lambda_q =
+        3.2f * config.info_loss_multiplier * d_rdo_norm;
+    const float lambda_reg = 4.2f;
+
+    float r_0 = 0.0f;
+    float l_0 = 0.0f;
+    eval_q(q_0, /*rdo_mode=*/true, r_0, l_0);
+    const float j0 = r_0 + lambda_q * l_0;
+
+    auto score_q1x1 = [&](float qc) -> float {
+      float r_cand = 0.0f;
+      float l_cand = 0.0f;
+      eval_q(qc, /*rdo_mode=*/true, r_cand, l_cand);
+      const float dq = (qc - q_0) / std::max(step, 1e-4f);
+      return r_cand + lambda_q * l_cand + lambda_reg * dq * dq;
+    };
+
+    const float jm =
+        (q_minus < q_0 - 1e-5f) ? score_q1x1(q_minus) : (j0 + lambda_reg);
+    const float jp =
+        (q_plus > q_0 + 1e-5f) ? score_q1x1(q_plus) : (j0 + lambda_reg);
+    const float d2_j = jm - 2.0f * j0 + jp;
+    float delta = 0.0f;
+    if (d2_j > 1e-4f) {
+      delta = Clamp1((jm - jp) / (2.0f * d2_j), -1.0f, 1.0f);
+    } else if (jm < jp && jm < j0) {
+      delta = -0.8f;
+    } else if (jp < jm && jp < j0) {
+      delta = 0.8f;
+    }
+    const float q_rdo = Clamp1(q_0 + 0.50f * delta * step, q_min_floor,
+                               q_max_ceil);
+    quant_norm16 = q_rdo;
+    config.MutableQuant(bx0, by0) = q_rdo;
+    if (config.band_qf_stride > 0) {
+      const float ratio = q_rdo / std::max(q_all_c[1], 1e-4f);
+      for (size_t c = 0; c < 3; ++c) {
+        for (size_t s = 0; s < 4; ++s) {
+          if (config.band_qf_rows[c][s] != nullptr) {
+            config.band_qf_rows[c][s][by0 * config.band_qf_stride + bx0] *=
+                ratio;
+          }
+        }
       }
     }
+    const float nonflat_w =
+        Clamp1(r_0 / (12.0f * config.cost_delta * 0.1f), 0.0f, 1.0f);
+    const float dct8_d_gate =
+        Clamp1(1.02f - 0.48f * (d - 0.50f), 0.12f, 1.02f);
+    const float dct8_step =
+        nonflat_w * dct8_d_gate * Clamp1(1.0f + 0.45f * delta, 0.25f, 1.45f);
+    q_out = Clamp1(q_rdo + dct8_step * config.quant_scale, q_min_floor,
+                   q_max_ceil);
   }
-  const float inv_npixels = 1.0f / static_cast<float>(num_blocks * kDCTBlockSize);
-  const float d8 = std::pow(loss * inv_npixels, 1.0f / 8.0f);
-  const float d2 = std::sqrt(loss2 * inv_npixels);
-  const float d_blend =
-      (config.band_qf_stride > 0) ? (0.91f * d8 + 0.09f * 2.18f * d2) : d8;
-  float loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / quant_norm16;
-  entropy = rate_scale * entropy +
-            dist_scale * config.info_loss_multiplier * loss_scalar;
+
+  float base_rate = 0.0f;
+  float base_loss_scalar = 0.0f;
+  eval_q(quant_norm16, /*rdo_mode=*/false, base_rate, base_loss_scalar);
+  entropy = rate_scale * base_rate +
+            dist_scale * config.info_loss_multiplier * base_loss_scalar;
   if (config.band_qf_stride > 0 && num_blocks >= 2 && q_min > 1e-4f) {
     const float q_ratio = q_max / q_min;
     if (num_blocks <= 16 && q_ratio < 1.12f) {
@@ -909,6 +908,133 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     } else if (q_ratio > 1.22f) {
       entropy *= 1.0f + 0.014f * Clamp1((q_ratio - 1.22f) / 0.35f, 0.0f, 1.0f);
     }
+  }
+
+  if (use_q_rdo && num_blocks >= 2 && entropy <= best_cost_bound) {
+    const float q_0 = Clamp1(q_pool, q_min_floor, q_max_ceil);
+    const float step = std::max(0.5f * config.quant_scale, 0.14f * q_0);
+    const float q_minus = std::max(q_min_floor, q_0 - step);
+    const float q_plus = std::min(q_max_ceil, q_0 + step);
+    const float lambda_q_mb =
+        3.5f * dist_scale * config.info_loss_multiplier * d_rdo_norm;
+    const float lambda_reg_mb = 4.2f * static_cast<float>(num_blocks);
+
+    float r_0_mb = 0.0f;
+    float l_0_mb = 0.0f;
+    eval_q(q_0, /*rdo_mode=*/true, r_0_mb, l_0_mb);
+    const float j0 = r_0_mb + lambda_q_mb * l_0_mb;
+
+    auto score_q_mb = [&](float qc) -> float {
+      float r_cand = 0.0f;
+      float l_cand = 0.0f;
+      eval_q(qc, /*rdo_mode=*/true, r_cand, l_cand);
+      const float dq = (qc - q_0) / std::max(step, 1e-4f);
+      return r_cand + lambda_q_mb * l_cand + lambda_reg_mb * dq * dq;
+    };
+
+    const float jm =
+        (q_minus < q_0 - 1e-5f) ? score_q_mb(q_minus) : (j0 + lambda_reg_mb);
+    const float jp =
+        (q_plus > q_0 + 1e-5f) ? score_q_mb(q_plus) : (j0 + lambda_reg_mb);
+    const float d2_j = jm - 2.0f * j0 + jp;
+    float delta_mb = 0.0f;
+    if (d2_j > 1e-4f) {
+      delta_mb = Clamp1((jm - jp) / (2.0f * d2_j), -1.0f, 1.0f);
+    } else if (jm < jp && jm < j0) {
+      delta_mb = -0.8f;
+    } else if (jp < jm && jp < j0) {
+      delta_mb = 0.8f;
+    }
+    const float nonflat_mb = Clamp1(
+        (r_0_mb * inv_nblocks) / (8.0f * config.cost_delta * 0.1f), 0.0f, 1.0f);
+    const float mb_d_gate =
+        Clamp1(1.12f - 0.30f * (d - 0.50f), 0.48f, 1.12f);
+    const float mb_base_steps = (num_blocks >= 16)  ? 1.35f
+                                : (num_blocks >= 8) ? 1.25f
+                                : (num_blocks >= 4) ? 1.15f
+                                                    : 0.85f;
+    const float mb_steps = nonflat_mb * mb_d_gate * mb_base_steps *
+                           Clamp1(1.0f + 0.50f * delta_mb, 0.25f, 1.65f);
+    q_out = Clamp1(q_0 + 0.40f * delta_mb * step + mb_steps * config.quant_scale,
+                   q_min_floor, q_max_ceil);
+  }
+
+  if (use_q_rdo && entropy <= best_cost_bound) {
+    // Compute 4-quadrant Luma (c = 1) non-zero activity at q_out for
+    // ComputeBlockThresholds's high-frequency deadzone adaptation.
+    const float* inv_matrix_y = config.dequant->InvMatrix(acs.Strategy(), 1);
+    const auto q_y_v = Set(df, q_out * config.qm_multiplier[1]);
+    auto quad_v0 = Zero(df);
+    auto quad_v1 = Zero(df);
+    auto quad_v2 = Zero(df);
+    auto quad_v3 = Zero(df);
+    HWY_ALIGN float quad_row8[2][8] = {};
+    for (size_t v8 = 0; v8 < kBlockDim; ++v8) {
+      const bool v8_hi = (v8 >= 4);
+      for (size_t u8 = 0; u8 < kBlockDim; ++u8) {
+        const bool is_llf = (v8 == 0 && u8 == 0);
+        const uint8_t s = kCoeffBand[v8][u8];
+        const size_t hfix =
+            (static_cast<size_t>(v8_hi) * 2 + static_cast<size_t>(u8 >= 4));
+        const float t0_q =
+            is_llf ? 1e30f : (zero_thres_c[1][hfix] + zero_thres_c[1][4 + s]);
+        for (size_t ix = 0; ix < cx; ++ix) {
+          t0_row[u8 * cx + ix] = t0_q;
+        }
+      }
+      for (size_t iy = 0; iy < cy; ++iy) {
+        const size_t off = (v8 * cy + iy) * row_stride;
+        for (size_t rx = 0; rx < row_stride; rx += Lanes(df)) {
+          const auto in = Load(df, block + size + off + rx);
+          const auto im = Load(df, inv_matrix_y + off + rx);
+          const auto v0 = Abs(Mul(in, Mul(im, q_y_v)));
+          const auto t0_q = Load(df, t0_row + rx);
+          const auto q_nz = IfThenElseZero(Ge(v0, t0_q), Round(v0));
+          if (cx == 1) {
+            const auto prev_q = Load(df, quad_row8[v8_hi] + rx);
+            Store(Add(prev_q, q_nz), df, quad_row8[v8_hi] + rx);
+          } else if (rx < cx * 4) {
+            if (!v8_hi) {
+              quad_v0 = Add(quad_v0, q_nz);
+            } else {
+              quad_v2 = Add(quad_v2, q_nz);
+            }
+          } else {
+            if (!v8_hi) {
+              quad_v1 = Add(quad_v1, q_nz);
+            } else {
+              quad_v3 = Add(quad_v3, q_nz);
+            }
+          }
+        }
+      }
+    }
+    float hfNonZeros[4] = {};
+    if (cx == 1) {
+      hfNonZeros[0] =
+          quad_row8[0][0] + quad_row8[0][1] + quad_row8[0][2] + quad_row8[0][3];
+      hfNonZeros[1] =
+          quad_row8[0][4] + quad_row8[0][5] + quad_row8[0][6] + quad_row8[0][7];
+      hfNonZeros[2] =
+          quad_row8[1][0] + quad_row8[1][1] + quad_row8[1][2] + quad_row8[1][3];
+      hfNonZeros[3] =
+          quad_row8[1][4] + quad_row8[1][5] + quad_row8[1][6] + quad_row8[1][7];
+    } else {
+      hfNonZeros[0] = GetLane(SumOfLanes(df, quad_v0));
+      hfNonZeros[1] = GetLane(SumOfLanes(df, quad_v1));
+      hfNonZeros[2] = GetLane(SumOfLanes(df, quad_v2));
+      hfNonZeros[3] = GetLane(SumOfLanes(df, quad_v3));
+    }
+    const int32_t div = static_cast<int32_t>(num_blocks);
+    const float min_hf_non_zeros =
+        std::min({hfNonZeros[0], hfNonZeros[1], hfNonZeros[2], hfNonZeros[3]});
+    int32_t activity = 15;
+    if (min_hf_non_zeros < 15.0f * div) {
+      activity = (static_cast<int32_t>(min_hf_non_zeros) + div / 2) / div;
+    }
+    const uint8_t q0_sub =
+        (activity <= 2 && hfNonZeros[0] >= 2.0f * div) ? 1u : 0u;
+    act_out = static_cast<uint8_t>((activity << 1) | q0_sub);
   }
   return true;
 }
@@ -1016,7 +1142,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         JXL_RETURN_IF_ERROR(EstimateEntropy(
             AcStrategy::FromRawStrategy(tx.type), 8 * (bx + ix), 8 * (by + iy),
             config, cmap_factors, block, scratch_space, quantized,
-            cand_entropy, cand_q, cand_act));
+            best_entropy, cand_entropy, cand_q, cand_act));
         if (cand_entropy < best_entropy) {
           best_entropy = cand_entropy;
           best_of_8x8s = tx.type;
@@ -1324,8 +1450,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                                    [x0 / kColorTileDimInBlocks];
               JXL_RETURN_IF_ERROR(EstimateEntropy(
                   acs_direct, (bx + x0) * 8, (by + y0) * 8, config,
-                  cmap_factors, block, scratch_space, quantized, cand_entropy,
-                  cand_q, cand_act));
+                  cmap_factors, block, scratch_space, quantized, best_c,
+                  cand_entropy, cand_q, cand_act));
               if (cand_entropy < best_c) {
                 best_c = cand_entropy;
                 best_s = 0;
@@ -1397,28 +1523,22 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         }
         q_pool = mean_max_mixer * q_max + (1.0f - mean_max_mixer) * q_rms;
       }
-      const int32_t quant_orig =
-          Quantizer::ClampVal(q_pool * config.inv_global_scale + 0.5f);
-      const int32_t quant_final =
-          Quantizer::ClampVal(q_val * config.inv_global_scale + 0.5f);
-      const float q_step_ratio =
-          static_cast<float>(quant_final) / static_cast<float>(quant_orig);
+      const float q_step_ratio = q_val / std::max(q_pool, 1e-4f);
       for (size_t c = 0; c < 3; ++c) {
         for (size_t s = 0; s < 4; ++s) {
           if (config.band_qf_rows[c][s] == nullptr) continue;
           float sq_sum = 0.0f;
           for (size_t iy = 0; iy < h; ++iy) {
             for (size_t ix = 0; ix < w; ++ix) {
-              const float old_q =
-                  std::max(config.Quant(bx + x0 + ix, by + y0 + iy), 1e-4f);
+              const size_t sbx = bx + x0 + ix;
+              const size_t sby = by + y0 + iy;
+              const float old_q = std::max(config.Quant(sbx, sby), 1e-4f);
               const float rescale = q_pool / old_q;
               const float band_rescale =
                   (rescale > 1.0f)
                       ? (1.0f + kBandRescaleMix[s] * (rescale - 1.0f))
                       : rescale;
-              const float v =
-                  config.BandQuant(c, s, bx + x0 + ix, by + y0 + iy) *
-                  band_rescale;
+              const float v = config.BandQuant(c, s, sbx, sby) * band_rescale;
               sq_sum += v * v;
             }
           }
@@ -1436,7 +1556,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
       for (size_t iy = 0; iy < h; ++iy) {
         for (size_t ix = 0; ix < w; ++ix) {
           config.quant_field_row[(by + y0 + iy) * config.quant_field_stride +
-                                 (bx + x0 + ix)] = q_pool;
+                                 (bx + x0 + ix)] = q_val;
         }
       }
     } else if (config.band_qf_rows[1][0] != nullptr) {
@@ -1571,6 +1691,7 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
                                   float b_qm_multiplier, float quant_scale,
                                   float inv_global_scale) {
   config.dequant = matrices;
+  config.token_cost_model = nullptr;
   config.quant_scale = quant_scale;
   config.inv_global_scale = inv_global_scale;
 
@@ -1590,6 +1711,10 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   // Image row pointers and strides.
   config.quant_field_row = quant_field->Row(0);
   config.quant_field_stride = quant_field->PixelsPerRow();
+  config.base_quant =
+      (quant_field->xsize() > 0 && quant_field->ysize() > 0)
+          ? quant_field->ConstRow(0)[0]
+          : 1.0f;
   config.mask1x1_xsize = mask1x1.xsize();
   if (mask1x1.xsize() > 0 && mask1x1.ysize() > 0) {
     config.masking1x1_field_row = mask1x1.Row(0);

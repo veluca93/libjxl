@@ -8,12 +8,18 @@
 
 #include <jxl/memory_manager.h>
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
+#include "lib/jxl/ac_context.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/chroma_from_luma.h"
+#include "lib/jxl/coeff_order_fwd.h"
+#include "lib/jxl/dec_ans.h"
 #include "lib/jxl/enc_cache.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/frame_dimensions.h"
@@ -29,10 +35,59 @@ namespace jxl {
 struct AuxOut;
 class AcStrategyImage;
 
+struct AcTokenCostModel {
+  static constexpr size_t kMaxTokenAlphabet = 256;
+  static constexpr size_t kSmallValLimit = 64;
+
+  BlockCtxMap block_ctx_map;
+  std::vector<coeff_order_t> coeff_orders;
+  Image3I pass1_nzeros;
+  std::vector<uint8_t> cluster_of_ctx;
+  std::vector<HybridUintConfig> uint_config;
+  std::vector<float> tok_bits;
+  std::vector<float> small_val_bits;
+  std::vector<float> rdo_c_one;
+  std::vector<float> rdo_c_slope;
+  std::vector<float> rdo_nzero_bits;
+  float acs_strategy_bits[27] = {};
+  float qf_block_bits = 2.2f;
+  float bits_to_cost_mul = 1.0f;
+
+  JXL_INLINE float LargeValBits(size_t cluster, uint32_t value) const {
+    uint32_t tok = 0;
+    uint32_t nbits = 0;
+    uint32_t bits = 0;
+    uint_config[cluster].Encode(value, &tok, &nbits, &bits);
+    const size_t t_idx = cluster * kMaxTokenAlphabet +
+                         std::min<size_t>(tok, kMaxTokenAlphabet - 1);
+    return tok_bits[t_idx] + static_cast<float>(nbits);
+  }
+
+  JXL_INLINE float ValBits(size_t cluster, uint32_t value) const {
+    if (JXL_LIKELY(value < kSmallValLimit)) {
+      return small_val_bits[cluster * kSmallValLimit + value];
+    }
+    return LargeValBits(cluster, value);
+  }
+
+  JXL_INLINE int32_t PredictNzeros(size_t c, size_t bx0, size_t by0) const {
+    const size_t lx = bx0 & 31;
+    const size_t ly = by0 & 31;
+    if (lx == 0 && ly == 0) return 32;
+    const int32_t* JXL_RESTRICT row = pass1_nzeros.ConstPlaneRow(c, by0);
+    if (ly == 0) return row[bx0 - 1];
+    const int32_t* JXL_RESTRICT row_top =
+        pass1_nzeros.ConstPlaneRow(c, by0 - 1);
+    if (lx == 0) return row_top[bx0];
+    return (row[bx0 - 1] + row_top[bx0] + 1) >> 1;
+  }
+};
+
 // AC strategy selection: utility struct.
 
 struct ACSConfig {
   const DequantMatrices* JXL_RESTRICT dequant;
+  const AcTokenCostModel* JXL_RESTRICT token_cost_model;
   float* JXL_RESTRICT quant_field_row;
   size_t quant_field_stride;
   const float* JXL_RESTRICT masking1x1_field_row;
@@ -46,6 +101,7 @@ struct ACSConfig {
   float qm_multiplier[3];
   float quant_scale;
   float inv_global_scale;
+  float base_quant;
   float info_loss_multiplier;
   float cost_delta;
   float zeros_mul;

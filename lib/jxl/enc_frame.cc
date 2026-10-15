@@ -1736,15 +1736,7 @@ bool CanDoStreamingEncoding(const CompressParams& cparams,
                             const CodecMetadata& metadata,
                             const JxlEncoderChunkedFrameAdapter& frame_data) {
   if (cparams.buffering == -1) {
-    if (cparams.speed_tier < SpeedTier::kTortoise) return false;
-    if (cparams.speed_tier < SpeedTier::kSquirrel &&
-        cparams.butteraugli_distance > 0.5f) {
-      return false;
-    }
-    if (cparams.speed_tier == SpeedTier::kSquirrel &&
-        cparams.butteraugli_distance >= 3.f) {
-      return false;
-    }
+    return false;
   }
   if (cparams.buffering == 0) {
     return false;

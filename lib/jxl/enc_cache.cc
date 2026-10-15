@@ -223,6 +223,7 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
     JXL_ENSURE(encoded_size == 0);
   } else {
     if (enc_state->initialize_global_state &&
+        enc_state->cparams.use_full_image_heuristics &&
         frame_header.chroma_subsampling.Is444() &&
         !enc_state->cparams.disable_perceptual_optimizations &&
         enc_state->cparams.speed_tier < SpeedTier::kFalcon &&
