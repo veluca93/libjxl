@@ -866,6 +866,8 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                                const CompressParams& cparams,
                                const FrameDimensions& frame_dim,
                                bool enable_rdo,
+                               const ImageF& initial_quant_field,
+                               const ImageF (*band_qf)[4],
                                ModularFrameEncoder* modular_frame_encoder,
                                DequantMatrices* dequant_matrices) {
   // TODO(veluca): quant matrices for no-gaborish.
@@ -949,6 +951,91 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     auto inv_mult_step = [](float r) -> float {
       return (r >= 1.0f) ? (r - 1.0f) : (1.0f - 1.0f / r);
     };
+    float delta_hf[3] = {};
+    float delta_mf[3] = {};
+    float delta_chr[3] = {};
+    if (band_qf != nullptr && band_qf[1][0].xsize() > 0 &&
+        band_qf[1][0].ysize() > 0 &&
+        frame_dim.xsize_blocks * frame_dim.ysize_blocks > 1) {
+      const float w_bd =
+          0.52f * Clamp1(3.5f - d, 0.0f, 1.0f) *
+          Clamp1((d - 0.35f) * 2.0f, 0.0f, 1.0f);
+      if (w_bd > 1e-3f) {
+        const float inv_w_bd = 1.0f / std::max(w_bd, 0.15f);
+        const float ln_r03_flat =
+            std::log((1.0f + w_bd * 0.0200f) / (1.0f + w_bd * 0.0710f));
+        const float ln_r12_flat =
+            std::log((1.0f + w_bd * 0.0404f) / (1.0f + w_bd * 0.0302f));
+        double w_sum = 0.0;
+        double act_sum = 0.0;
+        double sum_hf[3] = {};
+        double sum_mf[3] = {};
+        double sum_chr[3] = {};
+        const size_t total_blocks =
+            frame_dim.xsize_blocks * frame_dim.ysize_blocks;
+        for (size_t by = 0; by < frame_dim.ysize_blocks; ++by) {
+          const float* JXL_RESTRICT q0_row = initial_quant_field.ConstRow(by);
+          const float* JXL_RESTRICT bq_row[3][4];
+          for (size_t c = 0; c < 3; ++c) {
+            for (size_t s = 0; s < 4; ++s) {
+              bq_row[c][s] = band_qf[c][s].ConstRow(by);
+            }
+          }
+          for (size_t bx = 0; bx < frame_dim.xsize_blocks; ++bx) {
+            uint32_t act_bits = 0;
+            memcpy(&act_bits, &bq_row[1][0][bx], sizeof(act_bits));
+            const int32_t activity =
+                static_cast<int32_t>((act_bits >> 1) & 15u);
+            const float act_w =
+                std::min(1.0f, static_cast<float>(activity) * (1.0f / 3.0f));
+            act_sum += act_w;
+            const float q_base = std::max(q0_row[bx], 1e-4f);
+            const float bq12 = std::max(bq_row[1][2][bx], 1e-4f);
+            const float w_blk =
+                0.05f + 0.65f * act_w +
+                0.30f * Clamp1(std::log((1.18f * q_base) / bq12), 0.0f, 1.0f);
+            w_sum += w_blk;
+            for (size_t c = 0; c < 3; ++c) {
+              const float b0 = std::max(bq_row[c][0][bx], 1e-4f);
+              const float b1 = std::max(bq_row[c][1][bx], 1e-4f);
+              const float b2 = std::max(bq_row[c][2][bx], 1e-4f);
+              const float b3 = std::max(bq_row[c][3][bx], 1e-4f);
+              sum_hf[c] += w_blk * (std::log(b0 / b3) - ln_r03_flat) * inv_w_bd;
+              sum_mf[c] += w_blk * (std::log(b1 / b2) - ln_r12_flat) * inv_w_bd;
+              if (c != 1) {
+                sum_chr[c] += w_blk * std::log(b2 / bq12) * inv_w_bd;
+              }
+            }
+          }
+        }
+        if (w_sum > 1e-6 && total_blocks > 0) {
+          static constexpr float kHfRef[3] = {-0.085f, -0.076f, -0.080f};
+          static constexpr float kMfRef[3] = {-0.036f, -0.045f, -0.034f};
+          static constexpr float kChrRef[3] = {0.008f, 0.0f, -0.002f};
+          const float act_frac =
+              static_cast<float>(act_sum) / static_cast<float>(total_blocks);
+          const float act_gate =
+              Clamp1((act_frac - 0.04f) / 0.22f, 0.0f, 1.0f);
+          for (size_t c = 0; c < 3; ++c) {
+            const float hf_t = static_cast<float>(sum_hf[c] / w_sum);
+            const float mf_t = static_cast<float>(sum_mf[c] / w_sum);
+            const float chr_t = static_cast<float>(sum_chr[c] / w_sum);
+            delta_hf[c] =
+                act_gate *
+                (-0.010f + Clamp1(hf_t - kHfRef[c], -0.035f, 0.0f));
+            const float raw_mf =
+                act_gate *
+                Clamp1((mf_t - kMfRef[c]) - 0.40f * (hf_t - kHfRef[c]), -0.004f,
+                       0.009f);
+            delta_mf[c] = std::min(raw_mf, -0.38f * delta_hf[c]);
+            delta_chr[c] =
+                (c != 1)
+                    ? (act_gate * Clamp1(chr_t - kChrRef[c], -0.030f, 0.0f))
+                    : 0.0f;
+          }
+        }
+      }
+    }
 
     std::vector<QuantEncoding> encodings(kNumQuantTables,
                                          QuantEncoding::Library<0>());
@@ -992,10 +1079,19 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                 : eval_ln_w(0.0f);
         target_w[0] = std::exp(ln_w_0);
         target_w[1] = std::exp(ln_w_1);
+        const float d_gate = Clamp1((d - 1.05f) / 0.45f, 0.0f, 1.0f) *
+                             (1.0f - 0.35f * Clamp1(d - 1.50f, 0.0f, 1.0f));
+        const float hf_adapt =
+            d_gate * (0.22f * delta_hf[c] + 0.14f * delta_chr[c]);
+        const float mf_adapt =
+            d_gate * 0.22f * delta_mf[c] * std::exp(-0.55f * b);
         for (size_t k = 2; k < out_bands; ++k) {
           const float u =
               static_cast<float>(k) / static_cast<float>(out_bands - 1);
-          target_w[k] = std::exp(eval_ln_w(u));
+          const float xi = (u - u1) / (1.0f - u1);
+          const float mod =
+              hf_adapt * xi * xi + mf_adapt * 4.0f * xi * (1.0f - xi);
+          target_w[k] = std::exp(eval_ln_w(u) + mod);
         }
 
         new_params.distance_bands[c][0] = target_w[0];
@@ -2352,8 +2448,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   if (initialize_global_state) {
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
-        memory_manager, cparams, frame_dim, enable_rdo, modular_frame_encoder,
-        &matrices));
+        memory_manager, cparams, frame_dim, enable_rdo, initial_quant_field,
+        /*band_qf=*/nullptr, modular_frame_encoder, &matrices));
   }
 
   enc_state->x_qm_multiplier =
@@ -2539,17 +2635,29 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   if (!streaming_mode && initialize_global_state) {
     uint32_t used_tables_mask = 0;
+    uint32_t used_acs_mask = 1u;
     for (size_t y = 0; y < ac_strategy.ysize(); ++y) {
       AcStrategyRow row = ac_strategy.ConstRow(y);
       for (size_t x = 0; x < ac_strategy.xsize(); ++x) {
         AcStrategy acs = row[x];
         if (!acs.IsFirstBlock()) continue;
-        const size_t table_idx = static_cast<size_t>(
-            kAcStrategyToQuantTableMap[static_cast<size_t>(acs.Strategy())]);
+        const size_t st = static_cast<size_t>(acs.Strategy());
+        const size_t table_idx =
+            static_cast<size_t>(kAcStrategyToQuantTableMap[st]);
         used_tables_mask |= (1u << table_idx);
+        used_acs_mask |= (1u << st);
       }
     }
+    if (enable_rdo && cparams.butteraugli_distance > 1.05f) {
+      JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
+          memory_manager, cparams, frame_dim, enable_rdo, initial_quant_field,
+          enc_state->band_qf, modular_frame_encoder, &matrices));
+    }
     matrices.PruneUnusedEncodings(used_tables_mask);
+    if (enable_rdo) {
+      JXL_RETURN_IF_ERROR(
+          matrices.EnsureComputed(memory_manager, used_acs_mask));
+    }
   }
 
   // Refine quantization levels.
