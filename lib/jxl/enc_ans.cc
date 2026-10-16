@@ -746,22 +746,28 @@ Status EntropyEncodingData::ChooseUintConfigs(
   std::vector<HybridUintConfig> configs;
   if (params.uint_method == HistogramParams::HybridUintMethod::kBest) {
     configs = {
-        HybridUintConfig(4, 2, 0),  // default
-        HybridUintConfig(4, 1, 0),  // less precise
-        HybridUintConfig(4, 2, 1),  // add sign
-        HybridUintConfig(4, 2, 2),  // add sign+parity
-        HybridUintConfig(4, 1, 2),  // add parity but less msb
+        HybridUintConfig(4, 2, 0),   // default
+        HybridUintConfig(4, 1, 0),   // less precise
+        HybridUintConfig(4, 1, 1),   // 1 msb + 1 lsb
+        HybridUintConfig(4, 2, 1),   // add sign
+        HybridUintConfig(4, 2, 2),   // add sign+parity
+        HybridUintConfig(4, 1, 2),   // add parity but less msb
+        HybridUintConfig(4, 0, 0),   // pure exponent above 16
         // Same as above, but more direct coding.
         HybridUintConfig(5, 2, 0), HybridUintConfig(5, 1, 0),
         HybridUintConfig(5, 2, 1), HybridUintConfig(5, 2, 2),
-        HybridUintConfig(5, 1, 2),
+        HybridUintConfig(5, 1, 2), HybridUintConfig(5, 0, 0),
         // Same as above, but less direct coding.
         HybridUintConfig(3, 2, 0), HybridUintConfig(3, 1, 0),
         HybridUintConfig(3, 2, 1), HybridUintConfig(3, 1, 2),
+        HybridUintConfig(3, 0, 0),
+        // Small split pure exponent / ctx-map style.
+        HybridUintConfig(2, 0, 0), HybridUintConfig(1, 0, 0),
         // For near-lossless.
         HybridUintConfig(4, 1, 3), HybridUintConfig(5, 1, 4),
         HybridUintConfig(5, 2, 3), HybridUintConfig(6, 1, 5),
-        HybridUintConfig(6, 2, 4), HybridUintConfig(6, 0, 0),
+        HybridUintConfig(6, 2, 4), HybridUintConfig(6, 1, 0),
+        HybridUintConfig(6, 0, 0),
         // Other
         HybridUintConfig(0, 0, 0),   // varlenuint
         HybridUintConfig(2, 0, 1),   // works well for ctx map
@@ -832,10 +838,51 @@ Status EntropyEncodingData::ChooseUintConfigs(
       AlignedMemory tmp,
       AlignedMemory::Create(memory_manager, (max_histo_volume + max_vec_size) *
                                                 sizeof(uint32_t)));
+  struct CandidateConfig {
+    float screen_cost;
+    float header_bits;
+    size_t extra_bits;
+    HybridUintConfig cfg;
+    Histogram histo;
+  };
+  constexpr size_t kTopCandidates = 4;
+
   for (size_t h = 0; h < num_histo; h++) {
-    float best_cost = std::numeric_limits<float>::max();
+    uint32_t max_v = max_value_per_histo[h];
+    size_t len = histo_volume[h];
+    uint32_t* data = transposed.data() + histo_offset[h];
+
+    Histogram lz77_histo;
+    size_t lz77_len = histo_volume[num_histo + h];
+    if (lz77_len > 0) {
+      size_t max_histo_tok = max_value_per_histo[num_histo + h];
+      uint32_t tok, nbits, bits;
+      lz77.length_uint_config.Encode(max_histo_tok, &tok, &nbits, &bits);
+      tok |= lz77.length_uint_config.LsbMask();
+      tok += lz77.min_symbol;
+      lz77_histo.EnsureCapacity(tok + 1);
+      uint32_t* lz77_data = transposed.data() + histo_offset[num_histo + h];
+      uint32_t unused =
+          EstimateTokenCost(lz77_data, lz77_len, lz77.length_uint_config, tmp);
+      (void)unused;
+      uint32_t* tmp_tokens = tmp.address<uint32_t>();
+      for (size_t i = 0; i < lz77_len; ++i) {
+        lz77_histo.FastAdd(tmp_tokens[i] + lz77.min_symbol);
+      }
+      lz77_histo.Condition();
+    }
+
+    CandidateConfig top_cands[kTopCandidates];
+    size_t num_cands = 0;
+
     for (HybridUintConfig cfg : configs) {
-      uint32_t max_v = max_value_per_histo[h];
+      if (!use_prefix_code && cfg.split_exponent > 8) {
+        continue;
+      }
+      if (params.uint_method == HistogramParams::HybridUintMethod::kBest &&
+          cfg.split_exponent > 0 && max_v < (1u << (cfg.split_exponent - 1))) {
+        continue;
+      }
       size_t capacity;
       {
         uint32_t tok, nbits, bits;
@@ -848,54 +895,110 @@ Status EntropyEncodingData::ChooseUintConfigs(
       }
 
       Histogram histo;
-      histo.EnsureCapacity(capacity);
-      size_t len = histo_volume[h];
-      uint32_t* data = transposed.data() + histo_offset[h];
+      histo.EnsureCapacity(std::max(capacity, lz77_histo.counts.size()));
       size_t extra_bits = EstimateTokenCost(data, len, cfg, tmp);
       uint32_t* tmp_tokens = tmp.address<uint32_t>();
       for (size_t i = 0; i < len; ++i) {
         histo.FastAdd(tmp_tokens[i]);
       }
       histo.Condition();
-      JXL_ASSIGN_OR_RETURN(float cost, histo.ANSPopulationCost());
-      cost += extra_bits;
-      // Add signaling cost of the hybriduintconfig itself.
-      cost += CeilLog2Nonzero(cfg.split_exponent + 1);
-      cost += CeilLog2Nonzero(cfg.split_exponent - cfg.msb_in_token + 1);
-      if (cost < best_cost) {
-        uint_config[h] = cfg;
-        best_cost = cost;
-        clustered_histograms[h].swap(histo);
+      if (lz77_len > 0) {
+        histo.AddHistogram(lz77_histo);
+      }
+
+      float header_bits = 0.0f;
+      const size_t fixed_log_alpha =
+          use_prefix_code ? static_cast<size_t>(PREFIX_MAX_BITS) : 8;
+      if (cfg.split_exponent != fixed_log_alpha) {
+        header_bits += CeilLog2Nonzero(cfg.split_exponent + 1);
+        header_bits +=
+            CeilLog2Nonzero(cfg.split_exponent - cfg.msb_in_token + 1);
+      }
+
+      float pop_cost = 0.0f;
+      if (use_prefix_code) {
+        size_t size = histo.alphabet_size();
+        SizeWriter varlen_writer;
+        StoreVarLenUint16(std::max<size_t>(1, size) - 1, &varlen_writer);
+        pop_cost = static_cast<float>(varlen_writer.size);
+        if (size > 1) {
+          std::vector<uint32_t> counts_u32(size);
+          for (size_t i = 0; i < size; ++i) {
+            counts_u32[i] = static_cast<uint32_t>(histo.counts[i]);
+          }
+          std::vector<uint8_t> depths(size);
+          std::vector<uint16_t> bits(size);
+          BitWriter tmp_writer{memory_manager};
+          JXL_RETURN_IF_ERROR(tmp_writer.WithMaxBits(
+              8 * size + 8, LayerType::Header, /*aux_out=*/nullptr, [&] {
+                return BuildAndStoreHuffmanTree(
+                    counts_u32.data(), size, depths.data(), bits.data(),
+                    &tmp_writer);
+              }));
+          size_t huff_cost = tmp_writer.BitsWritten();
+          for (size_t i = 0; i < size; ++i) {
+            huff_cost += static_cast<size_t>(counts_u32[i]) * depths[i];
+          }
+          pop_cost += static_cast<float>(huff_cost);
+        }
+      } else {
+        JXL_ASSIGN_OR_RETURN(pop_cost, histo.ANSPopulationCost());
+      }
+
+      float screen_cost = pop_cost + extra_bits + header_bits;
+      if (num_cands < kTopCandidates ||
+          screen_cost < top_cands[num_cands - 1].screen_cost) {
+        size_t pos = num_cands < kTopCandidates ? num_cands++
+                                                : (kTopCandidates - 1);
+        while (pos > 0 && screen_cost < top_cands[pos - 1].screen_cost) {
+          top_cands[pos] = std::move(top_cands[pos - 1]);
+          --pos;
+        }
+        top_cands[pos] = CandidateConfig{screen_cost, header_bits, extra_bits,
+                                         cfg, std::move(histo)};
       }
     }
+
+    if (num_cands == 0) {
+      if (lz77_len > 0) {
+        clustered_histograms[h].AddHistogram(lz77_histo);
+      }
+      continue;
+    }
+
+    size_t best_idx = 0;
+    if (!use_prefix_code &&
+        params.ans_histogram_strategy !=
+            HistogramParams::ANSHistogramStrategy::kFast &&
+        num_cands > 1) {
+      float best_exact_cost = std::numeric_limits<float>::max();
+      for (size_t c = 0; c < num_cands; ++c) {
+        JXL_ASSIGN_OR_RETURN(
+            ANSEncodingHistogram normalized,
+            ANSEncodingHistogram::ComputeBest(top_cands[c].histo,
+                                              params.ans_histogram_strategy));
+        float exact_cost = normalized.Cost() + top_cands[c].extra_bits +
+                           top_cands[c].header_bits;
+        if (exact_cost < best_exact_cost) {
+          best_exact_cost = exact_cost;
+          best_idx = c;
+        }
+      }
+    }
+    uint_config[h] = top_cands[best_idx].cfg;
+    clustered_histograms[h].swap(top_cands[best_idx].histo);
   }
 
   size_t max_tok = 0;
   for (size_t h = 0; h < num_histo; ++h) {
-    Histogram& histo = clustered_histograms[h];
-    max_tok = std::max(max_tok, histo.MaxSymbol());
-    size_t len = histo_volume[num_histo + h];
-    if (len == 0) continue;  // E.g. when lz77 not enabled
-    size_t max_histo_tok = max_value_per_histo[num_histo + h];
-    uint32_t tok, nbits, bits;
-    lz77.length_uint_config.Encode(max_histo_tok, &tok, &nbits, &bits);
-    tok |= lz77.length_uint_config.LsbMask();
-    tok += lz77.min_symbol;
-    histo.EnsureCapacity(tok + 1);
-    uint32_t* data = transposed.data() + histo_offset[num_histo + h];
-    uint32_t unused =
-        EstimateTokenCost(data, len, lz77.length_uint_config, tmp);
-    (void)unused;
-    uint32_t* tmp_tokens = tmp.address<uint32_t>();
-    for (size_t i = 0; i < len; ++i) {
-      histo.FastAdd(tmp_tokens[i] + lz77.min_symbol);
-    }
-    histo.Condition();
-    max_tok = std::max(max_tok, histo.MaxSymbol());
+    max_tok = std::max(max_tok, clustered_histograms[h].MaxSymbol());
   }
 
   // `log_alpha_size - 5` is encoded in the header, so min is 5.
   size_t log_size = 5;
+  for (size_t h = 0; h < num_histo; ++h) {
+    log_size = std::max<size_t>(log_size, uint_config[h].split_exponent);
+  }
   while (max_tok >= (1u << log_size)) ++log_size;
 
   size_t max_log_alpha_size = use_prefix_code ? PREFIX_MAX_BITS : 8;
@@ -949,13 +1052,122 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
         clustered_histograms[0].Add(i);
       }
     }
-    if (writer != nullptr) {
-      JXL_RETURN_IF_ERROR(EncodeContextMap(
-          context_map, clustered_histograms.size(), writer, layer, aux_out));
-    }
   } else {
     JXL_ENSURE(encoding_info.empty());
     clustered_histograms.push_back(builder[0]);
+  }
+
+  JXL_RETURN_IF_ERROR(
+      ChooseUintConfigs(memory_manager, params, tokens, clustered_histograms));
+
+  if (prev_histograms == 0 && !use_prefix_code && !ans_fuzzer_friendly_ &&
+      builder.size() > 1 && clustered_histograms.size() > 1 &&
+      params.clustering == HistogramParams::ClusteringType::kBest) {
+    size_t num_h = clustered_histograms.size();
+    std::vector<float> h_costs(num_h, 0.0f);
+    std::vector<size_t> ctx_cnt(num_h, 0);
+    std::vector<uint8_t> alive(num_h, 1);
+    std::vector<size_t> remap_h(num_h);
+    for (size_t h = 0; h < num_h; ++h) {
+      remap_h[h] = h;
+      JXL_ASSIGN_OR_RETURN(ANSEncodingHistogram norm,
+                           ANSEncodingHistogram::ComputeBest(
+                               clustered_histograms[h],
+                               params.ans_histogram_strategy));
+      h_costs[h] = norm.Cost();
+    }
+    for (size_t c = 0; c < builder.size(); ++c) {
+      if (builder[c].total_count > 0) {
+        ctx_cnt[context_map[context_offset + c]]++;
+      }
+    }
+    bool merged_any = false;
+    while (true) {
+      float best_gain = 0.0f;
+      size_t best_i = 0;
+      size_t best_j = 0;
+      Histogram best_merged;
+      float best_m_cost = 0.0f;
+      for (size_t i = 0; i < num_h; ++i) {
+        if (!alive[i]) continue;
+        for (size_t j = i + 1; j < num_h; ++j) {
+          if (!alive[j]) continue;
+          if (uint_config[i].split_exponent != uint_config[j].split_exponent ||
+              uint_config[i].msb_in_token != uint_config[j].msb_in_token ||
+              uint_config[i].lsb_in_token != uint_config[j].lsb_in_token) {
+            continue;
+          }
+          Histogram merged = clustered_histograms[i];
+          merged.AddHistogram(clustered_histograms[j]);
+          JXL_ASSIGN_OR_RETURN(
+              ANSEncodingHistogram norm_m,
+              ANSEncodingHistogram::ComputeBest(
+                  merged, params.ans_histogram_strategy));
+          float m_cost = norm_m.Cost();
+          float cfg_bits =
+              static_cast<float>(CeilLog2Nonzero(log_alpha_size + 1));
+          if (uint_config[i].split_exponent != log_alpha_size) {
+            cfg_bits += CeilLog2Nonzero(uint_config[i].split_exponent + 1);
+            cfg_bits += CeilLog2Nonzero(uint_config[i].split_exponent -
+                                        uint_config[i].msb_in_token + 1);
+          }
+          float ctx_bits = 0.0f;
+          if (ctx_cnt[i] > 0 && ctx_cnt[j] > 0) {
+            float fi = static_cast<float>(ctx_cnt[i]);
+            float fj = static_cast<float>(ctx_cnt[j]);
+            ctx_bits = 0.4f * ((fi + fj) * std::log2(fi + fj) -
+                               fi * std::log2(fi) - fj * std::log2(fj));
+          }
+          float gain = (h_costs[i] + h_costs[j] + cfg_bits + ctx_bits) - m_cost;
+          if (gain > best_gain) {
+            best_gain = gain;
+            best_i = i;
+            best_j = j;
+            best_merged = std::move(merged);
+            best_m_cost = m_cost;
+          }
+        }
+      }
+      if (best_gain <= 0.0f) break;
+      clustered_histograms[best_i] = std::move(best_merged);
+      h_costs[best_i] = best_m_cost;
+      ctx_cnt[best_i] += ctx_cnt[best_j];
+      ctx_cnt[best_j] = 0;
+      alive[best_j] = 0;
+      for (size_t k = 0; k < num_h; ++k) {
+        if (remap_h[k] == best_j) remap_h[k] = best_i;
+      }
+      merged_any = true;
+    }
+    if (merged_any) {
+      std::vector<int> canon(num_h, -1);
+      std::vector<Histogram> new_histos;
+      std::vector<HybridUintConfig> new_cfgs;
+      for (size_t c = 0; c < builder.size(); ++c) {
+        size_t old_h = remap_h[context_map[context_offset + c]];
+        if (canon[old_h] < 0) {
+          canon[old_h] = static_cast<int>(new_histos.size());
+          new_histos.push_back(std::move(clustered_histograms[old_h]));
+          new_cfgs.push_back(uint_config[old_h]);
+        }
+        context_map[context_offset + c] = static_cast<uint8_t>(canon[old_h]);
+      }
+      clustered_histograms.swap(new_histos);
+      uint_config.swap(new_cfgs);
+      size_t max_tok = 0;
+      size_t log_size = 5;
+      for (size_t h = 0; h < clustered_histograms.size(); ++h) {
+        max_tok = std::max(max_tok, clustered_histograms[h].MaxSymbol());
+        log_size = std::max<size_t>(log_size, uint_config[h].split_exponent);
+      }
+      while (max_tok >= (1u << log_size)) ++log_size;
+      log_alpha_size = log_size;
+    }
+  }
+
+  if (builder.size() > 1 && writer != nullptr) {
+    JXL_RETURN_IF_ERROR(EncodeContextMap(
+        context_map, clustered_histograms.size(), writer, layer, aux_out));
   }
   if (aux_out != nullptr) {
     for (size_t i = prev_histograms; i < clustered_histograms.size(); ++i) {
@@ -963,9 +1175,6 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
           clustered_histograms[i].ShannonEntropy();
     }
   }
-
-  JXL_RETURN_IF_ERROR(
-      ChooseUintConfigs(memory_manager, params, tokens, clustered_histograms));
 
   SizeWriter size_writer;  // Used if writer == nullptr to estimate costs.
   size_t cost = use_prefix_code ? 1 : 3;

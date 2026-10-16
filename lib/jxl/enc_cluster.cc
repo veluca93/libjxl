@@ -6,6 +6,7 @@
 #include "lib/jxl/enc_cluster.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -134,7 +135,8 @@ float HistogramKLDivergence(const Histogram& actual, const Histogram& coding) {
 
 // First step of a k-means clustering with a fancy distance metric.
 Status FastClusterHistograms(const std::vector<Histogram>& in,
-                             size_t max_histograms, std::vector<Histogram>* out,
+                             size_t max_histograms, bool is_best,
+                             std::vector<Histogram>* out,
                              std::vector<uint32_t>* histogram_symbols) {
   const size_t prev_histograms = out->size();
   out->reserve(max_histograms);
@@ -155,6 +157,42 @@ Status FastClusterHistograms(const std::vector<Histogram>& in,
     }
   }
 
+  // Group 1-symbol (zero-entropy) contexts by their unique symbol so they are
+  // not prematurely absorbed into multi-symbol clusters before exact ANS cost
+  // merging runs in ClusterHistograms.
+  if (is_best && prev_histograms == 0 && max_histograms > 2) {
+    std::map<size_t, std::vector<size_t>> single_sym_groups;
+    std::map<size_t, size_t> single_sym_counts;
+    for (size_t i = 0; i < in.size(); ++i) {
+      if (in[i].total_count > 0 && in[i].entropy == 0.0f) {
+        size_t sym = in[i].MaxSymbol();
+        single_sym_groups[sym].push_back(i);
+        single_sym_counts[sym] += in[i].total_count;
+      }
+    }
+    for (const auto& kv : single_sym_groups) {
+      if (single_sym_counts[kv.first] < 16) continue;
+      if (out->size() + 1 >= max_histograms) break;
+      size_t cluster_id = out->size();
+      Histogram combined;
+      for (size_t idx : kv.second) {
+        combined.AddHistogram(in[idx]);
+        (*histogram_symbols)[idx] = cluster_id;
+        dists[idx] = 0.0f;
+      }
+      HistogramEntropy(combined);
+      out->push_back(std::move(combined));
+    }
+    largest_idx = 0;
+    for (size_t i = 0; i < in.size(); ++i) {
+      if (dists[i] == 0.0f) continue;
+      if (dists[largest_idx] == 0.0f ||
+          in[i].total_count > in[largest_idx].total_count) {
+        largest_idx = i;
+      }
+    }
+  }
+
   if (prev_histograms > 0) {
     for (size_t j = 0; j < prev_histograms; ++j) {
       HistogramEntropy((*out)[j]);
@@ -172,7 +210,8 @@ Status FastClusterHistograms(const std::vector<Histogram>& in,
   }
 
   constexpr float kMinDistanceForDistinct = 48.0f;
-  while (out->size() < max_histograms) {
+  while (out->size() < max_histograms &&
+         (out->empty() || dists[largest_idx] > 0.0f)) {
     (*histogram_symbols)[largest_idx] = out->size();
     out->push_back(in[largest_idx]);
     dists[largest_idx] = 0.0f;
@@ -217,6 +256,7 @@ namespace jxl {
 HWY_EXPORT(FastClusterHistograms);  // Local function
 HWY_EXPORT(HistogramEntropy);       // Local function
 HWY_EXPORT(HistogramCondition);     // Local function
+HWY_EXPORT(HistogramKLDivergence);  // Local function
 
 void Histogram::Condition() { HWY_DYNAMIC_DISPATCH(HistogramCondition)(*this); }
 
@@ -268,11 +308,12 @@ Status ClusterHistograms(const HistogramParams& params,
     max_histograms = std::min(max_histograms, static_cast<size_t>(4));
   }
 
+  const bool is_best =
+      (params.clustering == HistogramParams::ClusteringType::kBest);
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(FastClusterHistograms)(
-      in, prev_histograms + max_histograms, out, histogram_symbols));
+      in, prev_histograms + max_histograms, is_best, out, histogram_symbols));
 
-  if (prev_histograms == 0 &&
-      params.clustering == HistogramParams::ClusteringType::kBest) {
+  if (prev_histograms == 0 && is_best) {
     for (auto& histo : *out) {
       JXL_ASSIGN_OR_RETURN(histo.entropy, histo.ANSPopulationCost());
     }
@@ -280,6 +321,24 @@ Status ClusterHistograms(const HistogramParams& params,
     std::vector<uint32_t> version(out->size(), 1);
     std::vector<uint32_t> renumbering(out->size());
     std::iota(renumbering.begin(), renumbering.end(), 0);
+    std::vector<size_t> ctx_count(out->size(), 0);
+    for (size_t i = 0; i < in.size(); ++i) {
+      if (in[i].total_count > 0) {
+        ctx_count[(*histogram_symbols)[i]]++;
+      }
+    }
+
+    auto pair_merge_bonus = [&](uint32_t a, uint32_t b) -> float {
+      constexpr float kUintConfigBits = 5.0f;
+      size_t ca = ctx_count[a];
+      size_t cb = ctx_count[b];
+      if (ca == 0 || cb == 0) return kUintConfigBits;
+      float fa = static_cast<float>(ca);
+      float fb = static_cast<float>(cb);
+      float ctx_bits = (fa + fb) * std::log2(fa + fb) - fa * std::log2(fa) -
+                       fb * std::log2(fb);
+      return kUintConfigBits + 0.4f * ctx_bits;
+    };
 
     // Try to pair up clusters if doing so reduces the total cost.
 
@@ -306,7 +365,7 @@ Status ClusterHistograms(const HistogramParams& params,
         histo.AddHistogram((*out)[i]);
         histo.AddHistogram((*out)[j]);
         JXL_ASSIGN_OR_RETURN(float cost, histo.ANSPopulationCost());
-        cost -= (*out)[i].entropy + (*out)[j].entropy;
+        cost -= (*out)[i].entropy + (*out)[j].entropy + pair_merge_bonus(i, j);
         // Avoid enqueueing pairs that are not advantageous to merge.
         if (cost >= 0) continue;
         pairs_to_merge.push(
@@ -326,6 +385,8 @@ Status ClusterHistograms(const HistogramParams& params,
         continue;
       }
       (*out)[first].AddHistogram((*out)[second]);
+      ctx_count[first] += ctx_count[second];
+      ctx_count[second] = 0;
       JXL_ASSIGN_OR_RETURN((*out)[first].entropy,
                            (*out)[first].ANSPopulationCost());
       for (uint32_t& item : renumbering) {
@@ -342,7 +403,8 @@ Status ClusterHistograms(const HistogramParams& params,
         histo.AddHistogram((*out)[first]);
         histo.AddHistogram((*out)[j]);
         JXL_ASSIGN_OR_RETURN(float merge_cost, histo.ANSPopulationCost());
-        merge_cost -= (*out)[first].entropy + (*out)[j].entropy;
+        merge_cost -=
+            (*out)[first].entropy + (*out)[j].entropy + pair_merge_bonus(first, j);
         // Avoid enqueueing pairs that are not advantageous to merge.
         if (merge_cost >= 0) continue;
         pairs_to_merge.push(
@@ -354,12 +416,89 @@ Status ClusterHistograms(const HistogramParams& params,
     size_t num_alive = 0;
     for (size_t i = 0; i < out->size(); i++) {
       if (version[i] == 0) continue;
-      (*out)[num_alive++] = (*out)[i];
-      reverse_renumbering[i] = num_alive - 1;
+      (*out)[num_alive] = (*out)[i];
+      ctx_count[num_alive] = ctx_count[i];
+      reverse_renumbering[i] = num_alive;
+      num_alive++;
     }
     out->resize(num_alive);
+    ctx_count.resize(num_alive);
     for (uint32_t& item : *histogram_symbols) {
       item = reverse_renumbering[renumbering[item]];
+    }
+
+    // Relocate individual contexts between surviving clusters if exact ANS cost
+    // improves.
+    if (out->size() > 1 && in.size() > out->size()) {
+      std::vector<float> ans_costs(out->size());
+      for (size_t c = 0; c < out->size(); ++c) {
+        ans_costs[c] = (*out)[c].entropy;
+        HWY_DYNAMIC_DISPATCH(HistogramEntropy)((*out)[c]);
+      }
+      for (int pass = 0; pass < 2; ++pass) {
+        bool moved_any = false;
+        for (size_t i = 0; i < in.size(); ++i) {
+          if (in[i].total_count == 0) continue;
+          uint32_t cur = (*histogram_symbols)[i];
+          if (ctx_count[cur] <= 1) continue;
+          float cur_kl =
+              HWY_DYNAMIC_DISPATCH(HistogramKLDivergence)(in[i], (*out)[cur]);
+          uint32_t best_c = cur;
+          float best_kl = cur_kl;
+          for (uint32_t c = 0; c < out->size(); ++c) {
+            if (c == cur) continue;
+            float kl =
+                HWY_DYNAMIC_DISPATCH(HistogramKLDivergence)(in[i], (*out)[c]);
+            if (kl < best_kl) {
+              best_kl = kl;
+              best_c = c;
+            }
+          }
+          if (best_c == cur || best_kl + 0.5f >= cur_kl) continue;
+          Histogram h_cur = (*out)[cur];
+          for (size_t s = 0; s < in[i].counts.size(); ++s) {
+            h_cur.counts[s] -= in[i].counts[s];
+          }
+          h_cur.Condition();
+          Histogram h_best = (*out)[best_c];
+          h_best.AddHistogram(in[i]);
+          JXL_ASSIGN_OR_RETURN(float cost_cur_new, h_cur.ANSPopulationCost());
+          JXL_ASSIGN_OR_RETURN(float cost_best_new, h_best.ANSPopulationCost());
+          if (cost_cur_new + cost_best_new + 0.25f <
+              ans_costs[cur] + ans_costs[best_c]) {
+            (*out)[cur] = std::move(h_cur);
+            (*out)[best_c] = std::move(h_best);
+            ans_costs[cur] = cost_cur_new;
+            ans_costs[best_c] = cost_best_new;
+            HWY_DYNAMIC_DISPATCH(HistogramEntropy)((*out)[cur]);
+            HWY_DYNAMIC_DISPATCH(HistogramEntropy)((*out)[best_c]);
+            ctx_count[cur]--;
+            ctx_count[best_c]++;
+            (*histogram_symbols)[i] = best_c;
+            moved_any = true;
+          }
+        }
+        if (!moved_any) break;
+      }
+    }
+  }
+
+  // Assign empty contexts to the preceding non-empty context's cluster so
+  // RLE/MTF runs in context_map are not broken by unused contexts.
+  if (prev_histograms == 0 && is_best && !out->empty()) {
+    uint32_t last_sym = (*histogram_symbols)[0];
+    for (size_t i = 0; i < in.size(); ++i) {
+      if (in[i].total_count > 0) {
+        last_sym = (*histogram_symbols)[i];
+        break;
+      }
+    }
+    for (size_t i = 0; i < in.size(); ++i) {
+      if (in[i].total_count == 0) {
+        (*histogram_symbols)[i] = last_sym;
+      } else {
+        last_sym = (*histogram_symbols)[i];
+      }
     }
   }
 

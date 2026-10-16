@@ -126,11 +126,22 @@ uint32_t EstimateTokenCost(uint32_t* JXL_RESTRICT values, size_t len,
 #else
   if (cfg.split_exponent == 0) {
     return EstimateTokenCostImpl<0, 0, 0>(values, len, out);
+  } else if (cfg.split_exponent == 1) {
+    JXL_DASSERT((cfg.msb_in_token == 0) && (cfg.lsb_in_token == 0));
+    return EstimateTokenCostImpl<1, 0, 0>(values, len, out);
   } else if (cfg.split_exponent == 2) {
-    JXL_DASSERT((cfg.msb_in_token == 0) && (cfg.lsb_in_token == 1));
-    return EstimateTokenCostImpl<2, 0, 1>(values, len, out);
+    JXL_DASSERT(cfg.msb_in_token == 0);
+    if (cfg.lsb_in_token == 0) {
+      return EstimateTokenCostImpl<2, 0, 0>(values, len, out);
+    } else {
+      JXL_DASSERT(cfg.lsb_in_token == 1);
+      return EstimateTokenCostImpl<2, 0, 1>(values, len, out);
+    }
   } else if (cfg.split_exponent == 3) {
-    if (cfg.msb_in_token == 1) {
+    if (cfg.msb_in_token == 0) {
+      JXL_DASSERT(cfg.lsb_in_token == 0);
+      return EstimateTokenCostImpl<3, 0, 0>(values, len, out);
+    } else if (cfg.msb_in_token == 1) {
       if (cfg.lsb_in_token == 0) {
         return EstimateTokenCostImpl<3, 1, 0>(values, len, out);
       } else {
@@ -147,9 +158,14 @@ uint32_t EstimateTokenCost(uint32_t* JXL_RESTRICT values, size_t len,
       }
     }
   } else if (cfg.split_exponent == 4) {
-    if (cfg.msb_in_token == 1) {
+    if (cfg.msb_in_token == 0) {
+      JXL_DASSERT(cfg.lsb_in_token == 0);
+      return EstimateTokenCostImpl<4, 0, 0>(values, len, out);
+    } else if (cfg.msb_in_token == 1) {
       if (cfg.lsb_in_token == 0) {
         return EstimateTokenCostImpl<4, 1, 0>(values, len, out);
+      } else if (cfg.lsb_in_token == 1) {
+        return EstimateTokenCostImpl<4, 1, 1>(values, len, out);
       } else if (cfg.lsb_in_token == 2) {
         return EstimateTokenCostImpl<4, 1, 2>(values, len, out);
       } else {
@@ -168,7 +184,10 @@ uint32_t EstimateTokenCost(uint32_t* JXL_RESTRICT values, size_t len,
       }
     }
   } else if (cfg.split_exponent == 5) {
-    if (cfg.msb_in_token == 1) {
+    if (cfg.msb_in_token == 0) {
+      JXL_DASSERT(cfg.lsb_in_token == 0);
+      return EstimateTokenCostImpl<5, 0, 0>(values, len, out);
+    } else if (cfg.msb_in_token == 1) {
       if (cfg.lsb_in_token == 0) {
         return EstimateTokenCostImpl<5, 1, 0>(values, len, out);
       } else if (cfg.lsb_in_token == 2) {
@@ -195,8 +214,12 @@ uint32_t EstimateTokenCost(uint32_t* JXL_RESTRICT values, size_t len,
       JXL_DASSERT(cfg.lsb_in_token == 0);
       return EstimateTokenCostImpl<6, 0, 0>(values, len, out);
     } else if (cfg.msb_in_token == 1) {
-      JXL_DASSERT(cfg.lsb_in_token == 5);
-      return EstimateTokenCostImpl<6, 1, 5>(values, len, out);
+      if (cfg.lsb_in_token == 0) {
+        return EstimateTokenCostImpl<6, 1, 0>(values, len, out);
+      } else {
+        JXL_DASSERT(cfg.lsb_in_token == 5);
+        return EstimateTokenCostImpl<6, 1, 5>(values, len, out);
+      }
     } else {
       JXL_DASSERT(cfg.msb_in_token == 2);
       JXL_DASSERT(cfg.lsb_in_token == 4);
