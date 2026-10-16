@@ -630,7 +630,8 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
               const auto z4 = Mul(z2, z2);
               const auto w_act = Div(z4, Add(one, z4));
               if (c == 1) {
-                Store(use_csf_w ? Mul(w_act, in) : in, df, rec_y + off + rx);
+                Store((config.band_qf_stride > 0) ? Mul(w_act, in) : in, df,
+                      rec_y + off + rx);
               }
               const auto err_denom =
                   Sqrt(Add(one, Mul(Set(df, 1.8f), z2)));
@@ -664,7 +665,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
               const auto q_mag = Abs(rval);
               const auto q_is_zero = Eq(q_mag, zero);
               if (c == 1) {
-                if (use_csf_w) {
+                if (config.band_qf_stride > 0) {
                   const auto q_y_nz = Ge(Abs(val), Load(df, cs_row + rx));
                   const auto adj_rval = IfThenElseZero(
                       q_y_nz,

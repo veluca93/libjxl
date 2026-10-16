@@ -1634,13 +1634,25 @@ StatusOr<Image3F> ReconstructImage(
 }
 
 float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
-                             const ImageF& mask1x1, size_t by, size_t bx) {
+                             const ImageF& mask1x1, size_t by, size_t bx,
+                             float* JXL_RESTRICT out_bdry_err = nullptr,
+                             float* JXL_RESTRICT out_grad_a = nullptr,
+                             float* JXL_RESTRICT out_grad_b = nullptr) {
   Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim, a.xsize(),
             a.ysize());
   const size_t xsize = rect.xsize();
   const size_t ysize = rect.ysize();
+  const size_t x0 = rect.x0();
+  const size_t y0 = rect.y0();
+  const bool has_left = (out_bdry_err != nullptr) && (x0 > 0);
+  const bool has_right = (out_bdry_err != nullptr) && (x0 + xsize < a.xsize());
+  const bool has_top = (out_bdry_err != nullptr) && (y0 > 0);
+  const bool has_bottom = (out_bdry_err != nullptr) && (y0 + ysize < a.ysize());
   float err2_masked[3] = {0.0f};
   float err2_unmasked[3] = {0.0f};
+  float bdry_err2[3] = {0.0f};
+  float grad_a2[3] = {0.0f};
+  float grad_b2[3] = {0.0f};
   float sum_mask2 = 0.0f;
   for (size_t y = 0; y < ysize; ++y) {
     const float* row_a[3] = {
@@ -1653,6 +1665,32 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
         rect.ConstPlaneRow(b, 1, y),
         rect.ConstPlaneRow(b, 2, y),
     };
+    const float* row_a_next[3] = {
+        (y + 1 < ysize || has_bottom) ? a.ConstPlaneRow(0, y0 + y + 1) + x0
+                                      : nullptr,
+        (y + 1 < ysize || has_bottom) ? a.ConstPlaneRow(1, y0 + y + 1) + x0
+                                      : nullptr,
+        (y + 1 < ysize || has_bottom) ? a.ConstPlaneRow(2, y0 + y + 1) + x0
+                                      : nullptr,
+    };
+    const float* row_b_next[3] = {
+        (y + 1 < ysize || has_bottom) ? b.ConstPlaneRow(0, y0 + y + 1) + x0
+                                      : nullptr,
+        (y + 1 < ysize || has_bottom) ? b.ConstPlaneRow(1, y0 + y + 1) + x0
+                                      : nullptr,
+        (y + 1 < ysize || has_bottom) ? b.ConstPlaneRow(2, y0 + y + 1) + x0
+                                      : nullptr,
+    };
+    const float* row_a_prev[3] = {
+        (y == 0 && has_top) ? a.ConstPlaneRow(0, y0 - 1) + x0 : nullptr,
+        (y == 0 && has_top) ? a.ConstPlaneRow(1, y0 - 1) + x0 : nullptr,
+        (y == 0 && has_top) ? a.ConstPlaneRow(2, y0 - 1) + x0 : nullptr,
+    };
+    const float* row_b_prev[3] = {
+        (y == 0 && has_top) ? b.ConstPlaneRow(0, y0 - 1) + x0 : nullptr,
+        (y == 0 && has_top) ? b.ConstPlaneRow(1, y0 - 1) + x0 : nullptr,
+        (y == 0 && has_top) ? b.ConstPlaneRow(2, y0 - 1) + x0 : nullptr,
+    };
     const float* row_mask = rect.ConstRow(mask1x1, y);
     for (size_t x = 0; x < xsize; ++x) {
       float mask = row_mask[x];
@@ -1663,6 +1701,38 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
         float diff2 = diff * diff;
         err2_masked[i] += mask2 * diff2;
         err2_unmasked[i] += diff2;
+        if (x + 1 < xsize) {
+          float ga = row_a[i][x + 1] - row_a[i][x];
+          float gb = row_b[i][x + 1] - row_b[i][x];
+          grad_a2[i] += ga * ga;
+          grad_b2[i] += gb * gb;
+        }
+        if (y + 1 < ysize) {
+          float ga = row_a_next[i][x] - row_a[i][x];
+          float gb = row_b_next[i][x] - row_b[i][x];
+          grad_a2[i] += ga * ga;
+          grad_b2[i] += gb * gb;
+        }
+        if (x == 0 && has_left) {
+          float diff_l = row_a[i][-1] - row_b[i][-1];
+          float db = diff - diff_l;
+          bdry_err2[i] += mask2 * db * db;
+        }
+        if (x + 1 == xsize && has_right) {
+          float diff_r = row_a[i][xsize] - row_b[i][xsize];
+          float db = diff - diff_r;
+          bdry_err2[i] += mask2 * db * db;
+        }
+        if (y == 0 && has_top) {
+          float diff_t = row_a_prev[i][x] - row_b_prev[i][x];
+          float db = diff - diff_t;
+          bdry_err2[i] += mask2 * db * db;
+        }
+        if (y + 1 == ysize && has_bottom) {
+          float diff_d = row_a_next[i][x] - row_b_next[i][x];
+          float db = diff - diff_d;
+          bdry_err2[i] += mask2 * db * db;
+        }
       }
     }
   }
@@ -1679,6 +1749,16 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
       1.0,
       0.2,
   };
+  if (out_bdry_err != nullptr) {
+    *out_bdry_err =
+        kW[0] * bdry_err2[0] + kW[1] * bdry_err2[1] + kW[2] * bdry_err2[2];
+  }
+  if (out_grad_a != nullptr && out_grad_b != nullptr) {
+    *out_grad_a = mean_mask2 * (kW[0] * grad_a2[0] + kW[1] * grad_a2[1] +
+                                kW[2] * grad_a2[2]);
+    *out_grad_b = mean_mask2 * (kW[0] * grad_b2[0] + kW[1] * grad_b2[1] +
+                                kW[2] * grad_b2[2]);
+  }
   float retval = kW[0] * err2[0] + kW[1] * err2[1] + kW[2] * err2[2];
   return retval;
 }
@@ -1733,6 +1813,18 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     }
   }
   std::array<ImageF, kNumEPFVals> error_images;
+  ImageF bdry_err0;
+  JXL_ASSIGN_OR_RETURN(bdry_err0,
+                       ImageF::Create(memory_manager, frame_dim.xsize_blocks,
+                                      frame_dim.ysize_blocks));
+  ImageF target_grad_int;
+  JXL_ASSIGN_OR_RETURN(target_grad_int,
+                       ImageF::Create(memory_manager, frame_dim.xsize_blocks,
+                                      frame_dim.ysize_blocks));
+  constexpr float kBdryWeight = 0.08f;
+  constexpr float kTexWeight7 = 0.012f;
+  const float tex_weight_2 =
+      0.008f * Clamp1((1.15f - clamped_butteraugli) / 0.65f, 0.0f, 1.0f);
   for (uint8_t val : epf_steps) {
     FillPlane(val, &epf_sharpness, Rect(epf_sharpness));
     JXL_ASSIGN_OR_RETURN(
@@ -1743,9 +1835,24 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
                                         frame_dim.ysize_blocks));
     for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
       float* error_row = error_images[val].Row(by);
+      float* bdry0_row = bdry_err0.Row(by);
+      float* target_grad_row = target_grad_int.Row(by);
       for (size_t bx = 0; bx < frame_dim.xsize_blocks; bx++) {
-        error_row[bx] = ComputeBlockL2Distance(
-            orig_opsin, decoded, initial_quant_masking1x1, by, bx);
+        float bdry_b = 0.0f;
+        float grad_a = 0.0f;
+        float grad_b = 0.0f;
+        float err = ComputeBlockL2Distance(
+            orig_opsin, decoded, initial_quant_masking1x1, by, bx, &bdry_b,
+            &grad_a, &grad_b);
+        if (val == 0) {
+          bdry0_row[bx] = bdry_b;
+          target_grad_row[bx] = std::min(grad_a, grad_b);
+        } else {
+          const float tw = (val >= 7) ? kTexWeight7 : tex_weight_2;
+          err += kBdryWeight * (bdry_b - bdry0_row[bx]) +
+                 tw * std::max(0.0f, target_grad_row[bx] - grad_b);
+        }
+        error_row[bx] = err;
       }
     }
   }
@@ -1765,6 +1872,9 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       0.15f / std::pow(clamped_butteraugli, 0.35f);
   std::vector<std::vector<size_t>> histo(9, std::vector<size_t>(kNumEPFVals));
   std::vector<size_t> totals(9, 1);
+  std::vector<std::vector<size_t>> bctx_histo(4,
+                                              std::vector<size_t>(kNumEPFVals));
+  std::vector<size_t> bctx_totals(4, 1);
   static const float kFavorNoSmoothing = 0.99;
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
@@ -1798,8 +1908,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
         out_row[bx] = left_val;
       }
       int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
+      int bctx = (top_val > 0 ? 2 : 0) + (left_val > 0 ? 1 : 0);
       ++histo[context][out_row[bx]];
       ++totals[context];
+      ++bctx_histo[bctx][out_row[bx]];
+      ++bctx_totals[bctx];
     }
   }
   const float c3base = 0.98017198824148288;
@@ -1811,10 +1924,14 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
     for (uint8_t left_val : epf_steps) {
       for (uint8_t val : epf_steps) {
         int context = epf_steps_lut[top_val] * 3 + epf_steps_lut[left_val];
+        int bctx = (top_val > 0 ? 2 : 0) + (left_val > 0 ? 1 : 0);
         const auto& ctx_histo = histo[context];
         const int mulix = epf_steps_lut[val] + 3 * context;
-        const float ratio = static_cast<float>(ctx_histo[val]) /
-                            static_cast<float>(totals[context]);
+        const float ratio_9 = static_cast<float>(ctx_histo[val]) /
+                              static_cast<float>(totals[context]);
+        const float ratio_4 = static_cast<float>(bctx_histo[bctx][val]) /
+                              static_cast<float>(bctx_totals[bctx]);
+        const float ratio = 0.65f * ratio_9 + 0.35f * ratio_4;
         mul[mulix] =
             1.0f / (1.0f + c5 * std::log1p(ratio) / clamped_butteraugli);
         if (val == top_val && val == left_val) {
