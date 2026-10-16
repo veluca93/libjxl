@@ -1599,6 +1599,13 @@ Status ComputeEncodingData(
           &enc_state, aux_out));
     }
     JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(enc_state, frame_dim));
+    if (!enc_state.streaming_mode && !jpeg_data &&
+        enc_state.initialize_global_state &&
+        cparams.speed_tier < SpeedTier::kFalcon) {
+      JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
+          frame_header, shared.coeff_orders.data(), &enc_state,
+          &shared.block_ctx_map));
+    }
     if (!enc_state.streaming_mode) {
       shared.num_histograms = 1;
       enc_state.histogram_idx.resize(frame_dim.num_groups);

@@ -13,12 +13,14 @@
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/coeff_order_fwd.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image.h"
 
 namespace jxl {
 
 struct AuxOut;
+struct BlockCtxMap;
 struct PassesEncoderState;
 class DequantMatrices;
 class ImageBundle;
@@ -42,6 +44,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
                            ThreadPool* pool);
 
 void FindBestBlockEntropyModel(PassesEncoderState& enc_state);
+
+Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
+                                           const coeff_order_t* coeff_orders,
+                                           PassesEncoderState* enc_state,
+                                           BlockCtxMap* block_ctx_map);
 
 Status DownsampleImage2_Iterative(Image3F* opsin);
 Status DownsampleImage2_Sharper(Image3F* opsin);

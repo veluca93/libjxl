@@ -22,6 +22,7 @@
 
 #include "lib/jxl/ac_context.h"
 #include "lib/jxl/ac_strategy.h"
+#include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
@@ -55,6 +56,7 @@
 #include "lib/jxl/enc_patch_dictionary.h"
 #include "lib/jxl/enc_quant_weights.h"
 #include "lib/jxl/enc_splines.h"
+#include "lib/jxl/entropy_coder.h"
 #include "lib/jxl/epf.h"
 #include "lib/jxl/frame_dimensions.h"
 #include "lib/jxl/frame_header.h"
@@ -62,6 +64,7 @@
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/image_ops.h"
 #include "lib/jxl/memory_manager_internal.h"
+#include "lib/jxl/pack_signed.h"
 #include "lib/jxl/passes_state.h"
 #include "lib/jxl/quant_weights.h"
 #include "lib/jxl/render_pipeline/render_pipeline.h"
@@ -217,6 +220,644 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
   }
   block_ctx_map->num_ctxs =
       *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;
+}
+
+Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
+                                           const coeff_order_t* coeff_orders,
+                                           PassesEncoderState* enc_state,
+                                           BlockCtxMap* block_ctx_map) {
+  const CompressParams& cparams = enc_state->cparams;
+  if (cparams.decoding_speed_tier >= 1) {
+    static constexpr uint8_t kSimpleCtxMap[] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  //
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  //
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,  //
+    };
+    block_ctx_map->qf_thresholds.clear();
+    for (auto& dct : block_ctx_map->dc_thresholds) dct.clear();
+    block_ctx_map->ctx_map.assign(std::begin(kSimpleCtxMap),
+                                  std::end(kSimpleCtxMap));
+    block_ctx_map->num_ctxs = 2;
+    block_ctx_map->num_dc_ctxs = 1;
+    return true;
+  }
+  if (cparams.speed_tier >= SpeedTier::kFalcon || enc_state->coeffs.empty()) {
+    return true;
+  }
+
+  PassesSharedState& shared = enc_state->shared;
+  const FrameDimensions& frame_dim = shared.frame_dim;
+  const ImageI& rqf = shared.raw_quant_field;
+  const AcStrategyImage& ac_strategy = shared.ac_strategy;
+  const ImageB& qdc = shared.quant_dc;
+  const YCbCrChromaSubsampling& cs = frame_header.chroma_subsampling;
+  const size_t tot_blocks = rqf.xsize() * rqf.ysize();
+  if (tot_blocks < 64) {
+    return true;
+  }
+
+  const ACImage& coeffs = *enc_state->coeffs[0];
+  JXL_ENSURE(coeffs.Type() == ACType::k32);
+  JxlMemoryManager* memory_manager = enc_state->memory_manager();
+
+  std::vector<double> nlog2n_tab(8192, 0.0);
+  for (uint32_t i = 2; i < 8192; ++i) {
+    nlog2n_tab[i] = static_cast<double>(i) * std::log2(static_cast<double>(i));
+  }
+  const auto fast_nlog2n = [&](uint32_t n) -> double {
+    if (n < 8192) return nlog2n_tab[n];
+    return static_cast<double>(n) * std::log2(static_cast<double>(n));
+  };
+
+  // Step 1: Collect per-(c_slice, ord, qf) 16-bin token summaries on first
+  // blocks and pick optimal qf_thresholds via 1D dynamic programming.
+  const double d_target = std::max<double>(0.25, cparams.butteraugli_distance);
+  const double size_for_ctx_model = 1024.0 * d_target;
+  const size_t max_luma_ctxs =
+      (tot_blocks < size_for_ctx_model)
+          ? 2
+          : static_cast<size_t>(
+                Clamp1(static_cast<int>(tot_blocks / size_for_ctx_model / 2.0),
+                       2, 10));
+  const size_t max_chroma_ctxs =
+      (tot_blocks < size_for_ctx_model)
+          ? 1
+          : static_cast<size_t>(
+                Clamp1(static_cast<int>(tot_blocks / size_for_ctx_model / 3.0),
+                       1, 6));
+
+  const size_t num_dc_ctxs = std::max<size_t>(1, block_ctx_map->num_dc_ctxs);
+  const double size_for_qf_split = 8192.0 * d_target;
+  const size_t max_q_segs_by_size =
+      (tot_blocks < size_for_qf_split)
+          ? 1
+          : (tot_blocks < 4.0 * size_for_qf_split ? 2 : 3);
+  const size_t max_q_segs =
+      std::min<size_t>(max_q_segs_by_size, 64 / num_dc_ctxs);
+  constexpr size_t kQfBins = 16;
+  std::vector<uint32_t> qf_hist(3 * kNumOrders * 257 * kQfBins, 0);
+  std::array<uint32_t, 257> qf_block_counts{};
+
+  for (size_t group_index = 0; group_index < frame_dim.num_groups;
+       ++group_index) {
+    const Rect grect = frame_dim.BlockGroupRect(group_index);
+    const int32_t* JXL_RESTRICT ac_rows[3] = {
+        coeffs.PlaneRow(0, group_index, 0).ptr32,
+        coeffs.PlaneRow(1, group_index, 0).ptr32,
+        coeffs.PlaneRow(2, group_index, 0).ptr32,
+    };
+    size_t offset[3] = {};
+    for (size_t by = 0; by < grect.ysize(); ++by) {
+      const size_t sby[3] = {by >> cs.VShift(0), by >> cs.VShift(1),
+                             by >> cs.VShift(2)};
+      const int32_t* JXL_RESTRICT row_qf = grect.ConstRow(rqf, by);
+      AcStrategyRow acs_row = ac_strategy.ConstRow(grect, by);
+      for (size_t bx = 0; bx < grect.xsize(); ++bx) {
+        AcStrategy acs = acs_row[bx];
+        if (!acs.IsFirstBlock()) continue;
+        const size_t sbx[3] = {bx >> cs.HShift(0), bx >> cs.HShift(1),
+                               bx >> cs.HShift(2)};
+        const size_t covered_blocks =
+            acs.covered_blocks_x() * acs.covered_blocks_y();
+        const size_t size = covered_blocks * kDCTBlockSize;
+        const int ord = kStrategyOrder[acs.RawStrategy()];
+        for (int c : {1, 0, 2}) {
+          if ((sbx[c] << cs.HShift(c)) != bx ||
+              (sby[c] << cs.VShift(c)) != by) {
+            continue;
+          }
+          const int32_t* JXL_RESTRICT block = ac_rows[c] + offset[c];
+          const coeff_order_t* JXL_RESTRICT order =
+              &coeff_orders[CoeffOrderOffset(ord, c)];
+          const int32_t qf_val = Clamp1<int32_t>(row_qf[sbx[c]], 1, 256);
+          if (c == 1) qf_block_counts[qf_val]++;
+          const size_t c_slice = (c < 2) ? (c ^ 1) : 2;
+          uint32_t* JXL_RESTRICT h =
+              &qf_hist[((c_slice * kNumOrders + ord) * 257 + qf_val) * kQfBins];
+
+          int32_t nzeros = 0;
+          for (size_t k = covered_blocks; k < size; ++k) {
+            nzeros += (block[order[k]] != 0);
+          }
+          const uint32_t nz_bin =
+              (nzeros == 0)
+                  ? 0
+                  : std::min<uint32_t>(
+                        7, 1 + FloorLog2Nonzero(static_cast<uint32_t>(nzeros)));
+          h[nz_bin]++;
+
+          int32_t rem_nz = nzeros;
+          for (size_t k = covered_blocks; k < size && rem_nz > 0; ++k) {
+            const int32_t coeff = block[order[k]];
+            if (coeff == 0) {
+              h[8]++;
+            } else {
+              rem_nz--;
+              const uint32_t abs_c = static_cast<uint32_t>(std::abs(coeff));
+              const uint32_t ac_bin =
+                  (abs_c == 1)
+                      ? 9
+                      : std::min<uint32_t>(15, 9 + FloorLog2Nonzero(abs_c));
+              h[ac_bin]++;
+            }
+          }
+          offset[c] += size;
+        }
+      }
+    }
+  }
+
+  std::vector<uint32_t> active_qfs;
+  active_qfs.reserve(32);
+  for (uint32_t v = 1; v <= 256; ++v) {
+    if (qf_block_counts[v] > 0) active_qfs.push_back(v);
+  }
+
+  block_ctx_map->qf_thresholds.clear();
+  if (active_qfs.size() >= 2 && max_q_segs >= 2) {
+    const size_t K = active_qfs.size();
+    const size_t num_co = 3 * kNumOrders;
+    std::vector<uint32_t> pref(num_co * (K + 1) * kQfBins, 0);
+    std::vector<uint32_t> pref_blocks(K + 1, 0);
+    for (size_t idx = 0; idx < K; ++idx) {
+      const uint32_t v = active_qfs[idx];
+      pref_blocks[idx + 1] = pref_blocks[idx] + qf_block_counts[v];
+      for (size_t co = 0; co < num_co; ++co) {
+        const uint32_t* src = &qf_hist[(co * 257 + v) * kQfBins];
+        const uint32_t* prv = &pref[(co * (K + 1) + idx) * kQfBins];
+        uint32_t* dst = &pref[(co * (K + 1) + idx + 1) * kQfBins];
+        for (size_t b = 0; b < kQfBins; ++b) {
+          dst[b] = prv[b] + src[b];
+        }
+      }
+    }
+
+    constexpr uint32_t kMinSegBlocks = 12;
+    constexpr double kQfNullBias = 0.70;
+    constexpr double kInf = 1e30;
+    std::vector<double> seg_cost(K * K, kInf);
+    for (size_t i = 0; i < K; ++i) {
+      for (size_t j = i; j < K; ++j) {
+        if (pref_blocks[j + 1] - pref_blocks[i] < kMinSegBlocks) continue;
+        double cost = 0.0;
+        for (size_t co = 0; co < num_co; ++co) {
+          const uint32_t* pi = &pref[(co * (K + 1) + i) * kQfBins];
+          const uint32_t* pj = &pref[(co * (K + 1) + j + 1) * kQfBins];
+          uint32_t n_nz = 0;
+          int act_nz = 0;
+          double sum_nz = 0.0;
+          for (size_t b = 0; b < 8; ++b) {
+            const uint32_t cnt = pj[b] - pi[b];
+            if (cnt > 0) {
+              n_nz += cnt;
+              act_nz++;
+              sum_nz += fast_nlog2n(cnt);
+            }
+          }
+          if (act_nz > 1) {
+            cost += (fast_nlog2n(n_nz) - sum_nz) +
+                    kQfNullBias * static_cast<double>(act_nz - 1);
+          }
+          uint32_t n_ac = 0;
+          int act_ac = 0;
+          double sum_ac = 0.0;
+          for (size_t b = 8; b < 16; ++b) {
+            const uint32_t cnt = pj[b] - pi[b];
+            if (cnt > 0) {
+              n_ac += cnt;
+              act_ac++;
+              sum_ac += fast_nlog2n(cnt);
+            }
+          }
+          if (act_ac > 1) {
+            cost += (fast_nlog2n(n_ac) - sum_ac) +
+                    kQfNullBias * static_cast<double>(act_ac - 1);
+          }
+        }
+        seg_cost[i * K + j] = cost;
+      }
+    }
+
+    const size_t max_s = std::min(max_q_segs, K);
+    std::vector<double> dp((max_s + 1) * K, kInf);
+    std::vector<int32_t> parent_split((max_s + 1) * K, -1);
+    for (size_t j = 0; j < K; ++j) {
+      dp[1 * K + j] = seg_cost[0 * K + j];
+    }
+    for (size_t s = 2; s <= max_s; ++s) {
+      for (size_t j = s - 1; j < K; ++j) {
+        double best_v = kInf;
+        int32_t best_m = -1;
+        for (size_t m = s - 2; m < j; ++m) {
+          const double prev = dp[(s - 1) * K + m];
+          const double cur = seg_cost[(m + 1) * K + j];
+          if (prev < kInf * 0.5 && cur < kInf * 0.5 && prev + cur < best_v) {
+            best_v = prev + cur;
+            best_m = static_cast<int32_t>(m);
+          }
+        }
+        dp[s * K + j] = best_v;
+        parent_split[s * K + j] = best_m;
+      }
+    }
+
+    constexpr double kMinBitsPerQfSplit = 250.0;
+    size_t best_s = 1;
+    double cur_best_cost = dp[1 * K + (K - 1)];
+    for (size_t s = 2; s <= max_s; ++s) {
+      const double cand = dp[s * K + (K - 1)];
+      if (cand < kInf * 0.5 && cur_best_cost - cand > kMinBitsPerQfSplit) {
+        best_s = s;
+        cur_best_cost = cand;
+      } else {
+        break;
+      }
+    }
+    if (best_s > 1) {
+      std::vector<uint32_t> rev_splits;
+      int32_t cur_j = static_cast<int32_t>(K - 1);
+      for (size_t s = best_s; s >= 2; --s) {
+        const int32_t m = parent_split[s * K + cur_j];
+        if (m < 0) break;
+        const uint32_t thr = std::min<uint32_t>(255, active_qfs[m]);
+        rev_splits.push_back(thr);
+        cur_j = m;
+      }
+      for (auto it = rev_splits.rbegin(); it != rev_splits.rend(); ++it) {
+        if (block_ctx_map->qf_thresholds.empty() ||
+            *it > block_ctx_map->qf_thresholds.back()) {
+          block_ctx_map->qf_thresholds.push_back(*it);
+        }
+      }
+    }
+  }
+
+  // Step 2: Collect exact 495-fine-context token histograms per active cell.
+  constexpr size_t kNumFineCtx = kNonZeroBuckets + kZeroDensityContextCount;
+  constexpr size_t kSymBins = 48;
+  const size_t Q = block_ctx_map->qf_thresholds.size() + 1;
+  const size_t M = 3 * kNumOrders * Q * num_dc_ctxs;
+
+  struct CellCluster {
+    uint8_t c_slice = 0;
+    int32_t rep_ord = 0;
+    int32_t rep_qf = 0;
+    bool alive = true;
+    uint32_t total_tokens = 0;
+    std::vector<uint32_t> counts;
+    std::array<uint32_t, kNumFineCtx> fine_tot{};
+    std::array<double, kNumFineCtx> fine_ent{};
+  };
+
+  std::vector<int32_t> cell_to_active(M, -1);
+  std::vector<CellCluster> clusters;
+  clusters.reserve(64);
+
+  JXL_ASSIGN_OR_RETURN(
+      Image3I tmp_num_nzeroes,
+      Image3I::Create(memory_manager, kGroupDimInBlocks, kGroupDimInBlocks));
+  const size_t nzeros_stride = tmp_num_nzeroes.PixelsPerRow();
+  const HybridUintConfig uint_config;
+
+  for (size_t group_index = 0; group_index < frame_dim.num_groups;
+       ++group_index) {
+    const Rect grect = frame_dim.BlockGroupRect(group_index);
+    const int32_t* JXL_RESTRICT ac_rows[3] = {
+        coeffs.PlaneRow(0, group_index, 0).ptr32,
+        coeffs.PlaneRow(1, group_index, 0).ptr32,
+        coeffs.PlaneRow(2, group_index, 0).ptr32,
+    };
+    size_t offset[3] = {};
+    for (size_t by = 0; by < grect.ysize(); ++by) {
+      const size_t sby[3] = {by >> cs.VShift(0), by >> cs.VShift(1),
+                             by >> cs.VShift(2)};
+      int32_t* JXL_RESTRICT row_nzeros[3] = {
+          tmp_num_nzeroes.PlaneRow(0, sby[0]),
+          tmp_num_nzeroes.PlaneRow(1, sby[1]),
+          tmp_num_nzeroes.PlaneRow(2, sby[2]),
+      };
+      const int32_t* JXL_RESTRICT row_nzeros_top[3] = {
+          sby[0] == 0 ? nullptr : tmp_num_nzeroes.ConstPlaneRow(0, sby[0] - 1),
+          sby[1] == 0 ? nullptr : tmp_num_nzeroes.ConstPlaneRow(1, sby[1] - 1),
+          sby[2] == 0 ? nullptr : tmp_num_nzeroes.ConstPlaneRow(2, sby[2] - 1),
+      };
+      const uint8_t* JXL_RESTRICT row_qdc =
+          qdc.ConstRow(grect.y0() + by) + grect.x0();
+      const int32_t* JXL_RESTRICT row_qf = grect.ConstRow(rqf, by);
+      AcStrategyRow acs_row = ac_strategy.ConstRow(grect, by);
+      for (size_t bx = 0; bx < grect.xsize(); ++bx) {
+        AcStrategy acs = acs_row[bx];
+        if (!acs.IsFirstBlock()) continue;
+        const size_t sbx[3] = {bx >> cs.HShift(0), bx >> cs.HShift(1),
+                               bx >> cs.HShift(2)};
+        const size_t cov_x = acs.covered_blocks_x();
+        const size_t cov_y = acs.covered_blocks_y();
+        const size_t covered_blocks = cov_x * cov_y;
+        const size_t log2_covered_blocks =
+            Num0BitsBelowLS1Bit_Nonzero(covered_blocks);
+        const size_t size = covered_blocks * kDCTBlockSize;
+        const int ord = kStrategyOrder[acs.RawStrategy()];
+
+        for (int c : {1, 0, 2}) {
+          if ((sbx[c] << cs.HShift(c)) != bx ||
+              (sby[c] << cs.VShift(c)) != by) {
+            continue;
+          }
+          const int32_t* JXL_RESTRICT block = ac_rows[c] + offset[c];
+          const coeff_order_t* JXL_RESTRICT order =
+              &coeff_orders[CoeffOrderOffset(ord, c)];
+
+          int32_t nzeros = 0;
+          for (size_t k = covered_blocks; k < size; ++k) {
+            nzeros += (block[order[k]] != 0);
+          }
+          const int32_t shifted_nzeros = static_cast<int32_t>(
+              (nzeros + covered_blocks - 1) >> log2_covered_blocks);
+          for (size_t sy = 0; sy < cov_y; ++sy) {
+            for (size_t sx = 0; sx < cov_x; ++sx) {
+              row_nzeros[c][sbx[c] + sx + sy * nzeros_stride] = shifted_nzeros;
+            }
+          }
+
+          const int32_t predicted_nzeros = PredictFromTopAndLeft(
+              row_nzeros_top[c], row_nzeros[c], sbx[c], 32);
+          const uint32_t clamped_pred_nz =
+              std::min<uint32_t>(64, static_cast<uint32_t>(predicted_nzeros));
+          const uint32_t nzero_bucket =
+              (clamped_pred_nz < 8) ? clamped_pred_nz
+                                    : (4 + clamped_pred_nz / 2);
+
+          const uint32_t qf_val =
+              static_cast<uint32_t>(std::max<int32_t>(1, row_qf[sbx[c]]));
+          size_t qf_idx = 0;
+          for (uint32_t t : block_ctx_map->qf_thresholds) {
+            if (qf_val > t) qf_idx++;
+          }
+          const size_t dc_idx =
+              (num_dc_ctxs > 1)
+                  ? std::min<size_t>(row_qdc[bx], num_dc_ctxs - 1)
+                  : 0;
+          const size_t c_slice = (c < 2) ? (c ^ 1) : 2;
+          const size_t cell_idx =
+              ((c_slice * kNumOrders + ord) * Q + qf_idx) * num_dc_ctxs +
+              dc_idx;
+
+          int32_t act_id = cell_to_active[cell_idx];
+          if (act_id < 0) {
+            act_id = static_cast<int32_t>(clusters.size());
+            cell_to_active[cell_idx] = act_id;
+            clusters.emplace_back();
+            auto& cl = clusters.back();
+            cl.c_slice = static_cast<uint8_t>(c_slice);
+            cl.rep_ord = ord;
+            cl.rep_qf = static_cast<int32_t>(qf_idx);
+            cl.counts.assign(kNumFineCtx * kSymBins, 0);
+          }
+          auto& cl = clusters[act_id];
+
+          uint32_t tok_nz = 0;
+          uint32_t nbits = 0;
+          uint32_t bits = 0;
+          uint_config.Encode(static_cast<uint32_t>(nzeros), &tok_nz, &nbits,
+                             &bits);
+          tok_nz = std::min<uint32_t>(tok_nz, kSymBins - 1);
+          cl.counts[nzero_bucket * kSymBins + tok_nz]++;
+          cl.fine_tot[nzero_bucket]++;
+          cl.total_tokens++;
+
+          size_t prev = (nzeros > static_cast<ptrdiff_t>(size / 16) ? 0 : 1);
+          int32_t rem_nz = nzeros;
+          for (size_t k = covered_blocks; k < size && rem_nz != 0; ++k) {
+            const int32_t coeff = block[order[k]];
+            const size_t zd_bucket =
+                kNonZeroBuckets + ZeroDensityContext(rem_nz, k, covered_blocks,
+                                                     log2_covered_blocks, prev);
+            const uint32_t u_coeff = PackSigned(coeff);
+            uint32_t tok_ac = 0;
+            uint_config.Encode(u_coeff, &tok_ac, &nbits, &bits);
+            tok_ac = std::min<uint32_t>(tok_ac, kSymBins - 1);
+            cl.counts[zd_bucket * kSymBins + tok_ac]++;
+            cl.fine_tot[zd_bucket]++;
+            cl.total_tokens++;
+            prev = (coeff != 0) ? 1 : 0;
+            rem_nz -= static_cast<int32_t>(prev);
+          }
+          offset[c] += size;
+        }
+      }
+    }
+  }
+
+  const size_t N_active = clusters.size();
+  if (N_active == 0) {
+    return true;
+  }
+
+  // Step 3: Compute fine-context entropies and run greedy agglomerative
+  // Jensen-Shannon clustering (keeping Luma and Chroma disjoint).
+  const auto compute_fine_ent = [&](CellCluster& cl, size_t f) {
+    const uint32_t n = cl.fine_tot[f];
+    if (n <= 1) {
+      cl.fine_ent[f] = 0.0;
+      return;
+    }
+    const uint32_t* cnts = &cl.counts[f * kSymBins];
+    double sum_c = 0.0;
+    for (size_t s = 0; s < kSymBins; ++s) {
+      if (cnts[s] > 1) sum_c += fast_nlog2n(cnts[s]);
+    }
+    cl.fine_ent[f] = fast_nlog2n(n) - sum_c;
+  };
+  for (size_t a = 0; a < N_active; ++a) {
+    for (size_t f = 0; f < kNumFineCtx; ++f) {
+      if (clusters[a].fine_tot[f] > 0) compute_fine_ent(clusters[a], f);
+    }
+  }
+
+  constexpr double kMergeNullBias = 0.70;
+  constexpr double kMergeLambda = 1000.0;
+  constexpr double kInfCost = 1e30;
+
+  const auto merge_cost = [&](size_t a, size_t b) -> double {
+    const auto& ca = clusters[a];
+    const auto& cb = clusters[b];
+    if ((ca.c_slice == 0) != (cb.c_slice == 0)) return kInfCost;
+    double total_de = 0.0;
+    for (size_t f = 0; f < kNumFineCtx; ++f) {
+      const uint32_t na = ca.fine_tot[f];
+      const uint32_t nb = cb.fine_tot[f];
+      if (na == 0 || nb == 0) continue;
+      const uint32_t* ha = &ca.counts[f * kSymBins];
+      const uint32_t* hb = &cb.counts[f * kSymBins];
+      double sum_ab = 0.0;
+      int overlap = 0;
+      for (size_t s = 0; s < kSymBins; ++s) {
+        const uint32_t cab = ha[s] + hb[s];
+        if (cab > 0) {
+          overlap++;
+          if (cab > 1) sum_ab += fast_nlog2n(cab);
+        }
+      }
+      if (overlap <= 1) continue;
+      const double ent_ab = fast_nlog2n(na + nb) - sum_ab;
+      const double raw_de = ent_ab - ca.fine_ent[f] - cb.fine_ent[f];
+      const double bias = kMergeNullBias * static_cast<double>(overlap - 1);
+      if (raw_de > bias) {
+        total_de += (raw_de - bias);
+      }
+    }
+    const double tie =
+        1e-3 * (4.0 * static_cast<double>(ca.c_slice != cb.c_slice) +
+                static_cast<double>(std::abs(ca.rep_ord - cb.rep_ord)) +
+                0.25 * static_cast<double>(std::abs(ca.rep_qf - cb.rep_qf)));
+    return total_de + tie;
+  };
+
+  std::vector<double> dist_matrix(N_active * N_active, kInfCost);
+  for (size_t a = 0; a < N_active; ++a) {
+    for (size_t b = a + 1; b < N_active; ++b) {
+      const double d = merge_cost(a, b);
+      dist_matrix[a * N_active + b] = d;
+      dist_matrix[b * N_active + a] = d;
+    }
+  }
+
+  std::vector<size_t> parent(N_active);
+  std::iota(parent.begin(), parent.end(), 0);
+  size_t luma_alive = 0;
+  size_t chroma_alive = 0;
+  for (size_t a = 0; a < N_active; ++a) {
+    if (clusters[a].c_slice == 0) {
+      luma_alive++;
+    } else {
+      chroma_alive++;
+    }
+  }
+
+  while (luma_alive > 1 || chroma_alive > 1) {
+    const bool force_luma = (luma_alive > max_luma_ctxs) ||
+                            (luma_alive + chroma_alive > 16 &&
+                             luma_alive > 1);
+    const bool force_chroma = (chroma_alive > max_chroma_ctxs) ||
+                              (luma_alive + chroma_alive > 16 &&
+                               chroma_alive > 1);
+    double best_d = kInfCost;
+    int32_t best_a = -1;
+    int32_t best_b = -1;
+    for (size_t a = 0; a < N_active; ++a) {
+      if (!clusters[a].alive) continue;
+      const bool is_luma = (clusters[a].c_slice == 0);
+      if (is_luma && luma_alive <= 1) continue;
+      if (!is_luma && chroma_alive <= 1) continue;
+      for (size_t b = a + 1; b < N_active; ++b) {
+        if (!clusters[b].alive) continue;
+        if ((clusters[b].c_slice == 0) != is_luma) continue;
+        const double d = dist_matrix[a * N_active + b];
+        if (!force_luma && !force_chroma && d >= kMergeLambda) continue;
+        if (is_luma && !force_luma && d >= kMergeLambda) continue;
+        if (!is_luma && !force_chroma && d >= kMergeLambda) continue;
+        if (d < best_d) {
+          best_d = d;
+          best_a = static_cast<int32_t>(a);
+          best_b = static_cast<int32_t>(b);
+        }
+      }
+    }
+    if (best_a < 0 || best_d >= kInfCost * 0.5) break;
+
+    auto& ca = clusters[best_a];
+    auto& cb = clusters[best_b];
+    for (size_t f = 0; f < kNumFineCtx; ++f) {
+      if (cb.fine_tot[f] == 0) continue;
+      uint32_t* ha = &ca.counts[f * kSymBins];
+      const uint32_t* hb = &cb.counts[f * kSymBins];
+      for (size_t s = 0; s < kSymBins; ++s) {
+        ha[s] += hb[s];
+      }
+      ca.fine_tot[f] += cb.fine_tot[f];
+      compute_fine_ent(ca, f);
+    }
+    ca.total_tokens += cb.total_tokens;
+    cb.alive = false;
+    parent[best_b] = static_cast<size_t>(best_a);
+    if (ca.c_slice == 0) {
+      luma_alive--;
+    } else {
+      chroma_alive--;
+    }
+
+    for (size_t x = 0; x < N_active; ++x) {
+      if (x == static_cast<size_t>(best_a) || !clusters[x].alive) continue;
+      const double d = merge_cost(best_a, x);
+      dist_matrix[best_a * N_active + x] = d;
+      dist_matrix[x * N_active + best_a] = d;
+    }
+  }
+
+  for (size_t a = 0; a < N_active; ++a) {
+    while (parent[parent[a]] != parent[a]) {
+      parent[a] = parent[parent[a]];
+    }
+  }
+
+  // Step 4: Fill ctx_map, propagate empty cells into contiguous MTF runs,
+  // and relabel cluster IDs in first-appearance order.
+  std::vector<int32_t> raw_ctx(M, -1);
+  for (size_t idx = 0; idx < M; ++idx) {
+    const int32_t act = cell_to_active[idx];
+    if (act >= 0) {
+      raw_ctx[idx] = static_cast<int32_t>(parent[act]);
+    }
+  }
+
+  const size_t ord_span = Q * num_dc_ctxs;
+  const size_t slice_span = kNumOrders * ord_span;
+  for (size_t cs_idx = 0; cs_idx < 3; ++cs_idx) {
+    const size_t cs_base = cs_idx * slice_span;
+    for (size_t ord = 0; ord < kNumOrders; ++ord) {
+      const size_t ob = cs_base + ord * ord_span;
+      for (size_t i = 1; i < ord_span; ++i) {
+        if (raw_ctx[ob + i] < 0 && raw_ctx[ob + i - 1] >= 0) {
+          raw_ctx[ob + i] = raw_ctx[ob + i - 1];
+        }
+      }
+      for (size_t i = ord_span - 1; i > 0; --i) {
+        if (raw_ctx[ob + i - 1] < 0 && raw_ctx[ob + i] >= 0) {
+          raw_ctx[ob + i - 1] = raw_ctx[ob + i];
+        }
+      }
+    }
+    for (size_t i = 1; i < slice_span; ++i) {
+      if (raw_ctx[cs_base + i] < 0 && raw_ctx[cs_base + i - 1] >= 0) {
+        raw_ctx[cs_base + i] = raw_ctx[cs_base + i - 1];
+      }
+    }
+    for (size_t i = slice_span - 1; i > 0; --i) {
+      if (raw_ctx[cs_base + i - 1] < 0 && raw_ctx[cs_base + i] >= 0) {
+        raw_ctx[cs_base + i - 1] = raw_ctx[cs_base + i];
+      }
+    }
+  }
+  for (size_t i = 1; i < M; ++i) {
+    if (raw_ctx[i] < 0 && raw_ctx[i - 1] >= 0) raw_ctx[i] = raw_ctx[i - 1];
+  }
+  for (size_t i = M - 1; i > 0; --i) {
+    if (raw_ctx[i - 1] < 0 && raw_ctx[i] >= 0) raw_ctx[i - 1] = raw_ctx[i];
+  }
+
+  std::vector<int32_t> root_to_id(N_active, -1);
+  uint8_t next_id = 0;
+  block_ctx_map->ctx_map.resize(M);
+  for (size_t i = 0; i < M; ++i) {
+    const int32_t r = std::max<int32_t>(0, raw_ctx[i]);
+    if (root_to_id[r] < 0) {
+      root_to_id[r] = next_id++;
+    }
+    block_ctx_map->ctx_map[i] = static_cast<uint8_t>(root_to_id[r]);
+  }
+  block_ctx_map->num_ctxs = std::max<size_t>(1, next_id);
+  JXL_ENSURE(block_ctx_map->num_ctxs <= 16);
+  return true;
 }
 
 namespace {
