@@ -330,6 +330,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
   float* pixels_buf = full_scratch_space + AcStrategy::kMaxCoeffArea;
   float* scratch_space = full_scratch_space + 2 * AcStrategy::kMaxCoeffArea;
   float* row_buf = full_scratch_space + 3 * AcStrategy::kMaxCoeffArea;
+  float* rec_y = full_scratch_space + 4 * AcStrategy::kMaxCoeffArea;
   const size_t size = (1 << acs.log2_covered_blocks()) * kDCTBlockSize;
 
   const size_t cov_x = acs.covered_blocks_x();
@@ -548,6 +549,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     float loss = 0.0f;
     float loss2 = 0.0f;
     const auto quant_ac_v = Set(df, q_cand);
+    const auto inv_quant_ac_v = Set(df, 1.0f / std::max(q_cand, 1e-4f));
     const auto q_llf_v = Set(df, q_llf_fixed);
     const uint32_t qf_cand =
         use_tcm ? Clamp1<uint32_t>(
@@ -561,7 +563,8 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     for (size_t c : {1, 0, 2}) {
       const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
       const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
-      const auto cmap_factor = Set(df, cmap_factors[c]);
+      const float base_corr = (c == 2) ? 1.0f : 0.0f;
+      const auto cmap_res_factor = Set(df, cmap_factors[c] - base_corr);
       auto entropy_v = Zero(df);
       auto nzeros_v = Zero(df);
       const size_t block_ctx =
@@ -591,6 +594,9 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
             const size_t k_freq = is_llf ? 0 : kCoeffFreqContext[k_approx];
             cw = is_llf ? 0.0f : tcm->rdo_c_one[block_ctx * 32 + k_freq];
             cs = is_llf ? 0.0f : tcm->rdo_c_slope[block_ctx * 32 + k_freq];
+          } else if (!rdo_mode && c == 1) {
+            const float quad_y = (v8 < 4 && u8 < 4) ? 0.58f : 0.64f;
+            cs = is_llf ? 1e30f : (quad_y + dz);
           }
           for (size_t ix = 0; ix < cx; ++ix) {
             w_row[u8 * cx + ix] = ws;
@@ -605,7 +611,10 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
             const auto in = Load(df, block + c * size + off + rx);
             const auto in_y =
                 (c == 1) ? zero
-                         : Mul(Load(df, block + size + off + rx), cmap_factor);
+                : (c == 0)
+                    ? Mul(Load(df, rec_y + off + rx), cmap_res_factor)
+                    : MulAdd(Load(df, rec_y + off + rx), cmap_res_factor,
+                             Load(df, block + size + off + rx));
             const auto im = Load(df, inv_matrix + off + rx);
             const auto t0 = Load(df, t0_row + rx);
             const auto ws = Load(df, w_row + rx);
@@ -620,6 +629,9 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
               const auto z2 = Mul(z, z);
               const auto z4 = Mul(z2, z2);
               const auto w_act = Div(z4, Add(one, z4));
+              if (c == 1) {
+                Store(use_csf_w ? Mul(w_act, in) : in, df, rec_y + off + rx);
+              }
               const auto err_denom =
                   Sqrt(Add(one, Mul(Set(df, 1.8f), z2)));
               const auto err = Div(val0, err_denom);
@@ -651,6 +663,22 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
               const auto rval = IfThenElseZero(Ge(Abs(val), t0), Round(val));
               const auto q_mag = Abs(rval);
               const auto q_is_zero = Eq(q_mag, zero);
+              if (c == 1) {
+                if (use_csf_w) {
+                  const auto q_y_nz = Ge(Abs(val), Load(df, cs_row + rx));
+                  const auto adj_rval = IfThenElseZero(
+                      q_y_nz,
+                      IfThenElse(
+                          Eq(q_mag, one),
+                          CopySignToAbs(Set(df, kDefaultQuantBias[1]), rval),
+                          Sub(rval, Div(Set(df, kDefaultQuantBias[3]), rval))));
+                  const auto deq_y = Mul(adj_rval, Mul(m, inv_quant_ac_v));
+                  Store(MulAdd(Set(df, 0.65f), deq_y, Mul(Set(df, 0.35f), in)),
+                        df, rec_y + off + rx);
+                } else {
+                  Store(in, df, rec_y + off + rx);
+                }
+              }
               const auto diff = Mul(ws, Sub(val, rval));
               Store(Mul(m, diff), df, &mem[off + rx]);
               const auto nz_one = IfThenZeroElse(q_is_zero, one);
@@ -1793,7 +1821,7 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
 Status AcStrategyHeuristics::PrepareForThreads(std::size_t num_threads) {
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
-  mem_per_thread = 7 * AcStrategy::kMaxCoeffArea + dct_scratch_size;
+  mem_per_thread = 8 * AcStrategy::kMaxCoeffArea + dct_scratch_size;
   size_t mem_bytes = num_threads * mem_per_thread * sizeof(float);
   JXL_ASSIGN_OR_RETURN(mem, AlignedMemory::Create(memory_manager, mem_bytes));
   qmem_per_thread = 655360;
