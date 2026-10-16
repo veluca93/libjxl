@@ -1768,8 +1768,15 @@ Status ModularFrameEncoder::AddACMetadata(const Rect& r, size_t group_index,
   } else if (cparams_.speed_tier >= SpeedTier::kFalcon) {
     stream_options_[stream_id].tree_kind =
         ModularOptions::TreeKind::kFalconACMeta;
-  } else if (cparams_.speed_tier > SpeedTier::kKitten) {
+  } else if (cparams_.speed_tier > SpeedTier::kSquirrel) {
     stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kACMeta;
+  } else {
+    stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kLearn;
+    stream_options_[stream_id].wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+    stream_options_[stream_id].splitting_heuristics_properties = {
+        0, 1, 2, 6, 7, 4, 5, 9, 10, 11, 12, 13, 14};
+    stream_options_[stream_id].max_property_values = 256;
+    stream_options_[stream_id].nb_repeats = 1.0f;
   }
   // If we are using a non-constant CfL field, and are in a slow enough mode,
   // re-enable tree computation for it.

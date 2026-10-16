@@ -1347,7 +1347,7 @@ HistogramParams HistogramParams::ForModular(
     const std::vector<uint8_t>& extra_dc_precision, bool streaming_mode) {
   HistogramParams params;
   params.streaming_mode = streaming_mode;
-  if (cparams.speed_tier > SpeedTier::kKitten) {
+  if (cparams.speed_tier > SpeedTier::kSquirrel) {
     params.clustering = HistogramParams::ClusteringType::kFast;
     params.ans_histogram_strategy =
         cparams.speed_tier > SpeedTier::kThunder
@@ -1365,6 +1365,15 @@ HistogramParams HistogramParams::ForModular(
     } else {
       params.uint_method = HistogramParams::HybridUintMethod::kNone;
     }
+  } else if (cparams.speed_tier == SpeedTier::kSquirrel &&
+             !cparams.modular_mode) {
+    params.lz77_method = HistogramParams::LZ77Method::kNone;
+  } else if (cparams.speed_tier > SpeedTier::kKitten) {
+    params.clustering = HistogramParams::ClusteringType::kFast;
+    params.ans_histogram_strategy =
+        HistogramParams::ANSHistogramStrategy::kApproximate;
+    params.lz77_method = HistogramParams::LZ77Method::kRLE;
+    params.uint_method = HistogramParams::HybridUintMethod::kFast;
   } else if (cparams.speed_tier <= SpeedTier::kTortoise) {
     params.lz77_method = HistogramParams::LZ77Method::kOptc256;
   } else {

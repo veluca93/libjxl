@@ -1212,6 +1212,12 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
     // Encode histograms.
     HistogramParams hist_params(enc_state->cparams.speed_tier,
                                 shared.block_ctx_map.NumACContexts());
+    if (enc_state->cparams.speed_tier <= SpeedTier::kSquirrel) {
+      hist_params.clustering = HistogramParams::ClusteringType::kBest;
+      hist_params.uint_method = HistogramParams::HybridUintMethod::kBest;
+      hist_params.ans_histogram_strategy =
+          HistogramParams::ANSHistogramStrategy::kPrecise;
+    }
     if (enc_state->cparams.speed_tier > SpeedTier::kTortoise) {
       hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
     }
