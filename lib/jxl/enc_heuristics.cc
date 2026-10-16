@@ -1473,6 +1473,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   AcStrategyImage& ac_strategy = shared.ac_strategy;
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
+  enc_state->token_cost_model.reset();
 
   // Find and subtract splines.
   bool override_splines = cparams.custom_splines.HasAny();
@@ -1773,6 +1774,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
                                   process_tile_pass2, "Enc Heuristics P2"));
     acs_heuristics.config.token_cost_model = nullptr;
+    enc_state->token_cost_model = std::move(token_cost_model);
   }
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));

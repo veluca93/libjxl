@@ -331,7 +331,7 @@ TEST(JxlTest, RoundtripMultiGroup) {
   };
 
   auto run_kitten = std::async(std::launch::async, test, SpeedTier::kKitten,
-                               1.0f, 60982u, 9.1);
+                               1.0f, 59961u, 9.1);
   auto run_wombat = std::async(std::launch::async, test, SpeedTier::kWombat,
                                2.0f, 34684u, 16.5);
 }

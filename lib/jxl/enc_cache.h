@@ -9,15 +9,20 @@
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
+#include "lib/jxl/ac_context.h"
+#include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/coeff_order_fwd.h"
 #include "lib/jxl/dct_util.h"
+#include "lib/jxl/dec_ans.h"
 #include "lib/jxl/enc_ans.h"
 #include "lib/jxl/enc_bit_writer.h"
 #include "lib/jxl/enc_params.h"
@@ -30,6 +35,54 @@
 namespace jxl {
 
 struct AuxOut;
+
+struct AcTokenCostModel {
+  static constexpr size_t kMaxTokenAlphabet = 256;
+  static constexpr size_t kSmallValLimit = 64;
+
+  BlockCtxMap block_ctx_map;
+  std::vector<coeff_order_t> coeff_orders;
+  Image3I pass1_nzeros;
+  std::vector<uint8_t> cluster_of_ctx;
+  std::vector<HybridUintConfig> uint_config;
+  std::vector<float> tok_bits;
+  std::vector<float> small_val_bits;
+  std::vector<float> rdo_c_one;
+  std::vector<float> rdo_c_slope;
+  std::vector<float> rdo_nzero_bits;
+  float acs_strategy_bits[27] = {};
+  float qf_block_bits = 2.2f;
+  float bits_to_cost_mul = 1.0f;
+
+  JXL_INLINE float LargeValBits(size_t cluster, uint32_t value) const {
+    uint32_t tok = 0;
+    uint32_t nbits = 0;
+    uint32_t bits = 0;
+    uint_config[cluster].Encode(value, &tok, &nbits, &bits);
+    const size_t t_idx = cluster * kMaxTokenAlphabet +
+                         std::min<size_t>(tok, kMaxTokenAlphabet - 1);
+    return tok_bits[t_idx] + static_cast<float>(nbits);
+  }
+
+  JXL_INLINE float ValBits(size_t cluster, uint32_t value) const {
+    if (JXL_LIKELY(value < kSmallValLimit)) {
+      return small_val_bits[cluster * kSmallValLimit + value];
+    }
+    return LargeValBits(cluster, value);
+  }
+
+  JXL_INLINE int32_t PredictNzeros(size_t c, size_t bx0, size_t by0) const {
+    const size_t lx = bx0 & 31;
+    const size_t ly = by0 & 31;
+    if (lx == 0 && ly == 0) return 32;
+    const int32_t* JXL_RESTRICT row = pass1_nzeros.ConstPlaneRow(c, by0);
+    if (ly == 0) return row[bx0 - 1];
+    const int32_t* JXL_RESTRICT row_top =
+        pass1_nzeros.ConstPlaneRow(c, by0 - 1);
+    if (lx == 0) return row_top[bx0];
+    return (row[bx0 - 1] + row_top[bx0] + 1) >> 1;
+  }
+};
 
 // Contains encoder state.
 struct PassesEncoderState {
@@ -76,6 +129,8 @@ struct PassesEncoderState {
   // Per-channel (X, Y, B), per-scale band (s = 0: 1:1, 1: 1:2, 2: 1:4, 3: 1:8)
   // target quantizer fields at 8x8 block resolution for intra-block AQ and RDO.
   ImageF band_qf[3][4];
+
+  std::unique_ptr<AcTokenCostModel> token_cost_model;
 
   JxlMemoryManager* memory_manager() const { return shared.memory_manager; }
 };
