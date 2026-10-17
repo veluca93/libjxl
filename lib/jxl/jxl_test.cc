@@ -135,7 +135,7 @@ TEST(JxlTest, RoundtripSmallD1) {
 
   {
     PackedPixelFile ppf_out;
-    EXPECT_NEAR(Roundtrip(t.ppf(), {}, {}, pool, &ppf_out), 890, 40);
+    EXPECT_NEAR(Roundtrip(t.ppf(), {}, {}, pool, &ppf_out), 875, 40);
     EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 0.92);
   }
 
@@ -1296,7 +1296,7 @@ TEST(JxlTest, RoundtripDisablePerceptual) {
 
   PackedPixelFile ppf_out;
 
-  size_t expected_size = 461558;
+  size_t expected_size = 458500;
   EXPECT_NEAR(Roundtrip(t.ppf(), cparams, dparams, pool, &ppf_out),
               expected_size, 4000);
   EXPECT_SLIGHTLY_BELOW(ButteraugliDistance(t.ppf(), ppf_out), 3.5);

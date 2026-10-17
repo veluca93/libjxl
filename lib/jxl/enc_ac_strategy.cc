@@ -552,7 +552,6 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     float loss_ssim4 = 0.0f;
     const float q_norm =
         rdo_mode ? q_llf_fixed : std::max(q_cand, 1e-4f);
-    const auto quant_ac_v = Set(df, q_cand);
     const auto inv_quant_ac_v = Set(df, 1.0f / std::max(q_cand, 1e-4f));
     const auto q_llf_v = Set(df, q_llf_fixed);
     const uint32_t qf_cand =
@@ -565,6 +564,9 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     int32_t* JXL_RESTRICT q_coeffs = reinterpret_cast<int32_t*>(pixels_buf);
 
     for (size_t c : {1, 0, 2}) {
+      const float qm_mul = config.qm_multiplier[c];
+      const auto quant_ac_c_v = Set(df, q_cand * qm_mul);
+      const auto inv_qm_mul_v = Set(df, 1.0f / qm_mul);
       const float* inv_matrix = config.dequant->InvMatrix(acs.Strategy(), c);
       const float* matrix = config.dequant->Matrix(acs.Strategy(), c);
       const float base_corr = (c == 2) ? 1.0f : 0.0f;
@@ -626,7 +628,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
             const auto cw = Load(df, cw_row + rx);
 
             const auto u_coeff = Mul(Sub(in, in_y), im);
-            const auto val = Mul(u_coeff, quant_ac_v);
+            const auto val = Mul(u_coeff, quant_ac_c_v);
             if (rdo_mode) {
               const auto val0 = Mul(u_coeff, q_llf_v);
               const auto z = Div(Abs(val), t0);
@@ -678,13 +680,15 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                           CopySignToAbs(Set(df, kDefaultQuantBias[1]), rval),
                           Sub(rval, Div(Set(df, kDefaultQuantBias[3]), rval))));
                   const auto deq_y = Mul(adj_rval, Mul(m, inv_quant_ac_v));
-                  Store(MulAdd(Set(df, 0.65f), deq_y, Mul(Set(df, 0.35f), in)),
+                  const float rec_w = use_tcm ? 0.90f : 0.65f;
+                  Store(MulAdd(Set(df, rec_w), deq_y,
+                               Mul(Set(df, 1.0f - rec_w), in)),
                         df, rec_y + off + rx);
                 } else {
                   Store(in, df, rec_y + off + rx);
                 }
               }
-              const auto diff = Mul(ws, Sub(val, rval));
+              const auto diff = Mul(ws, Mul(inv_qm_mul_v, Sub(val, rval)));
               Store(Mul(m, diff), df, &mem[off + rx]);
               const auto nz_one = IfThenZeroElse(q_is_zero, one);
               if (use_tcm) {
