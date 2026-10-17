@@ -2437,6 +2437,166 @@ Status BuildPass1TokenCostModel(const FrameHeader& frame_header,
   return true;
 }
 
+Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
+                                      const Image3F& opsin, const Rect& rect,
+                                      ThreadPool* pool,
+                                      PassesEncoderState* enc_state) {
+  if (enc_state->token_cost_model == nullptr || enc_state->streaming_mode ||
+      !enc_state->initialize_global_state ||
+      enc_state->progressive_splitter.GetNumPasses() != 1) {
+    return true;
+  }
+  const CompressParams& cparams = enc_state->cparams;
+  PassesSharedState& shared = enc_state->shared;
+  const FrameDimensions& frame_dim = shared.frame_dim;
+  JxlMemoryManager* memory_manager = enc_state->memory_manager();
+
+  // Detach Pass-1 token_cost_model so pilot ComputeCoefficients runs fast
+  // deadzone quantization + backward EOB Viterbi (unbiased by Pass-1 prices).
+  std::unique_ptr<AcTokenCostModel> frozen_tcm =
+      std::move(enc_state->token_cost_model);
+
+  JXL_ASSIGN_OR_RETURN(
+      Image3F pilot_dc,
+      Image3F::Create(memory_manager, frame_dim.xsize_blocks,
+                      frame_dim.ysize_blocks));
+  const auto compute_pilot_coeffs = [&](size_t group_idx,
+                                        size_t /*thread*/) -> Status {
+    return ComputeCoefficients(group_idx, enc_state, opsin, rect, &pilot_dc);
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups,
+                                ThreadPool::NoInit, compute_pilot_coeffs,
+                                "Pass2A PilotCoeffs"));
+
+  // Compute exact Pass-2 coefficient scan orders on pilot coeffs.
+  frozen_tcm->coeff_orders.resize(kCoeffOrderMaxSize);
+  auto used_orders_info = ComputeUsedOrders(
+      cparams.speed_tier, shared.ac_strategy, Rect(shared.raw_quant_field));
+  uint32_t pilot_used_orders = 0;
+  constexpr uint32_t kAllOrdersMask = (1u << kNumOrders) - 1u;
+  JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
+      cparams.speed_tier, *enc_state->coeffs[0], shared.ac_strategy, frame_dim,
+      pilot_used_orders, /*prev_used_acs=*/0, kAllOrdersMask,
+      used_orders_info.second, frozen_tcm->coeff_orders.data()));
+
+  // Compute exact Pass-2 block context map (1D DP qf_thresholds + JS-div).
+  frozen_tcm->block_ctx_map = BlockCtxMap();
+  if (cparams.speed_tier < SpeedTier::kFalcon) {
+    JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
+        frame_header, frozen_tcm->coeff_orders.data(), enc_state,
+        &frozen_tcm->block_ctx_map));
+  } else {
+    FindBestBlockEntropyModel(cparams, shared.raw_quant_field,
+                              shared.ac_strategy, &frozen_tcm->block_ctx_map);
+  }
+
+  // Tokenize pilot coefficients on exact Pass-2 orders and block_ctx_map.
+  ZeroFillImage(&shared.quant_dc);
+  if (frozen_tcm->pass1_nzeros.xsize() == 0) {
+    JXL_ASSIGN_OR_RETURN(
+        frozen_tcm->pass1_nzeros,
+        Image3I::Create(memory_manager, frame_dim.xsize_blocks,
+                        frame_dim.ysize_blocks));
+  }
+  std::vector<std::vector<Token>> pilot_tokens(frame_dim.num_groups);
+  std::vector<Image3I> pilot_tmp_nzeros;
+  const auto tok_init = [&](const size_t num_threads) -> Status {
+    pilot_tmp_nzeros.resize(num_threads);
+    return true;
+  };
+  const auto tok_group = [&](const uint32_t group_index,
+                             const size_t thread) -> Status {
+    if (pilot_tmp_nzeros[thread].xsize() == 0) {
+      JXL_ASSIGN_OR_RETURN(
+          pilot_tmp_nzeros[thread],
+          Image3I::Create(memory_manager, kGroupDimInBlocks,
+                          kGroupDimInBlocks));
+    }
+    const Rect grect = frame_dim.BlockGroupRect(group_index);
+    const int32_t* JXL_RESTRICT ac_rows[3] = {
+        enc_state->coeffs[0]->PlaneRow(0, group_index, 0).ptr32,
+        enc_state->coeffs[0]->PlaneRow(1, group_index, 0).ptr32,
+        enc_state->coeffs[0]->PlaneRow(2, group_index, 0).ptr32,
+    };
+    JXL_RETURN_IF_ERROR(TokenizeCoefficients(
+        frozen_tcm->coeff_orders.data(), grect, ac_rows, shared.ac_strategy,
+        frame_header.chroma_subsampling, &pilot_tmp_nzeros[thread],
+        &pilot_tokens[group_index], shared.quant_dc, shared.raw_quant_field,
+        frozen_tcm->block_ctx_map));
+    for (size_t c = 0; c < 3; ++c) {
+      for (size_t by = 0; by < grect.ysize(); ++by) {
+        const int32_t* JXL_RESTRICT src_r =
+            pilot_tmp_nzeros[thread].ConstPlaneRow(c, by);
+        int32_t* JXL_RESTRICT dst_r =
+            frozen_tcm->pass1_nzeros.PlaneRow(c, grect.y0() + by) + grect.x0();
+        memcpy(dst_r, src_r, grect.xsize() * sizeof(int32_t));
+      }
+    }
+    return true;
+  };
+  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups, tok_init,
+                                tok_group, "Pass2A PilotTokenize"));
+
+  // Cluster histograms with kBest + kPrecise ANS, keeping kNone uint_method
+  // (default HybridUintConfig(4,2,0)) to avoid single-token config flips.
+  HistogramParams hist_params(cparams.speed_tier,
+                              frozen_tcm->block_ctx_map.NumACContexts());
+  if (cparams.speed_tier <= SpeedTier::kSquirrel) {
+    hist_params.clustering = HistogramParams::ClusteringType::kBest;
+    hist_params.uint_method = HistogramParams::HybridUintMethod::kNone;
+    hist_params.ans_histogram_strategy =
+        HistogramParams::ANSHistogramStrategy::kPrecise;
+  }
+  if (cparams.speed_tier > SpeedTier::kTortoise) {
+    hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
+  }
+  if (cparams.decoding_speed_tier >= 1) {
+    hist_params.max_histograms = 6;
+  }
+  EntropyEncodingData pilot_codes;
+  JXL_ASSIGN_OR_RETURN(
+      size_t pilot_ac_bits,
+      BuildAndEncodeHistograms(
+          memory_manager, hist_params,
+          frozen_tcm->block_ctx_map.NumACContexts(), pilot_tokens, &pilot_codes,
+          /*writer=*/nullptr, LayerType::Ac, /*aux_out=*/nullptr));
+  (void)pilot_ac_bits;
+
+  frozen_tcm->cluster_of_ctx = pilot_codes.context_map;
+  frozen_tcm->uint_config = pilot_codes.uint_config;
+  const size_t num_clusters = pilot_codes.encoding_info.size();
+  frozen_tcm->tok_bits.assign(
+      num_clusters * AcTokenCostModel::kMaxTokenAlphabet, 12.5f);
+  frozen_tcm->small_val_bits.resize(
+      num_clusters * AcTokenCostModel::kSmallValLimit);
+  for (size_t cl = 0; cl < num_clusters; ++cl) {
+    const auto& info_vec = pilot_codes.encoding_info[cl];
+    const float unseen_bits = pilot_codes.use_prefix_code ? 14.0f : 12.5f;
+    for (size_t tok = 0; tok < AcTokenCostModel::kMaxTokenAlphabet; ++tok) {
+      float b = unseen_bits;
+      if (tok < info_vec.size()) {
+        if (pilot_codes.use_prefix_code) {
+          if (info_vec.size() <= 1) {
+            b = 0.0f;
+          } else if (info_vec[tok].depth > 0) {
+            b = static_cast<float>(info_vec[tok].depth);
+          }
+        } else if (info_vec[tok].freq_ > 0) {
+          b = 12.0f - std::log2(static_cast<float>(info_vec[tok].freq_));
+        }
+      }
+      frozen_tcm->tok_bits[cl * AcTokenCostModel::kMaxTokenAlphabet + tok] = b;
+    }
+    for (uint32_t val = 0; val < AcTokenCostModel::kSmallValLimit; ++val) {
+      frozen_tcm->small_val_bits[cl * AcTokenCostModel::kSmallValLimit + val] =
+          frozen_tcm->LargeValBits(cl, val);
+    }
+  }
+
+  enc_state->token_cost_model = std::move(frozen_tcm);
+  return true;
+}
+
 Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             PassesEncoderState* enc_state,
                             ModularFrameEncoder* modular_frame_encoder,
@@ -2702,8 +2862,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(
       RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
 
+  std::unique_ptr<AcTokenCostModel> token_cost_model;
   if (use_two_pass_rdo) {
-    auto token_cost_model = jxl::make_unique<AcTokenCostModel>();
+    token_cost_model = jxl::make_unique<AcTokenCostModel>();
     JXL_RETURN_IF_ERROR(BuildPass1TokenCostModel(
         frame_header, enc_state, *opsin, rect, acs_heuristics.config.cost_delta,
         pool, token_cost_model.get()));
@@ -2761,7 +2922,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
                                   process_tile_pass2, "Enc Heuristics P2"));
     acs_heuristics.config.token_cost_model = nullptr;
-    enc_state->token_cost_model = std::move(token_cost_model);
   }
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
@@ -2801,6 +2961,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                                           initial_quant_field, enc_state, cms,
                                           pool, aux_out));
   }
+  enc_state->token_cost_model = std::move(token_cost_model);
 
   // Choose a context model that depends on the amount of quantization for AC.
   if (cparams.speed_tier < SpeedTier::kFalcon && initialize_global_state) {

@@ -32,6 +32,7 @@
 #include "lib/jxl/enc_aux_out.h"
 #include "lib/jxl/enc_frame.h"
 #include "lib/jxl/enc_group.h"
+#include "lib/jxl/enc_heuristics.h"
 #include "lib/jxl/enc_modular.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/enc_quant_weights.h"
@@ -100,6 +101,11 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(
         DequantMatricesScaleDC(memory_manager, &shared.matrices, scale));
     shared.quantizer.RecomputeFromGlobalScale();
+  }
+
+  if (enc_state->token_cost_model != nullptr) {
+    JXL_RETURN_IF_ERROR(BuildPass2FrozenTokenCostModel(
+        frame_header, opsin, rect, pool, enc_state));
   }
 
   JXL_ASSIGN_OR_RETURN(

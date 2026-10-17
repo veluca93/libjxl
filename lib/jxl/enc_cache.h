@@ -38,7 +38,7 @@ struct AuxOut;
 
 struct AcTokenCostModel {
   static constexpr size_t kMaxTokenAlphabet = 256;
-  static constexpr size_t kSmallValLimit = 64;
+  static constexpr size_t kSmallValLimit = 256;
 
   BlockCtxMap block_ctx_map;
   std::vector<coeff_order_t> coeff_orders;
@@ -69,6 +69,19 @@ struct AcTokenCostModel {
       return small_val_bits[cluster * kSmallValLimit + value];
     }
     return LargeValBits(cluster, value);
+  }
+
+  // Fetches bit costs for [prev=0, prev=1] at once.
+  // `base_ctx` must be `ZeroDensityContextsOffset(block_ctx) +
+  // ZeroDensityContext(..., /*prev=*/0)` (which is always even).
+  JXL_INLINE void ValBitsPair(size_t base_ctx, uint32_t value,
+                              float* JXL_RESTRICT bits_prev0,
+                              float* JXL_RESTRICT bits_prev1) const {
+    const size_t cl0 = cluster_of_ctx[base_ctx];
+    const size_t cl1 = cluster_of_ctx[base_ctx + 1];
+    const float b0 = ValBits(cl0, value);
+    *bits_prev0 = b0;
+    *bits_prev1 = (cl0 == cl1) ? b0 : ValBits(cl1, value);
   }
 
   JXL_INLINE int32_t PredictNzeros(size_t c, size_t bx0, size_t by0) const {
@@ -125,6 +138,10 @@ struct PassesEncoderState {
   float b_qm_multiplier = 1.0f;
 
   ImageF initial_quant_masking1x1;
+
+  // Non-owning pointer to pre-Gaborish opsin (at unpadded frame dimensions)
+  // used during ComputeCoefficients for BlockHasFewColors detection.
+  const Image3F* orig_opsin = nullptr;
 
   // Per-channel (X, Y, B), per-scale band (s = 0: 1:1, 1: 1:2, 2: 1:4, 3: 1:8)
   // target quantizer fields at 8x8 block resolution for intra-block AQ and RDO.

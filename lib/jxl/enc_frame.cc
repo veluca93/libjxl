@@ -1078,8 +1078,11 @@ Status ComputeVarDCTEncodingData(FrameHeader& frame_header,
                                            linear, opsin, rect, cms, pool,
                                            aux_out));
 
-  JXL_RETURN_IF_ERROR(InitializePassesEncoder(
-      frame_header, *opsin, rect, cms, pool, enc_state, enc_modular, aux_out));
+  enc_state->orig_opsin = &orig_opsin;
+  Status init_status = InitializePassesEncoder(
+      frame_header, *opsin, rect, cms, pool, enc_state, enc_modular, aux_out);
+  enc_state->orig_opsin = nullptr;
+  JXL_RETURN_IF_ERROR(init_status);
 
   JXL_RETURN_IF_ERROR(
       ComputeARHeuristics(frame_header, enc_state, orig_opsin, rect, pool));

@@ -61,15 +61,126 @@ using hwy::HWY_NAMESPACE::Max;
 using hwy::HWY_NAMESPACE::Round;
 using hwy::HWY_NAMESPACE::Sub;
 
-static JXL_INLINE size_t TrellisNzBucket(size_t shifted_n) {
-  if (shifted_n <= 1) return 0;
-  if (shifted_n == 2) return 1;
-  if (shifted_n <= 4) return 2;
-  if (shifted_n <= 8) return 3;
-  if (shifted_n <= 12) return 4;
-  if (shifted_n <= 20) return 5;
-  if (shifted_n <= 32) return 6;
-  return 7;
+static constexpr size_t kMaxNzeroDelta = 6;
+static constexpr size_t kBandWidth = 2 * kMaxNzeroDelta + 2;  // 14
+static constexpr size_t kBandStride = 2 * kBandWidth;         // 28
+static constexpr size_t kMaxRdoqWindow = 1024;
+static constexpr size_t kMaxCandidates = 5;
+
+static JXL_INLINE float ReconstructedLevel(int32_t level, float bias_one) {
+  const int32_t abs_level = std::abs(level);
+  if (abs_level == 0) return 0.0f;
+  if (abs_level == 1) return (level > 0) ? bias_one : -bias_one;
+  const float f = static_cast<float>(level);
+  return f - 0.145f / f;
+}
+
+// Counts distinct 1/1024-quantized XYB triples in the transform footprint.
+// Returns true if distinct colors <= 24 * eff_blocks. Uses at most 1 KB stack.
+static bool BlockHasFewColors(const Image3F* orig_opsin,
+                              const float* const JXL_RESTRICT opsin_rows[3],
+                              size_t opsin_stride, size_t frame_px0,
+                              size_t frame_py0, size_t bx_px_offset,
+                              size_t cov_x, size_t cov_y) {
+  constexpr size_t kFewColorsPerBlock = 24;
+  const size_t step_x = std::max<size_t>(1, cov_x / 2);
+  const size_t step_y = std::max<size_t>(1, cov_y / 2);
+  const size_t eff_blocks = (cov_x / step_x) * (cov_y / step_y);
+  const size_t limit = kFewColorsPerBlock * eff_blocks;
+
+  uint32_t table[256];
+  const size_t table_size = (eff_blocks == 1) ? 64 : 256;
+  const uint32_t table_mask = static_cast<uint32_t>(table_size - 1);
+  const int hash_shift = (eff_blocks == 1) ? 26 : 24;
+  memset(table, 0xFF, table_size * sizeof(uint32_t));
+
+  const size_t width = cov_x * kBlockDim;
+  const size_t height = cov_y * kBlockDim;
+  const bool use_orig =
+      (orig_opsin != nullptr && frame_px0 < orig_opsin->xsize() &&
+       frame_py0 < orig_opsin->ysize());
+  const size_t max_x =
+      use_orig ? std::min(width, orig_opsin->xsize() - frame_px0) : width;
+  const size_t max_y =
+      use_orig ? std::min(height, orig_opsin->ysize() - frame_py0) : height;
+  if (max_x == 0 || max_y == 0) return false;
+
+  size_t distinct = 0;
+  for (size_t y = 0; y < max_y; y += step_y) {
+    const float* JXL_RESTRICT rx =
+        use_orig ? (orig_opsin->ConstPlaneRow(0, frame_py0 + y) + frame_px0)
+                 : (opsin_rows[0] + y * opsin_stride + bx_px_offset);
+    const float* JXL_RESTRICT ry =
+        use_orig ? (orig_opsin->ConstPlaneRow(1, frame_py0 + y) + frame_px0)
+                 : (opsin_rows[1] + y * opsin_stride + bx_px_offset);
+    const float* JXL_RESTRICT rb =
+        use_orig ? (orig_opsin->ConstPlaneRow(2, frame_py0 + y) + frame_px0)
+                 : (opsin_rows[2] + y * opsin_stride + bx_px_offset);
+    for (size_t x = 0; x < max_x; x += step_x) {
+      const uint32_t qx =
+          static_cast<uint32_t>(static_cast<int32_t>(rx[x] * 1024.0f + 512.5f)) &
+          0x3FFu;
+      const uint32_t qy =
+          static_cast<uint32_t>(static_cast<int32_t>(ry[x] * 1024.0f + 512.5f)) &
+          0x7FFu;
+      const uint32_t qb =
+          static_cast<uint32_t>(static_cast<int32_t>(rb[x] * 1024.0f + 512.5f)) &
+          0x7FFu;
+      uint32_t key = qx | (qy << 10) | (qb << 21);
+      if (key == 0xFFFFFFFFu) key = 0xFFFFFFFEu;
+
+      uint32_t slot = (key * 0x9E3779B1u) >> hash_shift;
+      while (true) {
+        const uint32_t cur = table[slot];
+        if (cur == key) break;
+        if (cur == 0xFFFFFFFFu) {
+          table[slot] = key;
+          if (++distinct > limit) return false;
+          break;
+        }
+        slot = (slot + 1u) & table_mask;
+      }
+    }
+  }
+  return true;
+}
+
+static JXL_INLINE size_t BuildRdoqCandidates(
+    int32_t current, float ideal, float abs_ideal, bool allow_zero_to_one,
+    bool allow_round_up, int32_t out_cands[kMaxCandidates]) {
+  out_cands[0] = 0;
+  size_t count = 1;
+  const int32_t sgn = (ideal >= 0.0f) ? 1 : -1;
+
+  auto push_unique = [&](int32_t cand) {
+    for (size_t i = 0; i < count; ++i) {
+      if (out_cands[i] == cand) return;
+    }
+    if (count < kMaxCandidates) {
+      out_cands[count++] = cand;
+    }
+  };
+
+  if (current == 0) {
+    if (allow_zero_to_one) {
+      push_unique(sgn);
+    }
+    return count;
+  }
+
+  push_unique(current);
+  const int32_t cur_sgn = (current > 0) ? 1 : -1;
+  const int32_t q_abs = std::abs(current);
+  if (q_abs >= 2) {
+    push_unique(cur_sgn * (q_abs - 1));
+  }
+  if (q_abs >= 3) {
+    push_unique(cur_sgn * (q_abs - 2));
+  }
+  if (allow_round_up && abs_ideal + 0.56f >= static_cast<float>(q_abs + 1)) {
+    push_unique(cur_sgn * (q_abs + 1));
+  }
+  return count;
 }
 
 int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
@@ -81,16 +192,16 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
                                int32_t predicted_nzeros,
                                const float quad_thres[4],
                                const float zero_thres[8], float eob_scale,
+                               bool few_colors,
                                const float* JXL_RESTRICT block_in,
-                               int32_t quant, int32_t* JXL_RESTRICT block_out) {
-  static constexpr uint16_t kNzBucketCtxOffset[8] = {0,   31,  62,  93,
-                                                     123, 152, 180, 206};
-  static constexpr size_t kMaxTrellisActive = 64;
+                               int32_t quant, int32_t* JXL_RESTRICT block_out,
+                               uint8_t* JXL_RESTRICT choices_buf) {
   const size_t size = covered_blocks * kDCTBlockSize;
   const size_t dim = xsize * kBlockDim;
   const coeff_order_t* JXL_RESTRICT order =
       &tcm.coeff_orders[CoeffOrderOffset(ord, c)];
-  const size_t block_ctx = tcm.block_ctx_map.Context(/*dc_idx=*/0, quant, ord, c);
+  const size_t block_ctx =
+      tcm.block_ctx_map.Context(/*dc_idx=*/0, quant, ord, c);
   const uint32_t nzero_ctx =
       tcm.block_ctx_map.NonZeroContext(predicted_nzeros, block_ctx);
   const uint8_t cl_nzero = tcm.cluster_of_ctx[nzero_ctx];
@@ -99,19 +210,15 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
   const float qac = quantizer.Scale() * quant * qm_multiplier;
   const float b_c = kDefaultQuantBias[c];
+  const float restore_floor = few_colors ? 0.50f : (0.5f * b_c);
 
-  auto a_hat = [b_c](int32_t m) -> float {
-    return (m == 1)
-               ? b_c
-               : (static_cast<float>(m) - 0.145f / static_cast<float>(m));
-  };
   const bool is_partial_block =
       ((1 << static_cast<size_t>(quant_kind)) & kPartialBlockKinds) != 0;
   auto rescue_quad0 = [&]() -> int32_t {
     if (is_partial_block || c != 1 || covered_blocks > 4 || eob_scale <= 0.0f) {
       return 0;
     }
-    float best_abs = 0.46f;
+    float best_abs = few_colors ? 0.54f : 0.46f;
     int best_pos = -1;
     int32_t best_sign = 1;
     for (size_t y = 0; y < 4 * ysize; ++y) {
@@ -134,16 +241,83 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
     return 0;
   };
 
-  struct ActiveCoeff {
-    uint32_t k;
-    uint32_t pos;
-    int32_t q_lo;
-    int32_t q_hi;
-    float d_lo;
-    float d_hi;
-  };
-  std::vector<ActiveCoeff> all_active;
-  all_active.reserve(64);
+  const size_t window_cap =
+      (covered_blocks == 1)
+          ? 63
+          : std::min<size_t>(64 * covered_blocks, kMaxRdoqWindow);
+  const size_t restore_len =
+      (covered_blocks == 1) ? 20 : std::min<size_t>(24 * covered_blocks, 256);
+  const size_t search_end = std::min<size_t>(size, covered_blocks + window_cap);
+  if (search_end <= covered_blocks) {
+    int32_t nz = 0;
+    for (size_t k = covered_blocks; k < size; ++k) {
+      nz += static_cast<int32_t>(block_out[order[k]] != 0);
+    }
+    return nz;
+  }
+  const size_t window_len = search_end - covered_blocks;
+
+  size_t suffix_nzeros = 0;
+  for (size_t k = search_end; k < size; ++k) {
+    suffix_nzeros += static_cast<size_t>(block_out[order[k]] != 0);
+  }
+  size_t window_orig_nzeros = 0;
+  size_t scalar_lf_nz = 0;
+  bool any_near_dz_cand = false;
+  for (size_t wi = 0; wi < window_len; ++wi) {
+    const size_t k = covered_blocks + wi;
+    const size_t pos = order[k];
+    const size_t y = pos / dim;
+    const size_t x = pos % dim;
+    const size_t v8 = y / ysize;
+    const size_t u8 = x / xsize;
+    const uint8_t s = kCoeffBand[v8][u8];
+    if (block_out[pos] != 0) {
+      ++window_orig_nzeros;
+      if (is_partial_block ? (k <= 8) : (s >= 2)) {
+        ++scalar_lf_nz;
+      }
+    } else if (!any_near_dz_cand) {
+      const size_t hfix =
+          (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
+      const float t0_full = quad_thres[hfix] + zero_thres[4 + s];
+      const float near_dz_floor = std::max(0.49f, t0_full - 0.04f);
+      const float abs_ideal = std::abs(block_in[pos] * (qm[pos] * qac));
+      const bool can_restore =
+          (c == 1)
+              ? (wi < restore_len)
+              : ((wi < restore_len / 2) &&
+                 (is_partial_block ? (k <= 8) : (s >= 2)));
+      if ((can_restore && abs_ideal >= restore_floor) ||
+          (!few_colors && abs_ideal >= near_dz_floor)) {
+        any_near_dz_cand = true;
+      }
+    }
+  }
+  if (suffix_nzeros == 0 && window_orig_nzeros == 0 && !any_near_dz_cand) {
+    return rescue_quad0();
+  }
+
+  float suffix_cost[2] = {0.0f, 0.0f};
+  if (suffix_nzeros > 0) {
+    for (size_t init_prev = 0; init_prev < 2; ++init_prev) {
+      size_t rem = suffix_nzeros;
+      size_t prev = init_prev;
+      float bits = 0.0f;
+      for (size_t k = search_end; k < size && rem > 0; ++k) {
+        const int32_t coeff = block_out[order[k]];
+        const uint32_t ctx =
+            static_cast<uint32_t>(histo_offset) +
+            ZeroDensityContext(rem, k, covered_blocks, log2_covered_blocks,
+                               prev);
+        const uint8_t cl = tcm.cluster_of_ctx[ctx];
+        bits += tcm.ValBits(cl, PackSigned(coeff));
+        prev = (coeff != 0) ? 1 : 0;
+        rem -= prev;
+      }
+      suffix_cost[init_prev] = bits;
+    }
+  }
 
   static constexpr float kBandDistWeight[4] = {0.92f, 1.00f, 1.24f, 1.65f};
   const float sparse_w = Clamp1((eob_scale - 0.32f) / 0.42f, 0.0f, 1.0f);
@@ -153,10 +327,28 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   const float base_h = 0.58f;
   const float t_ref = 0.60f;
   const float denom_ref = b_c * (2.0f * t_ref - b_c);
-  size_t scalar_lf_nz = 0;
 
-  for (size_t k = covered_blocks; k < size; ++k) {
-    const coeff_order_t pos = order[k];
+  constexpr float kInf = 1e30f;
+  float cost_buf[2][kBandStride];
+  for (size_t i = 0; i < kBandStride; ++i) {
+    cost_buf[0][i] = kInf;
+    cost_buf[1][i] = kInf;
+  }
+  size_t next_row = 0;
+  cost_buf[next_row][0] = suffix_cost[0];
+  cost_buf[next_row][1] = suffix_cost[1];
+  size_t next_min = suffix_nzeros;
+  size_t next_max = suffix_nzeros;
+  size_t original_after_nzeros = 0;
+
+  for (size_t rev = 0; rev < window_len; ++rev) {
+    const size_t wi = window_len - 1 - rev;
+    const size_t k = covered_blocks + wi;
+    const size_t pos = order[k];
+    const int32_t current = block_out[pos];
+    const float ideal = block_in[pos] * (qm[pos] * qac);
+    const float abs_ideal = std::abs(ideal);
+
     const size_t y = pos / dim;
     const size_t x = pos % dim;
     const size_t v8 = y / ysize;
@@ -165,283 +357,225 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
         (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
     const uint8_t s = kCoeffBand[v8][u8];
     const float t0_full = quad_thres[hfix] + zero_thres[4 + s];
-    const float x_val = block_in[pos] * (qm[pos] * qac);
-    const float a = std::abs(x_val);
-    if (block_out[pos] != 0 && (is_partial_block ? (k <= 8) : (s >= 2))) {
-      ++scalar_lf_nz;
-    }
-    if (block_out[pos] == 0 && a < std::max(0.49f, t0_full - 0.04f)) {
-      continue;
-    }
-    const float raw_h = (hfix == 0) ? 0.58f : ((c == 1) ? 0.64f : 0.62f);
-    const float perc_t0 =
-        std::max(0.50f, t0_full - (1.0f - kQuadTilt) * (raw_h - base_h));
-    const float t_ratio = t_ref / perc_t0;
-    const float w_base = (eff_ref_bits / denom_ref) * (t_ratio * t_ratio);
-    const float band_w = is_partial_block ? 1.0f : kBandDistWeight[s];
-    const float w_zero = w_base * (1.0f + sparse_w * (band_w - 1.0f));
-    const int32_t sgn = (x_val >= 0.0f) ? 1 : -1;
-    int32_t q_lo = sgn;
-    int32_t q_hi = sgn;
-    if (a >= 1.40f) {
-      const int32_t m_hi =
-          std::max<int32_t>(1, static_cast<int32_t>(std::floor(a + 0.56f)));
-      const int32_t m_lo = std::max<int32_t>(1, m_hi - 1);
-      q_lo = sgn * m_lo;
-      q_hi = sgn * m_hi;
-    }
-    const float d_one_base = b_c * (b_c - 2.0f * a);
-    const float d_zero_step = (w_zero - w_base) * d_one_base;
-    const float ah_lo = a_hat(std::abs(q_lo));
-    const float d_lo = d_zero_step + w_base * ah_lo * (ah_lo - 2.0f * a);
-    float d_hi = d_lo;
-    if (q_hi != q_lo) {
-      const float ah_hi = a_hat(std::abs(q_hi));
-      d_hi = d_zero_step + w_base * ah_hi * (ah_hi - 2.0f * a);
-    }
-    all_active.push_back(
-        {static_cast<uint32_t>(k), pos, q_lo, q_hi, d_lo, d_hi});
-  }
-
-  const size_t total_active = all_active.size();
-  if (total_active == 0) {
-    return rescue_quad0();
-  }
-
-  size_t prefix_active = 0;
-  size_t prefix_nzeros = 0;
-  size_t prefix_last_nz_k = 0;
-  if (total_active > kMaxTrellisActive) {
-    prefix_active = total_active - kMaxTrellisActive;
-    for (size_t idx = 0; idx < prefix_active; ++idx) {
-      const ActiveCoeff& ac = all_active[idx];
-      if (block_out[ac.pos] != 0 && ac.q_hi != ac.q_lo) {
-        const size_t rem_est = total_active - idx;
-        const size_t b_n = TrellisNzBucket((rem_est + covered_blocks - 1) >>
-                                           log2_covered_blocks);
-        const size_t kf = kCoeffFreqContext[ac.k >> log2_covered_blocks];
-        const size_t prev =
-            (ac.k > covered_blocks && block_out[order[ac.k - 1]] != 0) ? 1 : 0;
-        const uint8_t cl = tcm.cluster_of_ctx[histo_offset +
-                                              (kNzBucketCtxOffset[b_n] + kf) * 2 +
-                                              prev];
-        const float c_lo = ac.d_lo + tcm.ValBits(cl, PackSigned(ac.q_lo));
-        const float c_hi = ac.d_hi + tcm.ValBits(cl, PackSigned(ac.q_hi));
-        block_out[ac.pos] = (c_hi < c_lo) ? ac.q_hi : ac.q_lo;
+    const float near_dz_floor = std::max(0.49f, t0_full - 0.04f);
+    const bool can_restore =
+        (c == 1)
+            ? (wi < restore_len)
+            : ((wi < restore_len / 2) &&
+               (is_partial_block ? (k <= 8) : (s >= 2)));
+    const bool allow_zero_to_one =
+        (can_restore && abs_ideal >= restore_floor) ||
+        (!few_colors && abs_ideal >= near_dz_floor);
+    const bool allow_round_up = !(few_colors && s <= 1);
+    float restore_rate_mul = 1.0f;
+    if (current == 0) {
+      if (few_colors) {
+        restore_rate_mul = (c == 1) ? 2.0f : 2.5f;
+      } else if (c != 1 && abs_ideal < near_dz_floor) {
+        restore_rate_mul = (c == 0) ? 1.15f : 1.25f;
       }
     }
-    const size_t prefix_end_k = all_active[prefix_active].k;
-    for (size_t k = covered_blocks; k < prefix_end_k; ++k) {
-      if (block_out[order[k]] != 0) {
-        ++prefix_nzeros;
-        prefix_last_nz_k = k;
+
+    int32_t candidates[kMaxCandidates];
+    const size_t cand_count = BuildRdoqCandidates(
+        current, ideal, abs_ideal, allow_zero_to_one, allow_round_up,
+        candidates);
+
+    float dist_cost[kMaxCandidates];
+    uint32_t packed_sym[kMaxCandidates];
+    dist_cost[0] = 0.0f;
+    packed_sym[0] = 0u;
+    if (cand_count > 1) {
+      const float raw_h = (hfix == 0) ? 0.58f : ((c == 1) ? 0.64f : 0.62f);
+      const float perc_t0 =
+          std::max(0.50f, t0_full - (1.0f - kQuadTilt) * (raw_h - base_h));
+      const float t_ratio = t_ref / perc_t0;
+      const float w_base = (eff_ref_bits / denom_ref) * (t_ratio * t_ratio);
+      const float band_w = is_partial_block ? 1.0f : kBandDistWeight[s];
+      const float w_zero = w_base * (1.0f + sparse_w * (band_w - 1.0f));
+      const float d_one_base = b_c * (b_c - 2.0f * abs_ideal);
+      const float d_zero_step = (w_zero - w_base) * d_one_base;
+      for (size_t ci = 1; ci < cand_count; ++ci) {
+        const int32_t level = candidates[ci];
+        const float deq = ReconstructedLevel(level, b_c);
+        dist_cost[ci] = d_zero_step + w_base * deq * (deq - 2.0f * ideal);
+        packed_sym[ci] = PackSigned(level);
       }
     }
-  }
 
-  const ActiveCoeff* active = all_active.data() + prefix_active;
-  const size_t M = total_active - prefix_active;
-  float dp0[kMaxTrellisActive + 1] = {};
-  float dp1[kMaxTrellisActive + 1] = {};
-  uint64_t chose_nz0[kMaxTrellisActive] = {};
-  uint64_t chose_nz1[kMaxTrellisActive] = {};
+    const size_t processed_after = window_len - 1 - wi;
+    const size_t min_rem =
+        suffix_nzeros +
+        ((original_after_nzeros > kMaxNzeroDelta)
+             ? (original_after_nzeros - kMaxNzeroDelta)
+             : 0);
+    const size_t max_rem =
+        suffix_nzeros +
+        std::min(original_after_nzeros + kMaxNzeroDelta, processed_after);
+    const size_t current_min = min_rem;
+    const size_t current_max =
+        std::min(max_rem + 1, suffix_nzeros + window_len);
 
-  {
-    const ActiveCoeff& last_ac = active[M - 1];
-    const size_t kf = kCoeffFreqContext[last_ac.k >> log2_covered_blocks];
-    for (size_t p = 0; p < 2; ++p) {
-      const uint8_t cl =
-          tcm.cluster_of_ctx[histo_offset + (kNzBucketCtxOffset[0] + kf) * 2 + p];
-      const float c_lo = last_ac.d_lo + tcm.ValBits(cl, PackSigned(last_ac.q_lo));
-      const float c_hi =
-          (last_ac.q_hi == last_ac.q_lo)
-              ? c_lo
-              : (last_ac.d_hi + tcm.ValBits(cl, PackSigned(last_ac.q_hi)));
-      const float best_c = std::min(c_lo, c_hi);
-      if (p == 0) {
-        dp0[1] = best_c;
-      } else {
-        dp1[1] = best_c;
-      }
+    const size_t cur_row = 1 - next_row;
+    float* JXL_RESTRICT cur_dp = cost_buf[cur_row];
+    const float* JXL_RESTRICT next_dp = cost_buf[next_row];
+    for (size_t i = 0; i < kBandStride; ++i) {
+      cur_dp[i] = kInf;
     }
-    chose_nz0[M - 1] = 1ULL;
-    chose_nz1[M - 1] = 1ULL;
-  }
+    uint8_t* JXL_RESTRICT choice_row = choices_buf + wi * kBandStride;
 
-  for (int i = static_cast<int>(M) - 2; i >= 0; --i) {
-    const ActiveCoeff& ac = active[i];
-    const size_t k_cur = ac.k;
-    const size_t k_next = active[i + 1].k;
-    const size_t gap = k_next - k_cur - 1;
-    float gap_bits[8][2] = {};
-    if (gap >= 1) {
-      const size_t kf1 = kCoeffFreqContext[(k_cur + 1) >> log2_covered_blocks];
-      for (size_t b = 0; b < 8; ++b) {
-        if (kNzBucketCtxOffset[b] + kf1 >= 229) break;
-        const size_t base = histo_offset + (kNzBucketCtxOffset[b] + kf1) * 2;
-        gap_bits[b][0] = tcm.ValBits(tcm.cluster_of_ctx[base + 0], 0);
-        gap_bits[b][1] = tcm.ValBits(tcm.cluster_of_ctx[base + 1], 0);
+    uint32_t cached_ctx0 = 0xFFFFFFFFu;
+    float zero_local[2] = {0.0f, 0.0f};
+    float nz_local[2] = {kInf, kInf};
+    uint8_t nz_best_ci[2] = {0, 0};
+
+    for (size_t rem = current_min; rem <= current_max; ++rem) {
+      const size_t band_offset = (rem - current_min) * 2;
+      if (rem == 0) {
+        if (next_min == 0) {
+          const float tail0 = next_dp[0];
+          cur_dp[band_offset + 0] = tail0;
+          cur_dp[band_offset + 1] = tail0;
+          choice_row[band_offset + 0] = 0;
+          choice_row[band_offset + 1] = 0;
+        }
+        continue;
       }
-      for (size_t k = k_cur + 2; k < k_next; ++k) {
-        const size_t kf = kCoeffFreqContext[k >> log2_covered_blocks];
-        for (size_t b = 0; b < 8; ++b) {
-          if (kNzBucketCtxOffset[b] + kf >= 229) break;
-          const size_t base = histo_offset + (kNzBucketCtxOffset[b] + kf) * 2;
-          const float bz = tcm.ValBits(tcm.cluster_of_ctx[base + 0], 0);
-          gap_bits[b][0] += bz;
-          gap_bits[b][1] += bz;
+
+      const uint32_t ctx0 =
+          static_cast<uint32_t>(histo_offset) +
+          ZeroDensityContext(rem, k, covered_blocks, log2_covered_blocks, 0);
+      if (ctx0 != cached_ctx0) {
+        cached_ctx0 = ctx0;
+        tcm.ValBitsPair(ctx0, 0, &zero_local[0], &zero_local[1]);
+        nz_local[0] = kInf;
+        nz_local[1] = kInf;
+        nz_best_ci[0] = 0;
+        nz_best_ci[1] = 0;
+        for (size_t ci = 1; ci < cand_count; ++ci) {
+          float b0 = 0.0f;
+          float b1 = 0.0f;
+          tcm.ValBitsPair(ctx0, packed_sym[ci], &b0, &b1);
+          const float c0 = dist_cost[ci] + b0 * restore_rate_mul;
+          const float c1 = dist_cost[ci] + b1 * restore_rate_mul;
+          if (c0 < nz_local[0]) {
+            nz_local[0] = c0;
+            nz_best_ci[0] = static_cast<uint8_t>(ci);
+          }
+          if (c1 < nz_local[1]) {
+            nz_local[1] = c1;
+            nz_best_ci[1] = static_cast<uint8_t>(ci);
+          }
         }
       }
-    }
 
-    float zero_bits_cur[8][2] = {};
-    float nz_cost_cur[8][2] = {};
-    const size_t kf_cur = kCoeffFreqContext[k_cur >> log2_covered_blocks];
-    const uint32_t u_lo = PackSigned(ac.q_lo);
-    const uint32_t u_hi = PackSigned(ac.q_hi);
-    for (size_t b = 0; b < 8; ++b) {
-      if (kNzBucketCtxOffset[b] + kf_cur >= 229) break;
-      for (size_t p = 0; p < 2; ++p) {
-        const uint8_t cl =
-            tcm.cluster_of_ctx[histo_offset +
-                               (kNzBucketCtxOffset[b] + kf_cur) * 2 + p];
-        zero_bits_cur[b][p] = tcm.ValBits(cl, 0);
-        const float c_lo = ac.d_lo + tcm.ValBits(cl, u_lo);
-        const float c_hi =
-            (ac.q_hi == ac.q_lo) ? c_lo : (ac.d_hi + tcm.ValBits(cl, u_hi));
-        nz_cost_cur[b][p] = std::min(c_lo, c_hi);
+      float z_tail = kInf;
+      if (rem >= next_min && rem <= next_max) {
+        z_tail = next_dp[(rem - next_min) * 2 + 0];
       }
-    }
+      float nz_tail = kInf;
+      if (cand_count > 1 && (rem - 1) >= next_min && (rem - 1) <= next_max) {
+        nz_tail = next_dp[(rem - 1 - next_min) * 2 + 1];
+      }
 
-    const size_t max_n_next = M - 1 - static_cast<size_t>(i);
-    const size_t max_n_cur = max_n_next + 1;
-    uint64_t mask0 = 0;
-    uint64_t mask1 = 0;
-    for (size_t n = max_n_cur; n >= 1; --n) {
-      const size_t b_n =
-          TrellisNzBucket((n + covered_blocks - 1) >> log2_covered_blocks);
-      float tail_nz = 0.0f;
-      if (n >= 2) {
-        if (gap == 0) {
-          tail_nz = dp1[n - 1];
-        } else {
-          const size_t b_nm1 = TrellisNzBucket((n - 1 + covered_blocks - 1) >>
-                                               log2_covered_blocks);
-          tail_nz = gap_bits[b_nm1][1] + dp0[n - 1];
+      for (size_t prev = 0; prev < 2; ++prev) {
+        float best_c = kInf;
+        uint8_t best_ci = 0;
+        if (z_tail < kInf) {
+          best_c = zero_local[prev] + z_tail;
         }
-      }
-      const float c0_nz = nz_cost_cur[b_n][0] + tail_nz;
-      const float c1_nz = nz_cost_cur[b_n][1] + tail_nz;
-      const uint64_t bit = 1ULL << (n - 1);
-      if (n <= max_n_next) {
-        const float tail_z =
-            (gap == 0) ? dp0[n] : (gap_bits[b_n][0] + dp0[n]);
-        const float c0_z = zero_bits_cur[b_n][0] + tail_z;
-        const float c1_z = zero_bits_cur[b_n][1] + tail_z;
-        if (c0_nz < c0_z) mask0 |= bit;
-        if (c1_nz < c1_z) mask1 |= bit;
-        dp0[n] = std::min(c0_nz, c0_z);
-        dp1[n] = std::min(c1_nz, c1_z);
-      } else {
-        mask0 |= bit;
-        mask1 |= bit;
-        dp0[n] = c0_nz;
-        dp1[n] = c1_nz;
+        if (nz_tail < kInf) {
+          const float c_nz = nz_local[prev] + nz_tail;
+          if (c_nz < best_c) {
+            best_c = c_nz;
+            best_ci = nz_best_ci[prev];
+          }
+        }
+        cur_dp[band_offset + prev] = best_c;
+        choice_row[band_offset + prev] = best_ci;
       }
     }
-    chose_nz0[i] = mask0;
-    chose_nz1[i] = mask1;
-  }
 
-  const size_t gap_start =
-      (prefix_nzeros > 0) ? (prefix_last_nz_k + 1) : covered_blocks;
-  const size_t pre_gap = active[0].k - gap_start;
-  float pre_gap_bits[8][2] = {};
-  if (pre_gap >= 1) {
-    const size_t kf1 = kCoeffFreqContext[gap_start >> log2_covered_blocks];
-    for (size_t b = 0; b < 8; ++b) {
-      if (kNzBucketCtxOffset[b] + kf1 >= 229) break;
-      const size_t base = histo_offset + (kNzBucketCtxOffset[b] + kf1) * 2;
-      pre_gap_bits[b][0] = tcm.ValBits(tcm.cluster_of_ctx[base + 0], 0);
-      pre_gap_bits[b][1] = tcm.ValBits(tcm.cluster_of_ctx[base + 1], 0);
-    }
-    for (size_t k = gap_start + 1; k < active[0].k; ++k) {
-      const size_t kf = kCoeffFreqContext[k >> log2_covered_blocks];
-      for (size_t b = 0; b < 8; ++b) {
-        if (kNzBucketCtxOffset[b] + kf >= 229) break;
-        const size_t base = histo_offset + (kNzBucketCtxOffset[b] + kf) * 2;
-        const float bz = tcm.ValBits(tcm.cluster_of_ctx[base + 0], 0);
-        pre_gap_bits[b][0] += bz;
-        pre_gap_bits[b][1] += bz;
-      }
-    }
+    next_row = cur_row;
+    next_min = current_min;
+    next_max = current_max;
+    original_after_nzeros += static_cast<size_t>(current != 0);
   }
 
   const float flat_penalty =
-      (prefix_nzeros == 0 && scalar_lf_nz > 0)
+      (suffix_nzeros == 0 && scalar_lf_nz > 0)
           ? (sparse_w * ((c == 1) ? 1.15f : 0.35f) *
              static_cast<float>(std::min<size_t>(2, scalar_lf_nz)))
           : 0.0f;
-  float best_total_cost =
-      tcm.ValBits(cl_nzero, static_cast<uint32_t>(prefix_nzeros)) +
-      flat_penalty;
-  size_t best_n = 0;
-  for (size_t n = 1; n <= M; ++n) {
-    const size_t total_n = prefix_nzeros + n;
-    const size_t b_n =
-        TrellisNzBucket((n + covered_blocks - 1) >> log2_covered_blocks);
-    const size_t prev_start =
-        (prefix_nzeros > 0) ? 1 : ((total_n > size / 16) ? 0 : 1);
-    float ac_cost = 0.0f;
-    if (pre_gap == 0) {
-      ac_cost = (prev_start == 0) ? dp0[n] : dp1[n];
+
+  const float* JXL_RESTRICT final_dp = cost_buf[next_row];
+  float best_total_cost = kInf;
+  size_t best_remaining = suffix_nzeros + window_orig_nzeros;
+  for (size_t rem = next_min; rem <= next_max; ++rem) {
+    const size_t init_prev = (rem > size / 16) ? 0 : 1;
+    const float path_cost = final_dp[(rem - next_min) * 2 + init_prev];
+    if (path_cost >= kInf * 0.5f) continue;
+    float nzero_bits = tcm.ValBits(cl_nzero, static_cast<uint32_t>(rem));
+    if (rem == 0) {
+      nzero_bits += flat_penalty;
+    }
+    const float total_cost = path_cost + nzero_bits;
+    if (total_cost < best_total_cost) {
+      best_total_cost = total_cost;
+      best_remaining = rem;
+    }
+  }
+  if (best_total_cost >= kInf * 0.5f) {
+    return static_cast<int32_t>(suffix_nzeros + window_orig_nzeros);
+  }
+
+  size_t cur_rem = best_remaining;
+  size_t cur_prev = (best_remaining > size / 16) ? 0 : 1;
+  size_t orig_after = window_orig_nzeros;
+  for (size_t wi = 0; wi < window_len; ++wi) {
+    const size_t k = covered_blocks + wi;
+    const size_t pos = order[k];
+    const int32_t current = block_out[pos];
+    orig_after -= static_cast<size_t>(current != 0);
+
+    if (cur_rem == 0) {
+      block_out[pos] = 0;
+      cur_prev = 0;
+      continue;
+    }
+    const size_t row_min =
+        suffix_nzeros +
+        ((orig_after > kMaxNzeroDelta) ? (orig_after - kMaxNzeroDelta) : 0);
+    const size_t choice_idx =
+        wi * kBandStride + (cur_rem - row_min) * 2 + cur_prev;
+    const uint8_t ci = choices_buf[choice_idx];
+    if (ci == 0) {
+      block_out[pos] = 0;
+      cur_prev = 0;
     } else {
-      ac_cost = pre_gap_bits[b_n][prev_start] + dp0[n];
-    }
-    const float tot_cost =
-        tcm.ValBits(cl_nzero, static_cast<uint32_t>(total_n)) + ac_cost;
-    if (tot_cost < best_total_cost) {
-      best_total_cost = tot_cost;
-      best_n = n;
-    }
-  }
-
-  for (size_t i = 0; i < M; ++i) {
-    block_out[active[i].pos] = 0;
-  }
-  if (best_n > 0) {
-    size_t cur_n = best_n;
-    const size_t total_n = prefix_nzeros + best_n;
-    const size_t prev_start =
-        (prefix_nzeros > 0) ? 1 : ((total_n > size / 16) ? 0 : 1);
-    size_t cur_prev = (pre_gap == 0) ? prev_start : 0;
-    for (size_t i = 0; i < M && cur_n > 0; ++i) {
-      const uint64_t mask = (cur_prev == 0) ? chose_nz0[i] : chose_nz1[i];
-      const bool chose = ((mask >> (cur_n - 1)) & 1ULL) != 0;
-      if (chose) {
-        const size_t b_n =
-            TrellisNzBucket((cur_n + covered_blocks - 1) >> log2_covered_blocks);
-        const size_t kf = kCoeffFreqContext[active[i].k >> log2_covered_blocks];
-        const uint8_t cl = tcm.cluster_of_ctx[histo_offset +
-                                              (kNzBucketCtxOffset[b_n] + kf) * 2 +
-                                              cur_prev];
-        const float c_lo =
-            active[i].d_lo + tcm.ValBits(cl, PackSigned(active[i].q_lo));
-        const float c_hi =
-            (active[i].q_hi == active[i].q_lo)
-                ? c_lo
-                : (active[i].d_hi + tcm.ValBits(cl, PackSigned(active[i].q_hi)));
-        block_out[active[i].pos] =
-            (c_hi < c_lo) ? active[i].q_hi : active[i].q_lo;
-        cur_n -= 1;
-        cur_prev = (i + 1 < M && active[i + 1].k == active[i].k + 1) ? 1 : 0;
+      const float ideal = block_in[pos] * (qm[pos] * qac);
+      int32_t chosen = current;
+      if (current == 0) {
+        chosen = (ideal >= 0.0f) ? 1 : -1;
       } else {
-        cur_prev = 0;
+        const size_t y = pos / dim;
+        const size_t x = pos % dim;
+        const uint8_t s = kCoeffBand[y / ysize][x / xsize];
+        const bool allow_round_up = !(few_colors && s <= 1);
+        const float abs_ideal = std::abs(ideal);
+        int32_t candidates[kMaxCandidates];
+        const size_t cand_count = BuildRdoqCandidates(
+            current, ideal, abs_ideal, false, allow_round_up, candidates);
+        if (ci < cand_count) chosen = candidates[ci];
       }
+      block_out[pos] = chosen;
+      const size_t is_nz = static_cast<size_t>(chosen != 0);
+      cur_rem -= is_nz;
+      cur_prev = is_nz;
     }
   }
 
-  int32_t final_nzeros = static_cast<int32_t>(prefix_nzeros + best_n);
+  int32_t final_nzeros = static_cast<int32_t>(best_remaining);
   if (final_nzeros == 0) {
     final_nzeros = rescue_quad0();
   }
@@ -457,7 +591,10 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
                      const AcTokenCostModel* tcm = nullptr, size_t ord = 0,
                      size_t covered_blocks = 1, size_t log2_covered_blocks = 0,
                      int32_t predicted_nzeros = 32,
-                     int32_t* out_nzeros = nullptr) {
+                     int32_t* out_nzeros = nullptr,
+                     uint8_t* JXL_RESTRICT rdoq_choices = nullptr,
+                     bool few_colors = false) {
+  CoefficientLayout(&ysize, &xsize);
   const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
   const float qac = quantizer.Scale() * quant * qm_multiplier;
 
@@ -529,11 +666,12 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
     }
   }
 
-  if (tcm != nullptr && eob_scale > 0.0f && xsize >= ysize) {
+  if (tcm != nullptr && eob_scale > 0.0f && rdoq_choices != nullptr) {
     const int32_t nz = TrellisQuantizeBlockAC(
         quantizer, *tcm, c, qm_multiplier, quant_kind, xsize, ysize, ord,
         covered_blocks, log2_covered_blocks, predicted_nzeros, quad_thres,
-        zero_thres, eob_scale, block_in, quant, block_out);
+        zero_thres, eob_scale, few_colors, block_in, quant, block_out,
+        rdoq_choices);
     if (out_nzeros != nullptr) *out_nzeros = nz;
     return;
   }
@@ -752,7 +890,10 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
                                size_t ord = 0, size_t covered_blocks = 1,
                                size_t log2_covered_blocks = 0,
                                int32_t predicted_nzeros = 32,
-                               int32_t* out_nzeros = nullptr) {
+                               int32_t* out_nzeros = nullptr,
+                               uint8_t* JXL_RESTRICT rdoq_choices = nullptr,
+                               bool few_colors = false) {
+  CoefficientLayout(&ysize, &xsize);
   if (enc_state->cparams.speed_tier > SpeedTier::kHare) {
     zero_thres[1][0] = 0.56f;
     zero_thres[1][1] = 0.62f;
@@ -765,7 +906,8 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
   QuantizeBlockAC(quantizer, error_diffusion, 1, 1.0f, quant_kind, xsize, ysize,
                   zero_thres[1], eob_scale, inout + size, quant,
                   quantized + size, tcm, ord, covered_blocks,
-                  log2_covered_blocks, predicted_nzeros, out_nzeros);
+                  log2_covered_blocks, predicted_nzeros, out_nzeros,
+                  rdoq_choices, few_colors);
 
   const float* JXL_RESTRICT dequant_matrix =
       quantizer.DequantMatrix(quant_kind, 1);
@@ -821,7 +963,9 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
 
   // TODO(veluca): consider strategies to reduce this memory.
-  size_t mem_bytes = 3 * AcStrategy::kMaxCoeffArea * sizeof(int32_t);
+  const size_t quant_ints = 3 * AcStrategy::kMaxCoeffArea;
+  const size_t rdoq_choice_bytes = kMaxRdoqWindow * kBandStride;
+  size_t mem_bytes = quant_ints * sizeof(int32_t) + rdoq_choice_bytes;
   JXL_ASSIGN_OR_RETURN(auto mem,
                        AlignedMemory::Create(memory_manager, mem_bytes));
   size_t fmem_bytes =
@@ -846,6 +990,8 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
 
     HWY_ALIGN float* coeffs_in = fmem.address<float>();
     HWY_ALIGN int32_t* quantized = mem.address<int32_t>();
+    uint8_t* JXL_RESTRICT rdoq_choices =
+        reinterpret_cast<uint8_t*>(quantized + quant_ints);
     const AcTokenCostModel* JXL_RESTRICT tcm =
         has_band_qf ? enc_state->token_cost_model.get() : nullptr;
     Image3I group_nzeros;
@@ -950,6 +1096,14 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           float zero_thres[3][8];
           ComputeBlockThresholds(acs.Strategy(), xblocks, yblocks, q_block,
                                  band_q, d_target, dz_w, eob_scale, zero_thres);
+          const size_t frame_px0 = (block_group_rect.x0() + bx) * kBlockDim;
+          const size_t frame_py0 = (block_group_rect.y0() + by) * kBlockDim;
+          const bool few_colors =
+              (tcm != nullptr && eob_scale > 0.0f)
+                  ? BlockHasFewColors(enc_state->orig_opsin, opsin_rows,
+                                      opsin_stride, frame_px0, frame_py0,
+                                      bx * kBlockDim, cov_x, cov_y)
+                  : false;
 
           // DCT all channels, roundtrip-quantize Y and set DC.
           for (size_t c : {0, 1, 2}) {
@@ -975,7 +1129,8 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
               enc_state, size, enc_state->shared.quantizer, error_diffusion,
               acs.Strategy(), xblocks, yblocks, zero_thres, eob_scale,
               kDefaultQuantBias, quant_ac, coeffs_in, quantized, tcm, ord,
-              covered_blocks, log2_covered_blocks, pred_nz_y, &final_nz_y);
+              covered_blocks, log2_covered_blocks, pred_nz_y, &final_nz_y,
+              rdoq_choices, few_colors);
           if (tcm != nullptr) {
             const int32_t shifted_nz_y = static_cast<int32_t>(
                 (final_nz_y + covered_blocks - 1) >> log2_covered_blocks);
@@ -1012,7 +1167,8 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
                             acs.Strategy(), xblocks, yblocks, zero_thres[c],
                             eob_scale, coeffs_in + c * size, quant_ac,
                             quantized + c * size, tcm, ord, covered_blocks,
-                            log2_covered_blocks, pred_nz_c, &final_nz_c);
+                            log2_covered_blocks, pred_nz_c, &final_nz_c,
+                            rdoq_choices, few_colors);
             if (tcm != nullptr) {
               const int32_t shifted_nz_c = static_cast<int32_t>(
                   (final_nz_c + covered_blocks - 1) >> log2_covered_blocks);

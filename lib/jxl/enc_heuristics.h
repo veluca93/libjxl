@@ -50,6 +50,11 @@ Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
                                            PassesEncoderState* enc_state,
                                            BlockCtxMap* block_ctx_map);
 
+Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
+                                      const Image3F& opsin, const Rect& rect,
+                                      ThreadPool* pool,
+                                      PassesEncoderState* enc_state);
+
 Status DownsampleImage2_Iterative(Image3F* opsin);
 Status DownsampleImage2_Sharper(Image3F* opsin);
 
