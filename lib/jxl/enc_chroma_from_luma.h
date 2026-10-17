@@ -53,7 +53,8 @@ struct CfLHeuristics {
                      bool fast, size_t thread, ColorCorrelationMap* cmap,
                      bool shrink_towards_zero = false,
                      float x_qm_multiplier = 1.0f,
-                     float b_qm_multiplier = 1.0f);
+                     float b_qm_multiplier = 1.0f,
+                     float butteraugli_distance = 1.0f);
 
   JxlMemoryManager* memory_manager;
   AlignedMemory mem;

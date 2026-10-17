@@ -30,6 +30,7 @@
 #include <hwy/highway.h>
 
 #include "lib/jxl/base/common.h"
+#include "lib/jxl/base/fast_math-inl.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
 #include "lib/jxl/cms/opsin_params.h"
@@ -45,10 +46,20 @@ namespace HWY_NAMESPACE {
 
 // These templates are not found via ADL.
 using hwy::HWY_NAMESPACE::Abs;
+using hwy::HWY_NAMESPACE::CopySignToAbs;
+using hwy::HWY_NAMESPACE::Div;
+using hwy::HWY_NAMESPACE::Floor;
 using hwy::HWY_NAMESPACE::Ge;
 using hwy::HWY_NAMESPACE::GetLane;
 using hwy::HWY_NAMESPACE::IfThenElse;
+using hwy::HWY_NAMESPACE::IfThenElseZero;
 using hwy::HWY_NAMESPACE::Lt;
+using hwy::HWY_NAMESPACE::Max;
+using hwy::HWY_NAMESPACE::Min;
+using hwy::HWY_NAMESPACE::Mul;
+using hwy::HWY_NAMESPACE::MulAdd;
+using hwy::HWY_NAMESPACE::NegMulAdd;
+using hwy::HWY_NAMESPACE::Sub;
 
 static HWY_FULL(float) df;
 
@@ -200,14 +211,152 @@ int32_t FindBestMultiplier(const float* values_m, const float* values_s,
   return jxl::Clamp1(std::round(x), -128.0f, 127.0f);
 }
 
+constexpr float kCflRdLambda = 0.08086717f * 0.25f * 1.375f;  // 0.02779809f
+constexpr float kCflBaseWeightX = 0.30f;
+constexpr float kCflBaseWeightB = 0.28f;
+constexpr float kCflNonZeroBits = 4.0f;
+constexpr float kCflMagnitudeBits = 1.5f;
+constexpr float kRecYBlendDct8 = 0.65f;
+constexpr float kRecYBlendFinal = 1.0f;
+
+static inline float ChromaRdoWeight(float distance) {
+  return 2.0f - jxl::Clamp1((distance - 2.25f) * (1.0f / 1.75f), 0.0f, 1.0f);
+}
+
+static inline float CmapResidualBits(int32_t res) {
+  const int32_t abs_res = std::abs(res);
+  if (abs_res == 0) return 0.8f;
+  if (abs_res == 1) return 2.0f;
+  return 2.5f + std::log2(static_cast<float>(abs_res));
+}
+
+static inline int32_t ComputeTilePred(const ImageSB* map, int tx, int ty) {
+  const int lx = tx & 3;
+  const int ly = ty & 3;
+  if (lx == 0 && ly == 0) return 0;
+  const int8_t* row_cur = map->ConstRow(ty);
+  const int8_t* row_top = (ly > 0) ? map->ConstRow(ty - 1) : nullptr;
+  if (lx == 0) return row_top[tx];
+  if (ly == 0) return row_cur[tx - 1];
+  const int32_t left = row_cur[tx - 1];
+  const int32_t top = row_top[tx];
+  const int32_t topleft = row_top[tx - 1];
+  const int32_t m = std::min(top, left);
+  const int32_t M = std::max(top, left);
+  return std::min(M, std::max(m, top + left - topleft));
+}
+
+float ComputeCflRdCost(const float* JXL_RESTRICT values_m,
+                       const float* JXL_RESTRICT values_s, size_t num,
+                       float factor, float weight, float lambda,
+                       float bias_one) {
+  JXL_DASSERT(num % Lanes(df) == 0);
+  const auto factor_v = Set(df, factor);
+  const auto weight_v = Set(df, weight);
+  const auto lambda_v = Set(df, lambda);
+  const auto bias_one_v = Set(df, bias_one);
+  const auto bias_num_v = Set(df, kDefaultQuantBias[3]);
+  const auto nz_bits_v = Set(df, kCflNonZeroBits);
+  const auto mag_bits_v = Set(df, kCflMagnitudeBits);
+  const auto half_v = Set(df, 0.5f);
+  const auto one_v = Set(df, 1.0f);
+  const auto one_p5_v = Set(df, 1.5f);
+  auto total_cost_v = Zero(df);
+
+  for (size_t i = 0; i < num; i += Lanes(df)) {
+    const auto m = Load(df, values_m + i);
+    const auto s = Load(df, values_s + i);
+    const auto res = NegMulAdd(factor_v, m, s);
+    const auto abs_res = Abs(res);
+    const auto zero_cost = Mul(weight_v, Mul(abs_res, abs_res));
+
+    const auto abs_level = Floor(Add(abs_res, half_v));
+    const auto abs_level_safe = Max(abs_level, one_v);
+    const auto is_one = Lt(abs_level, one_p5_v);
+    const auto abs_deq =
+        IfThenElse(is_one, bias_one_v,
+                   Sub(abs_level_safe, Div(bias_num_v, abs_level_safe)));
+    const auto coded_err = Sub(abs_res, abs_deq);
+    const auto bits =
+        MulAdd(mag_bits_v, FastLog2f(df, abs_level_safe), nz_bits_v);
+    const auto coded_cost =
+        MulAdd(weight_v, Mul(coded_err, coded_err), Mul(lambda_v, bits));
+    const auto best_cost =
+        IfThenElse(Ge(abs_level, one_v), Min(zero_cost, coded_cost), zero_cost);
+    total_cost_v = Add(total_cost_v, best_cost);
+  }
+  return GetLane(SumOfLanes(df, total_cost_v));
+}
+
+int8_t FindBestMultiplierDiscrete(const float* JXL_RESTRICT values_m,
+                                  const float* JXL_RESTRICT values_s,
+                                  size_t num, int32_t pred_cand, bool use_pred,
+                                  float weight, float lambda, float bias_one) {
+  if (num == 0) return 0;
+  auto sum_ms_v = Zero(df);
+  auto sum_mm_v = Zero(df);
+  for (size_t i = 0; i < num; i += Lanes(df)) {
+    const auto m = Load(df, values_m + i);
+    const auto s = Load(df, values_s + i);
+    sum_ms_v = MulAdd(m, s, sum_ms_v);
+    sum_mm_v = MulAdd(m, m, sum_mm_v);
+  }
+  const float dot_ms = GetLane(SumOfLanes(df, sum_ms_v));
+  const float dot_mm = GetLane(SumOfLanes(df, sum_mm_v));
+  const float target_factor = (dot_mm > 1e-6f) ? (dot_ms / dot_mm) : 0.0f;
+  const int32_t target_cand = static_cast<int32_t>(jxl::Clamp1(
+      std::round(target_factor * kDefaultColorFactor), -128.0f, 127.0f));
+
+  int32_t candidates[19];
+  size_t num_candidates = 0;
+  auto push_cand = [&](int32_t c) {
+    const int32_t clamped = jxl::Clamp1(c, -128, 127);
+    for (size_t i = 0; i < num_candidates; ++i) {
+      if (candidates[i] == clamped) return;
+    }
+    candidates[num_candidates++] = clamped;
+  };
+
+  push_cand(0);
+  if (use_pred) push_cand(pred_cand);
+  push_cand(target_cand);
+  for (int32_t d = 1; d <= 4; ++d) {
+    push_cand(target_cand - d);
+    push_cand(target_cand + d);
+    if (use_pred) {
+      push_cand(pred_cand - d);
+      push_cand(pred_cand + d);
+    }
+  }
+
+  constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
+  int32_t best_cand = use_pred ? pred_cand : 0;
+  float best_cost = std::numeric_limits<float>::infinity();
+  for (size_t i = 0; i < num_candidates; ++i) {
+    const int32_t cand = candidates[i];
+    const float rd_cost = ComputeCflRdCost(
+        values_m, values_s, num, static_cast<float>(cand) * kInvColorFactor,
+        weight, lambda, bias_one);
+    const float map_bits =
+        use_pred ? CmapResidualBits(cand - pred_cand)
+                 : 0.5f * CmapResidualBits(cand);
+    const float total_cost = rd_cost + lambda * map_bits;
+    if (total_cost < best_cost) {
+      best_cost = total_cost;
+      best_cand = cand;
+    }
+  }
+  return static_cast<int8_t>(best_cand);
+}
+
 Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
                    const DequantMatrices& dequant,
                    const AcStrategyImage* ac_strategy,
                    const ImageI* raw_quant_field, const Quantizer* quantizer,
                    const Rect& rect, bool fast, bool use_dct8,
                    bool shrink_towards_zero, float x_qm_multiplier,
-                   float b_qm_multiplier, ImageSB* map_x, ImageSB* map_b,
-                   Span<float> mem) {
+                   float b_qm_multiplier, float butteraugli_distance,
+                   ImageSB* map_x, ImageSB* map_b, Span<float> mem) {
   static_assert(kEncTileDimInBlocks == kColorTileDimInBlocks,
                 "Invalid color tile dim");
   constexpr float kDistanceMultiplierAC = 1e-9f;
@@ -238,6 +387,10 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
   JXL_ENSURE(mem.remove_prefix(4 * kMaxTileCoeffs));
   float* HWY_RESTRICT scratch_space = mem.begin();
   JXL_ENSURE(mem.size() == 2 * AcStrategy::kMaxCoeffArea + dct_scratch_size);
+
+  const bool use_discrete_rdo =
+      (!fast && !shrink_towards_zero && quantizer != nullptr &&
+       raw_quant_field != nullptr);
 
   size_t num_ac = 0;
 
@@ -281,33 +434,99 @@ Status ComputeTile(const Image3F& opsin, const Rect& opsin_rect,
           block_b[cx * kBlockDim * iy + ix] = 0;
         }
       }
-      // Unclear why this is like it is. (This works slightly better
-      // than the previous approach which was also a hack.)
       const float qq =
           (raw_quant_field == nullptr) ? 1.0f : raw_quant_field->ConstRow(y)[x];
-      // Experimentally values 128-130 seem best -- I don't know why we
-      // need this multiplier.
-      const float kStrangeMultiplier = 128;
-      float q = (quantizer == nullptr)
-                    ? 1.0f
-                    : quantizer->Scale() * kStrangeMultiplier * qq;
-      const auto qv_x = Set(df, q * x_qm_multiplier);
-      const auto qv_b = Set(df, q * b_qm_multiplier);
-      for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
-        const auto b_y = Load(df, block_y + i);
-        const auto b_x = Load(df, block_x + i);
-        const auto b_b = Load(df, block_b + i);
-        const auto qqm_x = Mul(qv_x, Load(df, qm_x + i));
-        const auto qqm_b = Mul(qv_b, Load(df, qm_b + i));
-        Store(Mul(b_y, qqm_x), df, coeffs_yx + num_ac);
-        Store(Mul(b_x, qqm_x), df, coeffs_x + num_ac);
-        Store(Mul(b_y, qqm_b), df, coeffs_yb + num_ac);
-        Store(Mul(b_b, qqm_b), df, coeffs_b + num_ac);
-        num_ac += Lanes(df);
+      if (use_discrete_rdo) {
+        const float* const JXL_RESTRICT qm_y =
+            dequant.InvMatrix(acs.Strategy(), 1);
+        const float* const JXL_RESTRICT dm_y =
+            dequant.Matrix(acs.Strategy(), 1);
+        float* HWY_RESTRICT t0_buf = scratch_space;
+        const size_t row_stride = cx * kBlockDim;
+        for (size_t iy = 0; iy < cy * kBlockDim; ++iy) {
+          const bool low_v = (iy < cy * 4);
+          float* HWY_RESTRICT row = t0_buf + iy * row_stride;
+          for (size_t ix = 0; ix < row_stride; ++ix) {
+            row[ix] = (low_v && ix < cx * 4) ? 0.58f : 0.64f;
+          }
+        }
+        const float q_y = quantizer->Scale() * qq;
+        const float inv_q_y = 1.0f / q_y;
+        const auto qv_x = Set(df, q_y * x_qm_multiplier);
+        const auto qv_b = Set(df, q_y * b_qm_multiplier);
+        const float rec_blend = use_dct8 ? kRecYBlendDct8 : kRecYBlendFinal;
+        for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
+          const auto b_y_raw = Load(df, block_y + i);
+          const auto b_x_raw = Load(df, block_x + i);
+          const auto b_b_raw = Load(df, block_b + i);
+          const auto b_b_opp =
+              NegMulAdd(Set(df, jxl::cms::kYToBRatio), b_y_raw, b_b_raw);
+
+          const auto qm_y_v = Load(df, qm_y + i);
+          const auto dm_y_v = Load(df, dm_y + i);
+          const auto val_y = Mul(b_y_raw, Mul(qm_y_v, Set(df, q_y)));
+          const auto abs_val_y = Abs(val_y);
+          const auto t0_y_v = Load(df, t0_buf + i);
+          const auto abs_q_y = IfThenElseZero(
+              Ge(abs_val_y, t0_y_v), Floor(Add(abs_val_y, Set(df, 0.5f))));
+          const auto abs_q_y_safe = Max(abs_q_y, Set(df, 1.0f));
+          const auto abs_adj_y = IfThenElse(
+              Lt(abs_q_y, Set(df, 1.5f)),
+              IfThenElseZero(Ge(abs_q_y, Set(df, 1.0f)),
+                             Set(df, kDefaultQuantBias[1])),
+              Sub(abs_q_y_safe,
+                  Div(Set(df, kDefaultQuantBias[3]), abs_q_y_safe)));
+          const auto adj_y = CopySignToAbs(abs_adj_y, val_y);
+          const auto deq_y = Mul(adj_y, Mul(dm_y_v, Set(df, inv_q_y)));
+          const auto b_y_rec = MulAdd(Set(df, rec_blend), deq_y,
+                                      Mul(Set(df, 1.0f - rec_blend), b_y_raw));
+
+          const auto qqm_x = Mul(qv_x, Load(df, qm_x + i));
+          const auto qqm_b = Mul(qv_b, Load(df, qm_b + i));
+          Store(Mul(b_y_rec, qqm_x), df, coeffs_yx + num_ac);
+          Store(Mul(b_x_raw, qqm_x), df, coeffs_x + num_ac);
+          Store(Mul(b_y_rec, qqm_b), df, coeffs_yb + num_ac);
+          Store(Mul(b_b_opp, qqm_b), df, coeffs_b + num_ac);
+          num_ac += Lanes(df);
+        }
+      } else {
+        // Experimentally values 128-130 seem best -- I don't know why we
+        // need this multiplier.
+        const float kStrangeMultiplier = 128;
+        float q = (quantizer == nullptr)
+                      ? 1.0f
+                      : quantizer->Scale() * kStrangeMultiplier * qq;
+        const auto qv_x = Set(df, q * x_qm_multiplier);
+        const auto qv_b = Set(df, q * b_qm_multiplier);
+        for (size_t i = 0; i < cx * cy * 64; i += Lanes(df)) {
+          const auto b_y = Load(df, block_y + i);
+          const auto b_x = Load(df, block_x + i);
+          const auto b_b = Load(df, block_b + i);
+          const auto qqm_x = Mul(qv_x, Load(df, qm_x + i));
+          const auto qqm_b = Mul(qv_b, Load(df, qm_b + i));
+          Store(Mul(b_y, qqm_x), df, coeffs_yx + num_ac);
+          Store(Mul(b_x, qqm_x), df, coeffs_x + num_ac);
+          Store(Mul(b_y, qqm_b), df, coeffs_yb + num_ac);
+          Store(Mul(b_b, qqm_b), df, coeffs_b + num_ac);
+          num_ac += Lanes(df);
+        }
       }
     }
   }
   JXL_ENSURE(num_ac % Lanes(df) == 0);
+  if (use_discrete_rdo) {
+    const bool use_pred = !use_dct8;
+    const int32_t pred_x = use_pred ? ComputeTilePred(map_x, tx, ty) : 0;
+    const int32_t pred_b = use_pred ? ComputeTilePred(map_b, tx, ty) : 0;
+    const float chroma_w = ChromaRdoWeight(butteraugli_distance);
+    row_out_x[tx] = FindBestMultiplierDiscrete(
+        coeffs_yx, coeffs_x, num_ac, pred_x, use_pred,
+        kCflBaseWeightX * chroma_w, kCflRdLambda, kDefaultQuantBias[0]);
+    row_out_b[tx] = FindBestMultiplierDiscrete(
+        coeffs_yb, coeffs_b, num_ac, pred_b, use_pred,
+        kCflBaseWeightB * chroma_w, kCflRdLambda, kDefaultQuantBias[2]);
+    return true;
+  }
   const bool use_reg = (!fast && !shrink_towards_zero);
   const bool use_pred = (use_reg && !use_dct8);
   auto compute_pred = [&](const ImageSB* map, float* out_pred_lambda) -> float {
@@ -359,23 +578,19 @@ namespace jxl {
 
 HWY_EXPORT(ComputeTile);
 
-Status CfLHeuristics::ComputeTile(const Rect& r, const Image3F& opsin,
-                                  const Rect& opsin_rect,
-                                  const DequantMatrices& dequant,
-                                  const AcStrategyImage* ac_strategy,
-                                  const ImageI* raw_quant_field,
-                                  const Quantizer* quantizer, bool fast,
-                                  size_t thread, ColorCorrelationMap* cmap,
-                                  bool shrink_towards_zero,
-                                  float x_qm_multiplier,
-                                  float b_qm_multiplier) {
+Status CfLHeuristics::ComputeTile(
+    const Rect& r, const Image3F& opsin, const Rect& opsin_rect,
+    const DequantMatrices& dequant, const AcStrategyImage* ac_strategy,
+    const ImageI* raw_quant_field, const Quantizer* quantizer, bool fast,
+    size_t thread, ColorCorrelationMap* cmap, bool shrink_towards_zero,
+    float x_qm_multiplier, float b_qm_multiplier, float butteraugli_distance) {
   bool use_dct8 = ac_strategy == nullptr;
   Span<float> scratch(mem.address<float>() + thread * ItemsPerThread(),
                       ItemsPerThread());
   return HWY_DYNAMIC_DISPATCH(ComputeTile)(
       opsin, opsin_rect, dequant, ac_strategy, raw_quant_field, quantizer, r,
       fast, use_dct8, shrink_towards_zero, x_qm_multiplier, b_qm_multiplier,
-      &cmap->ytox_map, &cmap->ytob_map, scratch);
+      butteraugli_distance, &cmap->ytox_map, &cmap->ytob_map, scratch);
 }
 
 Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,

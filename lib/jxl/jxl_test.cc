@@ -471,7 +471,7 @@ TEST(JxlTest, RoundtripDotsForceEpf) {
   PackedPixelFile ppf_out;
   EXPECT_NEAR(Roundtrip(t.ppf(), cparams, dparams, pool.get(), &ppf_out), 44982,
               700);
-  EXPECT_SLIGHTLY_BELOW(ComputeDistance2(t.ppf(), ppf_out), 15);
+  EXPECT_SLIGHTLY_BELOW(ComputeDistance2(t.ppf(), ppf_out), 14.8);
 }
 
 // Checks for differing size/distance in two consecutive runs of distance 2,
