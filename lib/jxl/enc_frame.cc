@@ -1056,7 +1056,7 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
   return true;
 }
 
-Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
+Status ComputeVarDCTEncodingData(FrameHeader& frame_header,
                                  const Image3F* linear,
                                  Image3F* JXL_RESTRICT opsin, const Rect& rect,
                                  const JxlCmsInterface& cms, ThreadPool* pool,
@@ -1601,8 +1601,8 @@ Status ComputeEncodingData(
           *jpeg_data, frame_header, pool, &enc_modular, &enc_state));
     } else {
       JXL_RETURN_IF_ERROR(ComputeVarDCTEncodingData(
-          frame_header, linear, &color, group_rect, cms, pool, &enc_modular,
-          &enc_state, aux_out));
+          mutable_frame_header, linear, &color, group_rect, cms, pool,
+          &enc_modular, &enc_state, aux_out));
     }
     JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(enc_state, frame_dim));
     if (!enc_state.streaming_mode && !jpeg_data &&

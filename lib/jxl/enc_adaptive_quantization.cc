@@ -764,9 +764,10 @@ StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,
   JXL_ASSIGN_OR_RETURN(auto modular_frame_encoder,
                        ModularFrameEncoder::Create(memory_manager, frame_header,
                                                    enc_state->cparams, false));
-  JXL_RETURN_IF_ERROR(
-      InitializePassesEncoder(frame_header, opsin, Rect(opsin), cms, pool,
-                              enc_state, modular_frame_encoder.get(), nullptr));
+  FrameHeader mutable_frame_header = frame_header;
+  JXL_RETURN_IF_ERROR(InitializePassesEncoder(
+      mutable_frame_header, opsin, Rect(opsin), cms, pool, enc_state,
+      modular_frame_encoder.get(), nullptr));
   JXL_RETURN_IF_ERROR(dec_state->Init(frame_header));
   JXL_RETURN_IF_ERROR(dec_state->InitForAC(num_passes, pool));
 

@@ -1783,6 +1783,9 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
       float y_factor = enc_state->shared.quantizer.GetDcStep(1) / mul;
       float cfl_factor = color_correlation.DCFactors()[c];
       const float yk = y_factor * cfl_factor;
+      const float b_y_comp =
+          (c == 2 && enable_rdo && !jpeg_transcode) ? 0.75f : 0.0f;
+      const float yk_eff = yk - b_y_comp * y_factor;
       float q_ref = 1.0f;
       if (enable_rdo) {
         double sum_log_q = 0.0;
@@ -1850,6 +1853,11 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
             }
           }
         } else {
+          const float* row_y = r.ConstPlaneRow(dc, 1, y);
+          const float* row_y_prev =
+              (y > 0) ? r.ConstPlaneRow(dc, 1, y - 1) : nullptr;
+          const float* row_y_next =
+              (y + 1 < r.ysize()) ? r.ConstPlaneRow(dc, 1, y + 1) : nullptr;
           const int32_t* quant_row_y =
               stream_images_[stream_id].channel[0].plane.Row(y);
           const int32_t* quant_row_y_prev =
@@ -1863,29 +1871,37 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
           for (size_t x = 0; x < r.xsize(); x++) {
             const float w_aq = enable_rdo ? calc_w_aq(q_row[x]) : 1.0f;
             const float target_w =
-                (x > 0)
-                    ? ((row[x - 1] - quant_row_y[x - 1] * yk) * inv_factor)
-                    : 0.0f;
+                (x > 0) ? ((row[x - 1] - b_y_comp * row_y[x - 1] -
+                            quant_row_y[x - 1] * yk_eff) *
+                           inv_factor)
+                        : 0.0f;
             const float target_n =
-                (y > 0)
-                    ? ((row_prev[x] - quant_row_y_prev[x] * yk) * inv_factor)
-                    : 0.0f;
+                (y > 0) ? ((row_prev[x] - b_y_comp * row_y_prev[x] -
+                            quant_row_y_prev[x] * yk_eff) *
+                           inv_factor)
+                        : 0.0f;
             const bool has_e = enable_rdo && (x + 1 < r.xsize());
             const float target_e =
-                has_e ? ((row[x + 1] - quant_row_y[x + 1] * yk) * inv_factor)
+                has_e ? ((row[x + 1] - b_y_comp * row_y[x + 1] -
+                          quant_row_y[x + 1] * yk_eff) *
+                         inv_factor)
                       : 0.0f;
             const float w_aq_e = has_e ? calc_w_aq(q_row[x + 1]) : 1.0f;
             const bool has_s = enable_rdo && (y + 1 < r.ysize());
             const float target_s =
-                has_s ? ((row_next[x] - quant_row_y_next[x] * yk) * inv_factor)
+                has_s ? ((row_next[x] - b_y_comp * row_y_next[x] -
+                          quant_row_y_next[x] * yk_eff) *
+                         inv_factor)
                       : 0.0f;
             const float target_sw =
                 (has_s && x > 0)
-                    ? ((row_next[x - 1] - quant_row_y_next[x - 1] * yk) *
+                    ? ((row_next[x - 1] - b_y_comp * row_y_next[x - 1] -
+                        quant_row_y_next[x - 1] * yk_eff) *
                        inv_factor)
                     : 0.0f;
             const float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
-            const float val_c = row[x] - quant_row_y[x] * yk;
+            const float val_c =
+                row[x] - b_y_comp * row_y[x] - quant_row_y[x] * yk_eff;
             if (use_gradient) {
               quant_row[x] = QuantizeGradient(
                   quant_row, stride, c, x, y, r.xsize(), val_c, inv_factor,
