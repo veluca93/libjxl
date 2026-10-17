@@ -1750,6 +1750,13 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
   float grad_a2[3] = {0.0f};
   float grad_b2[3] = {0.0f};
   float sum_mask2 = 0.0f;
+  const bool full_8x8 = (xsize == 8 && ysize == 8);
+  float cell_a[3][4] = {};
+  float cell_b[3][4] = {};
+  float cell_a2[3][4] = {};
+  float cell_b2[3][4] = {};
+  float cell_e2[3][4] = {};
+  static constexpr float kSsimScale[3] = {14.0f, 1.0f, 1.0f};
   for (size_t y = 0; y < ysize; ++y) {
     const float* row_a[3] = {
         rect.ConstPlaneRow(a, 0, y),
@@ -1792,6 +1799,25 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
       float mask = row_mask[x];
       float mask2 = mask * mask;
       sum_mask2 += mask2;
+      if (full_8x8) {
+        const size_t q = ((y >> 2) << 1) + (x >> 2);
+        const float oa0 = kSsimScale[0] * row_a[0][x];
+        const float ob0 = kSsimScale[0] * row_b[0][x];
+        const float oa1 = row_a[1][x];
+        const float ob1 = row_b[1][x];
+        const float oa2 = row_a[2][x] - oa1;
+        const float ob2 = row_b[2][x] - ob1;
+        const float oa[3] = {oa0, oa1, oa2};
+        const float ob[3] = {ob0, ob1, ob2};
+        for (int c = 0; c < 3; ++c) {
+          const float oe = oa[c] - ob[c];
+          cell_a[c][q] += oa[c];
+          cell_b[c][q] += ob[c];
+          cell_a2[c][q] += oa[c] * oa[c];
+          cell_b2[c][q] += ob[c] * ob[c];
+          cell_e2[c][q] += oe * oe;
+        }
+      }
       for (int i = 0; i < 3; ++i) {
         float diff = row_a[i][x] - row_b[i][x];
         float diff2 = diff * diff;
@@ -1856,6 +1882,55 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
                                 kW[2] * grad_b2[2]);
   }
   float retval = kW[0] * err2[0] + kW[1] * err2[1] + kW[2] * err2[2];
+  if (full_8x8) {
+    static constexpr float kW_ssim[3] = {0.06f, 1.00f, 0.45f};
+    float ssim_err = 0.0f;
+    for (int c = 0; c < 3; ++c) {
+      float mu_a[4];
+      float mu_b[4];
+      float c_err = 0.0f;
+      for (size_t q = 0; q < 4; ++q) {
+        mu_a[q] = 0.0625f * cell_a[c][q];
+        mu_b[q] = 0.0625f * cell_b[c][q];
+        const float mu_e = mu_a[q] - mu_b[q];
+        const float sig_a2 =
+            std::max(0.0f, 0.0625f * cell_a2[c][q] - mu_a[q] * mu_a[q]);
+        const float sig_b2 =
+            std::max(0.0f, 0.0625f * cell_b2[c][q] - mu_b[q] * mu_b[q]);
+        const float sig_e2 =
+            std::max(0.0f, 0.0625f * cell_e2[c][q] - mu_e * mu_e);
+        const float denom = sig_a2 + sig_b2 + 0.0009f;
+        const float two_cov_c2 = std::max(0.0f, denom - sig_e2);
+        const float d_ssim = (sig_e2 + mu_e * mu_e * two_cov_c2) / denom;
+        const float sd_a = std::sqrt(sig_a2);
+        const float sd_b = std::sqrt(sig_b2);
+        const float edge_d = (sd_b - sd_a) / (1.0f + sd_a);
+        const float edge_pen =
+            (edge_d < 0.0f) ? (1.20f * edge_d * edge_d) : (0.45f * edge_d * edge_d);
+        c_err += 16.0f * (900.0f * d_ssim + 750.0f * edge_pen);
+      }
+      const float mu_a8 = 0.25f * (mu_a[0] + mu_a[1] + mu_a[2] + mu_a[3]);
+      const float mu_b8 = 0.25f * (mu_b[0] + mu_b[1] + mu_b[2] + mu_b[3]);
+      const float mu_e8 = mu_a8 - mu_b8;
+      float s_a2 = 0.0f;
+      float s_b2 = 0.0f;
+      float s_e2 = 0.0f;
+      for (size_t q = 0; q < 4; ++q) {
+        const float da = mu_a[q] - mu_a8;
+        const float db = mu_b[q] - mu_b8;
+        const float de = da - db;
+        s_a2 += da * da;
+        s_b2 += db * db;
+        s_e2 += de * de;
+      }
+      const float denom8 = 0.25f * (s_a2 + s_b2) + 0.0009f;
+      const float two_cov8 = std::max(0.0f, denom8 - 0.25f * s_e2);
+      const float d_ssim8 = (0.25f * s_e2 + mu_e8 * mu_e8 * two_cov8) / denom8;
+      c_err = 0.45f * c_err + 0.55f * (64.0f * 900.0f * d_ssim8);
+      ssim_err += kW_ssim[c] * c_err;
+    }
+    retval = 0.45f * retval + 0.55f * ssim_err;
+  }
   return retval;
 }
 

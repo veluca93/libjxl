@@ -548,6 +548,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     out_rate = 0.0f;
     float loss = 0.0f;
     float loss2 = 0.0f;
+    float loss_ssim2 = 0.0f;
     float loss_ssim4 = 0.0f;
     const float q_norm =
         rdo_mode ? q_llf_fixed : std::max(q_cand, 1e-4f);
@@ -791,12 +792,17 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
         }
       }
       float ssim4_c = 0.0f;
+      float ssim2_c = 0.0f;
       if (config.band_qf_stride > 0 && !rdo_mode) {
         const HWY_CAPPED(float, 4) df4;
+        const auto zero4 = Zero(df4);
+        static constexpr float kSsimChScale[3] = {14.0f, 1.0f, 1.0f};
+        const float ch_scale = kSsimChScale[c];
+        const auto ch_scale_v = Set(df4, ch_scale);
+        const auto ch_q_norm_v = Set(df4, q_norm * ch_scale);
+        const float c2_s = 0.0009f * q_norm * q_norm;
+        const float inv_q_norm2 = 1.0f / (q_norm * q_norm + 1e-12f);
         const auto q_norm_v = Set(df4, q_norm);
-        const auto masku_off4 = Set(df4, masku_lut[c]);
-        static constexpr float kSigmaFloor[3] = {0.0003f, 0.004f, 0.004f};
-        const float sigma_floor = q_norm * kSigmaFloor[c];
         const size_t buf_stride = cov_x * kBlockDim;
         for (size_t iy = 0; iy < cov_y; ++iy) {
           for (size_t ix = 0; ix < cov_x; ++ix) {
@@ -805,7 +811,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
             float cell_mu_r[4];
             float cell_sum_o2[4];
             float cell_sum_r2[4];
-            float sum_m8 = 0.0f;
+            float cell_sum_e2[4];
             for (size_t qy = 0; qy < 2; ++qy) {
               for (size_t qx = 0; qx < 2; ++qx) {
                 const size_t q_idx = qy * 2 + qx;
@@ -817,43 +823,36 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                   if (c == 2) {
                     return Mul(Sub(Load(df4, &config.Pixel(2, px0, py0 + r)),
                                    Load(df4, &config.Pixel(1, px0, py0 + r))),
-                               q_norm_v);
+                               ch_q_norm_v);
                   }
                   return Mul(Load(df4, &config.Pixel(c, px0, py0 + r)),
-                             q_norm_v);
+                             ch_q_norm_v);
                 };
                 const auto o0 = load_o(0);
                 const auto o1 = load_o(1);
                 const auto o2 = load_o(2);
                 const auto o3 = load_o(3);
-                const auto e0 = Load(df4, pixels_buf + p_off);
-                const auto e1 = Load(df4, pixels_buf + p_off + buf_stride);
-                const auto e2 = Load(df4, pixels_buf + p_off + 2 * buf_stride);
-                const auto e3 = Load(df4, pixels_buf + p_off + 3 * buf_stride);
+                const auto e0 =
+                    Mul(Load(df4, pixels_buf + p_off), ch_scale_v);
+                const auto e1 = Mul(
+                    Load(df4, pixels_buf + p_off + buf_stride), ch_scale_v);
+                const auto e2 = Mul(
+                    Load(df4, pixels_buf + p_off + 2 * buf_stride), ch_scale_v);
+                const auto e3 = Mul(
+                    Load(df4, pixels_buf + p_off + 3 * buf_stride), ch_scale_v);
                 const auto r0 = Sub(o0, e0);
                 const auto r1 = Sub(o1, e1);
                 const auto r2 = Sub(o2, e2);
                 const auto r3 = Sub(o3, e3);
-                const auto m0 =
-                    Add(Load(df4, config.MaskingPtr1x1(px0, py0)), masku_off4);
-                const auto m1 = Add(
-                    Load(df4, config.MaskingPtr1x1(px0, py0 + 1)), masku_off4);
-                const auto m2 = Add(
-                    Load(df4, config.MaskingPtr1x1(px0, py0 + 2)), masku_off4);
-                const auto m3 = Add(
-                    Load(df4, config.MaskingPtr1x1(px0, py0 + 3)), masku_off4);
                 const float mu_o = 0.0625f * GetLane(SumOfLanes(
                                                  df4, Add(Add(o0, o1),
                                                           Add(o2, o3))));
                 const float mu_r = 0.0625f * GetLane(SumOfLanes(
                                                  df4, Add(Add(r0, r1),
                                                           Add(r2, r3))));
-                const float bar_m = 0.0625f * GetLane(SumOfLanes(
-                                                  df4, Add(Add(m0, m1),
-                                                           Add(m2, m3))));
+                const float mu_e = mu_o - mu_r;
                 cell_mu_o[q_idx] = mu_o;
                 cell_mu_r[q_idx] = mu_r;
-                sum_m8 += bar_m;
 
                 const auto mu_o_v = Set(df4, mu_o);
                 const auto do0 = Sub(o0, mu_o_v);
@@ -873,45 +872,91 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                     df4, MulAdd(dr0, dr0,
                                 MulAdd(dr1, dr1,
                                        MulAdd(dr2, dr2, Mul(dr3, dr3))))));
+                const auto mu_e_v = Set(df4, mu_e);
+                const auto de0 = Sub(e0, mu_e_v);
+                const auto de1 = Sub(e1, mu_e_v);
+                const auto de2 = Sub(e2, mu_e_v);
+                const auto de3 = Sub(e3, mu_e_v);
+                const float sum_e2 = GetLane(SumOfLanes(
+                    df4, MulAdd(de0, de0,
+                                MulAdd(de1, de1,
+                                       MulAdd(de2, de2, Mul(de3, de3))))));
                 cell_sum_o2[q_idx] = sum_o2;
                 cell_sum_r2[q_idx] = sum_r2;
+                cell_sum_e2[q_idx] = sum_e2;
 
-                const float sigma_o = std::sqrt(0.0625f * sum_o2);
-                const float sigma_r = std::sqrt(0.0625f * sum_r2);
-                const float inv_denom =
-                    1.0f / (sigma_o + sigma_floor + 1e-8f);
-                const float g_tex = sigma_o * inv_denom;
-                const float g_smooth = sigma_floor * inv_denom;
-                const float u_blur =
-                    bar_m * g_tex * std::max(0.0f, sigma_o - sigma_r);
-                const float u_ring =
-                    bar_m * g_smooth * std::max(0.0f, sigma_r - sigma_o);
-                const float u_cell = u_blur + 1.15f * u_ring;
-                const float u_cell2 = u_cell * u_cell;
-                ssim4_c += 16.0f * u_cell2 * u_cell2;
+                // 4x4 SSIMMap (1 - SSIM') from ssimulacra2.cc (scale 1:1/1:2):
+                const float sig_o2 = 0.0625f * sum_o2;
+                const float sig_r2 = 0.0625f * sum_r2;
+                const float sig_e2 = 0.0625f * sum_e2;
+                const float denom_4 = sig_o2 + sig_r2 + c2_s;
+                const float denom_4_l1 = sig_o2 + sig_r2 + 2.2f * c2_s;
+                const float two_cov_c2 = std::max(0.0f, denom_4 - sig_e2);
+                const float mu_e_n2 = mu_e * mu_e * inv_q_norm2;
+                const float d_ssim4_val =
+                    (sig_e2 + mu_e_n2 * two_cov_c2) / denom_4;
+                const float d_ssim4_l1 =
+                    (sig_e2 + mu_e_n2 * two_cov_c2) / denom_4_l1;
+                // Scaled so 1/sqrt(kC2)=33.3 matches ~30 * q_norm * |o - r|
+                const float u_ssim4_sq = (q_norm * q_norm * 0.90f) * d_ssim4_val;
+                const float u_ssim4_l1 = (q_norm * q_norm * 0.90f) * d_ssim4_l1;
+                ssim2_c += 5.6f * u_ssim4_l1;
+                ssim4_c += 8.8f * u_ssim4_sq * u_ssim4_sq;
+
+                // 1:1 EdgeDiffMap (detail_lost / blur + artifact / ringing):
+                auto edge_row = [&](auto do_v, auto dr_v) {
+                  const auto abs_do = Abs(do_v);
+                  const auto abs_dr = Abs(dr_v);
+                  const auto inv_den =
+                      Div(Set(df4, 28.0f * q_norm), Add(q_norm_v, abs_do));
+                  const auto diff = Mul(Sub(abs_dr, abs_do), inv_den);
+                  const auto art = Max(zero4, diff);
+                  const auto blur = Max(zero4, Neg(diff));
+                  const auto art2 = Mul(art, art);
+                  const auto blur2 = Mul(blur, blur);
+                  return MulAdd(Set(df4, 0.35f), Mul(art2, art2),
+                                Mul(blur2, blur2));
+                };
+                const auto ed4 = Add(Add(edge_row(do0, dr0), edge_row(do1, dr1)),
+                                     Add(edge_row(do2, dr2), edge_row(do3, dr3)));
+                ssim4_c += 0.35f * GetLane(SumOfLanes(df4, ed4));
               }
             }
             const float mu_o8 = 0.25f * (cell_mu_o[0] + cell_mu_o[1] +
                                          cell_mu_o[2] + cell_mu_o[3]);
             const float mu_r8 = 0.25f * (cell_mu_r[0] + cell_mu_r[1] +
                                          cell_mu_r[2] + cell_mu_r[3]);
-            float sum_o2_8 = 0.0f;
-            float sum_r2_8 = 0.0f;
+            const float mu_e8 = mu_o8 - mu_r8;
+            float sum_o2_1to4 = 0.0f;
+            float sum_r2_1to4 = 0.0f;
+            float sum_e2_1to4 = 0.0f;
+            float cell_ring4 = 0.0f;
             for (size_t q = 0; q < 4; ++q) {
               const float dmo = cell_mu_o[q] - mu_o8;
               const float dmr = cell_mu_r[q] - mu_r8;
-              sum_o2_8 += cell_sum_o2[q] + 16.0f * dmo * dmo;
-              sum_r2_8 += cell_sum_r2[q] + 16.0f * dmr * dmr;
+              const float dme = dmo - dmr;
+              sum_o2_1to4 += dmo * dmo;
+              sum_r2_1to4 += dmr * dmr;
+              sum_e2_1to4 += dme * dme;
+              const float abs_dmo = std::abs(dmo);
+              const float abs_dmr = std::abs(dmr);
+              const float art_c =
+                  std::max(0.0f, abs_dmr - abs_dmo) *
+                  (28.0f * q_norm / (q_norm + abs_dmo));
+              const float art_c2 = art_c * art_c;
+              cell_ring4 += 8.0f * art_c2 * art_c2;
             }
-            const float sigma_o8 = std::sqrt((1.0f / 64.0f) * sum_o2_8);
-            const float sigma_r8 = std::sqrt((1.0f / 64.0f) * sum_r2_8);
-            const float bar_m8 = 0.25f * sum_m8;
-            const float g_tex8 =
-                sigma_o8 / (sigma_o8 + sigma_floor + 1e-8f);
-            const float u_blur8 =
-                0.70f * bar_m8 * g_tex8 * std::max(0.0f, sigma_o8 - sigma_r8);
-            const float u_blur8_2 = u_blur8 * u_blur8;
-            ssim4_c += 64.0f * u_blur8_2 * u_blur8_2;
+            const float sig_o8_2 = 0.25f * sum_o2_1to4;
+            const float sig_r8_2 = 0.25f * sum_r2_1to4;
+            const float sig_e8_2 = 0.25f * sum_e2_1to4;
+            const float denom_8 = sig_o8_2 + sig_r8_2 + c2_s;
+            const float two_cov8_c2 = std::max(0.0f, denom_8 - sig_e8_2);
+            const float mu_e8_n2 = mu_e8 * mu_e8 * inv_q_norm2;
+            const float d_ssim8_val =
+                (sig_e8_2 + mu_e8_n2 * two_cov8_c2) / denom_8;
+            const float u_ssim8_sq = (q_norm * q_norm * 0.90f) * d_ssim8_val;
+            ssim2_c += 41.6f * u_ssim8_sq;
+            ssim4_c += 28.8f * u_ssim8_sq * u_ssim8_sq + cell_ring4;
           }
         }
       }
@@ -928,13 +973,11 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
       loss += GetLane(SumOfLanes(df8, lossc)) * (kChannelMul[c] * w);
       loss2 += GetLane(SumOfLanes(df8, lossc2)) *
                (kChannelMul2[c] * ((w > 1.0f) ? std::pow(w, 0.25f) : 1.0f));
-      static constexpr float kChannelMul4[3] = {
-          4.5f * 4.5f * 4.5f * 4.5f,
-          1.0f,
-          1.0f,
-      };
-      loss_ssim4 +=
-          ssim4_c * (kChannelMul4[c] * ((w > 1.0f) ? std::sqrt(w) : 1.0f));
+      static constexpr float kSsimWeight2[3] = {0.06f, 1.00f, 0.45f};
+      static constexpr float kSsimWeight4[3] = {0.04f, 1.00f, 0.65f};
+      const float w_ssim = (w > 1.0f) ? std::sqrt(w) : 1.0f;
+      loss_ssim2 += ssim2_c * (kSsimWeight2[c] * w_ssim);
+      loss_ssim4 += ssim4_c * (kSsimWeight4[c] * w_ssim);
 
       if (rdo_mode && use_tcm) {
         const float dof_norm =
@@ -986,10 +1029,11 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     const float d8 = std::pow(loss * inv_npixels, 1.0f / 8.0f);
     const float d2 = std::sqrt(loss2 * inv_npixels);
     float d_blend =
-        (config.band_qf_stride > 0) ? (0.91f * d8 + 0.09f * 2.18f * d2) : d8;
+        (config.band_qf_stride > 0) ? (0.65f * d8 + 0.35f * 2.18f * d2) : d8;
     if (config.band_qf_stride > 0 && !rdo_mode) {
-      const float d_ssim = std::pow(loss_ssim4 * inv_npixels, 0.25f);
-      d_blend = 0.90f * d_blend + 0.30f * d_ssim;
+      const float d_ssim2 = std::sqrt(loss_ssim2 * inv_npixels);
+      const float d_ssim4 = std::pow(loss_ssim4 * inv_npixels, 0.25f);
+      d_blend = 0.38f * d_blend + 0.62f * d_ssim2 + 0.36f * d_ssim4;
     }
     out_loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / q_norm;
   };
