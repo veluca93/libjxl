@@ -2041,6 +2041,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       }
     }
   }
+  double total_mod_err = 0.0;
+  double sum_d_ref = 0.0;
+  size_t final_bctx_histo[4][kNumEPFVals] = {};
+  size_t final_bctx_totals[4] = {};
+  size_t val_counts[kNumEPFVals] = {};
   for (size_t by = 0; by < frame_dim.ysize_blocks; by++) {
     uint8_t* JXL_RESTRICT out_row = epf_sharpness.Row(by);
     uint8_t* JXL_RESTRICT prev_row = epf_sharpness.Row(by > 0 ? by - 1 : 0);
@@ -2062,6 +2067,56 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
         }
       }
       out_row[bx] = best_val;
+      total_mod_err += error_images[best_val].Row(by)[bx];
+      sum_d_ref += d_ref;
+      const int bctx = (top_val > 0 ? 2 : 0) + (left_val > 0 ? 1 : 0);
+      final_bctx_histo[bctx][best_val]++;
+      final_bctx_totals[bctx]++;
+      val_counts[best_val]++;
+    }
+  }
+
+  size_t num_unique_vals = 0;
+  for (uint8_t val : epf_steps) {
+    if (val_counts[val] > 0) num_unique_vals++;
+  }
+  if (num_unique_vals > 1 &&
+      frame_dim.xsize_blocks * frame_dim.ysize_blocks > 0) {
+    double epf_bits = 14.0;
+    for (int bctx = 0; bctx < 4; ++bctx) {
+      if (final_bctx_totals[bctx] == 0) continue;
+      const double inv_tot =
+          1.0 / static_cast<double>(final_bctx_totals[bctx]);
+      for (uint8_t val : epf_steps) {
+        const size_t cnt = final_bctx_histo[bctx][val];
+        if (cnt > 0) {
+          epf_bits -=
+              static_cast<double>(cnt) * std::log2(static_cast<double>(cnt) * inv_tot);
+        }
+      }
+    }
+    const double mean_d_ref =
+        sum_d_ref /
+        static_cast<double>(frame_dim.xsize_blocks * frame_dim.ysize_blocks);
+    const double lambda_bit =
+        (0.018 / static_cast<double>(clamped_butteraugli)) * mean_d_ref;
+    uint8_t best_const_val = 0;
+    double best_const_err = std::numeric_limits<double>::max();
+    for (uint8_t val : epf_steps) {
+      double c_err = 0.0;
+      for (size_t by = 0; by < frame_dim.ysize_blocks; ++by) {
+        const float* erow = error_images[val].ConstRow(by);
+        for (size_t bx = 0; bx < frame_dim.xsize_blocks; ++bx) {
+          c_err += erow[bx];
+        }
+      }
+      if (c_err < best_const_err) {
+        best_const_err = c_err;
+        best_const_val = val;
+      }
+    }
+    if (best_const_err <= total_mod_err + lambda_bit * epf_bits) {
+      FillPlane(best_const_val, &epf_sharpness, Rect(epf_sharpness));
     }
   }
 

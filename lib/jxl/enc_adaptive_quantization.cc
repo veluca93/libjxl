@@ -605,6 +605,53 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, ThreadPool::NoInit,
                                 process_tile, "AQ DiffPrecompute"));
 
+  if (band_qf != nullptr && xsize_blocks * ysize_blocks > 64) {
+    const float aq_damp =
+        0.36f * Clamp1((butteraugli_target - 0.85f) / 1.65f, 0.0f, 1.0f);
+    if (aq_damp > 1e-4f) {
+      double sum_log_q = 0.0;
+      for (size_t by = 0; by < ysize_blocks; ++by) {
+        const float* JXL_RESTRICT b0 = band_qf[1][0].ConstRow(by);
+        const float* JXL_RESTRICT b1 = band_qf[1][1].ConstRow(by);
+        const float* JXL_RESTRICT b2 = band_qf[1][2].ConstRow(by);
+        const float* JXL_RESTRICT b3 = band_qf[1][3].ConstRow(by);
+        for (size_t bx = 0; bx < xsize_blocks; ++bx) {
+          const float q_y = std::max(
+              1e-4f,
+              0.30f * b0[bx] + 0.30f * b1[bx] + 0.25f * b2[bx] + 0.15f * b3[bx]);
+          sum_log_q += std::log(static_cast<double>(q_y));
+        }
+      }
+      const float q_geom =
+          static_cast<float>(std::exp(
+              sum_log_q / static_cast<double>(xsize_blocks * ysize_blocks))) *
+          (1.0f - 0.035f * aq_damp);
+      for (size_t by = 0; by < ysize_blocks; ++by) {
+        const float* JXL_RESTRICT b0 = band_qf[1][0].ConstRow(by);
+        const float* JXL_RESTRICT b1 = band_qf[1][1].ConstRow(by);
+        const float* JXL_RESTRICT b2 = band_qf[1][2].ConstRow(by);
+        const float* JXL_RESTRICT b3 = band_qf[1][3].ConstRow(by);
+        float* JXL_RESTRICT rows[3][4];
+        for (size_t c = 0; c < 3; ++c) {
+          for (size_t s = 0; s < 4; ++s) {
+            rows[c][s] = band_qf[c][s].Row(by);
+          }
+        }
+        for (size_t bx = 0; bx < xsize_blocks; ++bx) {
+          const float q_y = std::max(
+              1e-4f,
+              0.30f * b0[bx] + 0.30f * b1[bx] + 0.25f * b2[bx] + 0.15f * b3[bx]);
+          const float scale_blk = std::pow(q_geom / q_y, aq_damp);
+          for (size_t c = 0; c < 3; ++c) {
+            for (size_t s = 0; s < 4; ++s) {
+              rows[c][s][bx] *= scale_blk;
+            }
+          }
+        }
+      }
+    }
+  }
+
   JXL_RETURN_IF_ERROR(Blur1x1Masking(memory_manager, pool, mask1x1, rect));
   return std::move(impl).aq_map;
 }
