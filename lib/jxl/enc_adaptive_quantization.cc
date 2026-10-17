@@ -409,11 +409,14 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
         const float uniform_tex_mask =
             achromatic * (0.009f / (edge_loc_y * edge_loc_y)) *
             std::min(1.0f, std::max(0.0f, E0_harm[1] - 0.020f) / 0.018f);
-        const float gammac = RatioOfDerivativesOfCubicRootToSimpleGamma(
-            block_mean[1] + 0.019f);
+        const float gammac =
+            1.0f + 0.50f * (RatioOfDerivativesOfCubicRootToSimpleGamma(
+                                block_mean[1] + 0.019f) -
+                            1.0f);
         const float e_harm = std::max(0.0f, E0_harm[1] - 5e-4f) * gammac;
         const float mask_base =
-            -0.115f - 0.58f * e_harm / (e_harm + 0.028f) + GetLane(gamma_val);
+            -0.115f - 0.58f * e_harm / (e_harm + 0.028f) +
+            0.40f * GetLane(gamma_val);
         const float hf_mod = Clamp1(
             0.42f - 48.64f * E[1][0] / edge_loc_y, -0.45f, 0.0f);
         const float psych_log_q =
@@ -443,17 +446,17 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
             float phi = Clamp1(0.95f + 0.07f * rel, 0.92f, 1.22f) * c_boost;
             if (s == 0) {
               const float hf_mask =
-                  1.0f / (1.0f + 0.22f * (tex_excess / 0.014f) / (edge_loc * edge_loc));
+                  1.0f / (1.0f + 0.32f * (tex_excess / 0.014f) / (edge_loc * edge_loc));
               phi *= hf_mask * edge_boost;
             } else if (s == 1) {
               const float hf_mask =
-                  1.0f / (1.0f + 0.09f * (tex_excess / 0.014f) / edge_loc);
+                  1.0f / (1.0f + 0.15f * (tex_excess / 0.014f) / edge_loc);
               phi *= hf_mask * 1.02f;
             } else if (s == 2) {
-              phi *= 1.01f;
+              phi *= 1.02f;
             } else {
               // Coarse scale (s = 3, 1:8 LF) cascades across all pyramid levels.
-              phi *= 1.05f;
+              phi *= 1.06f;
             }
             const float mod_phi =
                 1.0f + band_dist_w * (Clamp1(phi, 0.72f, 1.32f) - 1.0f);
@@ -607,7 +610,7 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
 
   if (band_qf != nullptr && xsize_blocks * ysize_blocks > 64) {
     const float aq_damp =
-        0.36f * Clamp1((butteraugli_target - 0.85f) / 1.65f, 0.0f, 1.0f);
+        0.25f + 0.35f * Clamp1((butteraugli_target - 0.50f) / 2.00f, 0.0f, 1.0f);
     if (aq_damp > 1e-4f) {
       double sum_log_q = 0.0;
       for (size_t by = 0; by < ysize_blocks; ++by) {
@@ -625,7 +628,7 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
       const float q_geom =
           static_cast<float>(std::exp(
               sum_log_q / static_cast<double>(xsize_blocks * ysize_blocks))) *
-          (1.0f - 0.035f * aq_damp);
+          (1.0f - 0.075f * aq_damp);
       for (size_t by = 0; by < ysize_blocks; ++by) {
         const float* JXL_RESTRICT b0 = band_qf[1][0].ConstRow(by);
         const float* JXL_RESTRICT b1 = band_qf[1][1].ConstRow(by);

@@ -94,11 +94,11 @@ static JXL_INLINE void ComputeBandThresholds(size_t c,
   for (size_t s = 0; s < 4; ++s) {
     const float bq = std::max(band_q[s], 1e-4f);
     const float rho =
-        (q_ref > 1e-4f) ? Clamp1(q_ref / bq, 0.80f, 1.25f) : 1.0f;
+        (q_ref > 1e-4f) ? Clamp1(q_ref / bq, 0.78f, 1.32f) : 1.0f;
     const float alpha = rho * rho;
-    const float slope = (alpha < 1.0f) ? 0.14f : (0.12f * pos_dz_scale);
+    const float slope = (alpha < 1.0f) ? 0.14f : (0.15f * pos_dz_scale);
     zero_thres[4 + s] =
-        Clamp1(slope * (alpha - 1.0f), -0.022f, 0.024f * pos_dz_scale);
+        Clamp1(slope * (alpha - 1.0f), -0.023f, 0.032f * pos_dz_scale);
   }
 }
 
@@ -126,7 +126,7 @@ static JXL_INLINE void ComputeBlockThresholds(
   }
 
   const float dz_w_rt =
-      Clamp1((butteraugli_distance - 0.50f) / (butteraugli_distance + 0.55f) *
+      Clamp1((butteraugli_distance - 0.38f) / (butteraugli_distance + 0.55f) *
                  1.65f,
              0.0f, 1.0f);
   const float hr_w = 1.0f - dz_w_rt;
@@ -136,13 +136,13 @@ static JXL_INLINE void ComputeBlockThresholds(
     }
     float luma_hf_dz = 0.0f;
     if (activity > 0) {
-      const float delta_hf = -0.002f * hr_w + dz_w_rt * (0.0085f * activity);
+      const float delta_hf = -0.002f * hr_w + dz_w_rt * (0.0100f * activity);
       zero_thres[1][1] += delta_hf;
       zero_thres[1][2] += delta_hf;
       luma_hf_dz = std::max(0.0f, delta_hf);
     }
     zero_thres[1][3] +=
-        -0.002f * hr_w + dz_w_rt * (0.002f + 0.0100f * activity);
+        -0.002f * hr_w + dz_w_rt * (0.0025f + 0.0115f * activity);
     for (int cc : {0, 2}) {
       zero_thres[cc][1] += 0.18f * luma_hf_dz;
       zero_thres[cc][2] += 0.18f * luma_hf_dz;
