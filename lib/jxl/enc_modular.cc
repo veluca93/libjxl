@@ -1617,7 +1617,7 @@ int QuantizeDcResidualRdo(const int32_t* qrow, size_t onerow, size_t c,
   const float abs_s = std::abs(svalue);
   const int sign = (svalue >= 0.0f) ? 1 : -1;
 
-  // Determine the two nearest legal candidate magnitudes {0, 1, 2, 4, 6, ...}.
+  // Determine the two nearest legal candidate magnitudes.
   int m0 = 0;
   int m1 = 0;
   float cost_m0 = 0.0f;
@@ -1733,11 +1733,89 @@ int QuantizeGradient(const int32_t* qrow, size_t onerow, size_t c, size_t x,
                                w_aq_s);
 }
 
+Status ModularFrameEncoder::QuantizeVarDCTYDC(
+    const FrameHeader& frame_header, const Image3F& dc, const Rect& r,
+    size_t group_index, bool nl_dc, PassesEncoderState* enc_state,
+    ImageI* quant_y_out) const {
+  (void)group_index;
+  JXL_ENSURE(frame_header.chroma_subsampling.Is444());
+  const float mul = nl_dc ? 2.0f : 1.0f;
+  const float inv_factor = enc_state->shared.quantizer.GetInvDcStep(1) * mul;
+  if (!nl_dc) {
+    for (size_t y = 0; y < r.ysize(); ++y) {
+      const float* JXL_RESTRICT row = r.ConstPlaneRow(dc, 1, y);
+      int32_t* JXL_RESTRICT qrow = r.Row(quant_y_out, y);
+      for (size_t x = 0; x < r.xsize(); ++x) {
+        qrow[x] = std::round(row[x] * inv_factor);
+      }
+    }
+    return true;
+  }
+  const bool enable_rdo =
+      enc_state->band_qf[0][3].xsize() >= r.x0() + r.xsize() &&
+      enc_state->band_qf[0][3].ysize() >= r.y0() + r.ysize();
+  const float diff_w = 0.10f;
+  float q_ref = 1.0f;
+  if (enable_rdo) {
+    double sum_log_q = 0.0;
+    for (size_t y = 0; y < r.ysize(); ++y) {
+      const float* q_row = r.ConstRow(enc_state->band_qf[1][3], y);
+      for (size_t x = 0; x < r.xsize(); ++x) {
+        sum_log_q += std::log(std::max(1e-4f, q_row[x]));
+      }
+    }
+    q_ref = std::exp(sum_log_q / std::max<size_t>(1, r.xsize() * r.ysize()));
+  }
+  const float aq_exp = kDcRdoParams[1].aq_exp;
+  auto calc_w_aq = [&](float q_blk) -> float {
+    const float log2_q =
+        Clamp1(std::log2(std::max(1e-4f, q_blk) / q_ref), -0.90f, 0.90f);
+    return std::exp2(aq_exp * log2_q);
+  };
+  bool has_outliers = false;
+  const size_t stride = quant_y_out->PixelsPerRow();
+  for (size_t y = 0; y < r.ysize(); ++y) {
+    int32_t* JXL_RESTRICT quant_row = r.Row(quant_y_out, y);
+    const float* row = r.ConstPlaneRow(dc, 1, y);
+    const float* row_prev = (y > 0) ? r.ConstPlaneRow(dc, 1, y - 1) : nullptr;
+    const float* row_next =
+        (y + 1 < r.ysize()) ? r.ConstPlaneRow(dc, 1, y + 1) : nullptr;
+    const float* q_row =
+        enable_rdo ? r.ConstRow(enc_state->band_qf[1][3], y) : nullptr;
+    const float* q_row_next =
+        (enable_rdo && y + 1 < r.ysize())
+            ? r.ConstRow(enc_state->band_qf[1][3], y + 1)
+            : nullptr;
+    for (size_t x = 0; x < r.xsize(); ++x) {
+      const float w_aq = enable_rdo ? calc_w_aq(q_row[x]) : 1.0f;
+      const float target_w = (x > 0) ? (row[x - 1] * inv_factor) : 0.0f;
+      const float target_n = (y > 0) ? (row_prev[x] * inv_factor) : 0.0f;
+      const bool has_e = enable_rdo && (x + 1 < r.xsize());
+      const float target_e = has_e ? (row[x + 1] * inv_factor) : 0.0f;
+      const float w_aq_e = has_e ? calc_w_aq(q_row[x + 1]) : 1.0f;
+      const bool has_s = enable_rdo && (y + 1 < r.ysize());
+      const float target_s = has_s ? (row_next[x] * inv_factor) : 0.0f;
+      const float target_sw =
+          (has_s && x > 0) ? (row_next[x - 1] * inv_factor) : 0.0f;
+      const float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
+      quant_row[x] = QuantizeGradient(
+          quant_row, stride, 1, x, y, r.xsize(), row[x], inv_factor, enable_rdo,
+          diff_w, w_aq, target_w, target_n, has_e, target_e, w_aq_e, has_s,
+          target_s, target_sw, w_aq_s, &has_outliers);
+    }
+  }
+  if (has_outliers) {
+    return JXL_FAILURE("Unsupported range of DC values");
+  }
+  return true;
+}
+
 Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
                                         const Image3F& dc, const Rect& r,
                                         size_t group_index, bool nl_dc,
                                         PassesEncoderState* enc_state,
-                                        bool jpeg_transcode) {
+                                        bool jpeg_transcode,
+                                        const ImageI* precomputed_quant_y) {
   JxlMemoryManager* memory_manager = dc.memory_manager();
   extra_dc_precision[group_index] = nl_dc ? 1 : 0;
   float mul = 1 << extra_dc_precision[group_index];
@@ -1758,7 +1836,10 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
         ModularOptions::TreeMode::kDefault;
     stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kLearn;
   }
-  if (cparams_.decoding_speed_tier >= 1) {
+  if (!jpeg_transcode || cparams_.decoding_speed_tier >= 1) {
+    stream_options_[stream_id].predictor = Predictor::Gradient;
+    stream_options_[stream_id].wp_tree_mode =
+        ModularOptions::TreeMode::kGradientOnly;
     stream_options_[stream_id].tree_kind =
         ModularOptions::TreeKind::kGradientFixedDC;
   }
@@ -1772,8 +1853,9 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
   if (nl_dc) {
     JXL_ENSURE(frame_header.chroma_subsampling.Is444());
     const bool use_gradient =
+        stream_options_[stream_id].predictor == Predictor::Gradient ||
         stream_options_[stream_id].tree_kind ==
-        ModularOptions::TreeKind::kGradientFixedDC;
+            ModularOptions::TreeKind::kGradientFixedDC;
     const bool enable_rdo =
         enc_state->band_qf[0][3].xsize() >= r.x0() + r.xsize() &&
         enc_state->band_qf[0][3].ysize() >= r.y0() + r.ysize();
@@ -1806,6 +1888,8 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
       };
       weighted::Header header;
       weighted::State wp_state(header, r.xsize(), r.ysize());
+      const bool copied_precomputed_y =
+          (c == 1 && precomputed_quant_y != nullptr);
       for (size_t y = 0; y < r.ysize(); y++) {
         int32_t* quant_row =
             stream_images_[stream_id].channel[c < 2 ? c ^ 1 : c].plane.Row(y);
@@ -1824,6 +1908,12 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
                 ? r.ConstRow(enc_state->band_qf[c][3], y + 1)
                 : nullptr;
         if (c == 1) {
+          if (copied_precomputed_y) {
+            const int32_t* JXL_RESTRICT pre_row =
+                r.ConstRow(*precomputed_quant_y, y);
+            memcpy(quant_row, pre_row, r.xsize() * sizeof(int32_t));
+            continue;
+          }
           for (size_t x = 0; x < r.xsize(); x++) {
             const float w_aq = enable_rdo ? calc_w_aq(q_row[x]) : 1.0f;
             const float target_w =
@@ -1929,6 +2019,12 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
             stream_images_[stream_id].channel[c < 2 ? c ^ 1 : c].plane.Row(y);
         const float* row = r.ConstPlaneRow(dc, c, y);
         if (c == 1) {
+          if (precomputed_quant_y != nullptr) {
+            const int32_t* JXL_RESTRICT pre_row =
+                r.ConstRow(*precomputed_quant_y, y);
+            memcpy(quant_row, pre_row, r.xsize() * sizeof(int32_t));
+            continue;
+          }
           for (size_t x = 0; x < r.xsize(); x++) {
             quant_row[x] = std::round(row[x] * inv_factor);
           }

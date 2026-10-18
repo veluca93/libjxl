@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "lib/jxl/base/bits.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
@@ -23,6 +24,7 @@
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/chroma_from_luma.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/compressed_dc.h"
@@ -45,6 +47,281 @@
 #include "lib/jxl/quantizer.h"
 
 namespace jxl {
+
+namespace {
+
+JXL_INLINE int32_t ClampedGradI32(int32_t n, int32_t w, int32_t nw) {
+  const int32_t m = std::min(n, w);
+  const int32_t M = std::max(n, w);
+  return Clamp1(n + w - nw, m, M);
+}
+
+JXL_INLINE float ClampedGradF32(float n, float w, float nw) {
+  const float m = std::min(n, w);
+  const float M = std::max(n, w);
+  return Clamp1(n + w - nw, m, M);
+}
+
+JXL_INLINE void AddHybridUint420(int32_t signed_res, uint32_t hist[64],
+                                 uint64_t* JXL_RESTRICT extra_bits) {
+  const uint32_t u = static_cast<uint32_t>(
+      (signed_res >= 0) ? (2 * signed_res) : (-2 * signed_res - 1));
+  uint32_t token = u;
+  if (u >= 16u) {
+    const uint32_t n = FloorLog2Nonzero(u);
+    const uint32_t nbits = n - 2u;
+    *extra_bits += nbits;
+    token =
+        std::min<uint32_t>(63u, 16u + ((n - 4u) << 2u) + ((u >> nbits) & 3u));
+  }
+  hist[token]++;
+}
+
+double HistogramEntropyBits(const uint32_t hist[64], uint32_t total_n,
+                            uint64_t extra_bits) {
+  double bits = static_cast<double>(extra_bits);
+  if (total_n > 0) {
+    bits +=
+        static_cast<double>(total_n) * std::log2(static_cast<double>(total_n));
+    for (size_t i = 0; i < 64; ++i) {
+      if (hist[i] > 0) {
+        bits -= static_cast<double>(hist[i]) *
+                std::log2(static_cast<double>(hist[i]));
+      }
+    }
+  }
+  return bits;
+}
+
+struct DcChannelRdCost {
+  double bits = 0.0;
+  double dist = 0.0;
+  double total(double lambda_dist) const { return bits + lambda_dist * dist; }
+};
+
+DcChannelRdCost EvalChromaDcChannelCost(const FrameDimensions& frame_dim,
+                                        const Image3F& dc_src,
+                                        const Image3F& dc_orig,
+                                        const ImageI& quant_y, size_t c,
+                                        float inv_dc_c, float half_y_step,
+                                        float k_ratio, float b_y_comp) {
+  const float y_comp = (c == 2) ? b_y_comp : 0.0f;
+  const float yk_eff = half_y_step * (k_ratio - y_comp);
+  const float inv_f = inv_dc_c * 2.0f;
+  const float dz = (c == 0) ? 0.64f : 0.60f;
+  uint32_t hist[64] = {0};
+  uint64_t extra_bits = 0;
+  uint32_t total_n = 0;
+  double dist = 0.0;
+  std::vector<int32_t> q_prev(frame_dim.group_dim, 0);
+  std::vector<int32_t> q_cur(frame_dim.group_dim, 0);
+
+  for (size_t group_index = 0; group_index < frame_dim.num_dc_groups;
+       ++group_index) {
+    const Rect r = frame_dim.DCGroupRect(group_index);
+    for (size_t y = 0; y < r.ysize(); ++y) {
+      const float* JXL_RESTRICT rc = r.ConstPlaneRow(dc_src, c, y);
+      const float* JXL_RESTRICT rc_orig = r.ConstPlaneRow(dc_orig, c, y);
+      const float* JXL_RESTRICT ry = r.ConstPlaneRow(dc_orig, 1, y);
+      const int32_t* JXL_RESTRICT qy = r.ConstRow(quant_y, y);
+      for (size_t x = 0; x < r.xsize(); ++x) {
+        const int32_t left = (x > 0) ? q_cur[x - 1] : (y > 0 ? q_prev[x] : 0);
+        const int32_t top = (y > 0) ? q_prev[x] : left;
+        const int32_t tl = (x > 0 && y > 0) ? q_prev[x - 1] : left;
+        const int32_t guess = ClampedGradI32(top, left, tl);
+        const float pred_y_cfl =
+            y_comp * ry[x] + static_cast<float>(qy[x]) * yk_eff;
+        const float raw_target = (rc[x] - pred_y_cfl) * inv_f;
+        const float orig_target = (rc_orig[x] - pred_y_cfl) * inv_f;
+        const float s = raw_target - static_cast<float>(guess);
+        const float abs_s = std::abs(s);
+        int32_t res = 0;
+        if (abs_s >= dz) {
+          if (abs_s < 2.0f) {
+            res = static_cast<int32_t>(std::lround(s));
+          } else {
+            res = static_cast<int32_t>(std::lround(s * 0.5f)) * 2;
+          }
+        }
+        const int32_t q_val = guess + res;
+        q_cur[x] = q_val;
+        const float err = orig_target - static_cast<float>(q_val);
+        dist += static_cast<double>(err * err);
+        AddHybridUint420(res, hist, &extra_bits);
+        total_n++;
+      }
+      std::swap(q_prev, q_cur);
+    }
+  }
+  DcChannelRdCost out;
+  out.bits = HistogramEntropyBits(hist, total_n, extra_bits);
+  out.dist = dist;
+  return out;
+}
+
+void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
+                            const ImageI& quant_y, bool has_dc_rdo,
+                            PassesSharedState* shared) {
+  const float inv_dc_x = shared->quantizer.GetInvDcStep(0);
+  const float inv_dc_b = shared->quantizer.GetInvDcStep(2);
+  const float half_y_step = shared->quantizer.GetDcStep(1) * 0.5f;
+  const float base_b = shared->cmap.base().GetBaseCorrelationB();
+  const float color_factor = shared->cmap.base().GetColorFactor();
+  const float b_y_comp = has_dc_rdo ? 0.75f : 0.0f;
+
+  // Check if AC CfL already modified the global ColorCorrelation header.
+  const bool header_already_paid =
+      color_factor != kDefaultColorFactor ||
+      shared->cmap.base().GetBaseCorrelationX() != 0.0f ||
+      base_b != jxl::cms::kYToBRatio;
+  const double kHeaderBits = header_already_paid ? 0.0 : 50.0;
+
+  double num_x = 0.0;
+  double den_x = 1e-5;
+  double num_b = 0.0;
+  double den_b = 1e-5;
+  uint64_t l1_weights_x[256] = {0};
+  uint64_t l1_weights_b[256] = {0};
+  uint64_t total_w_x = 0;
+  uint64_t total_w_b = 0;
+
+  for (size_t group_index = 0; group_index < frame_dim.num_dc_groups;
+       ++group_index) {
+    const Rect r = frame_dim.DCGroupRect(group_index);
+    for (size_t y = 0; y < r.ysize(); ++y) {
+      const float* JXL_RESTRICT rx = r.ConstPlaneRow(dc, 0, y);
+      const float* JXL_RESTRICT rx_p =
+          (y > 0) ? r.ConstPlaneRow(dc, 0, y - 1) : nullptr;
+      const float* JXL_RESTRICT ry = r.ConstPlaneRow(dc, 1, y);
+      const float* JXL_RESTRICT ry_p =
+          (y > 0) ? r.ConstPlaneRow(dc, 1, y - 1) : nullptr;
+      const float* JXL_RESTRICT rb = r.ConstPlaneRow(dc, 2, y);
+      const float* JXL_RESTRICT rb_p =
+          (y > 0) ? r.ConstPlaneRow(dc, 2, y - 1) : nullptr;
+      const int32_t* JXL_RESTRICT qy = r.ConstRow(quant_y, y);
+      const int32_t* JXL_RESTRICT qy_p =
+          (y > 0) ? r.ConstRow(quant_y, y - 1) : nullptr;
+      for (size_t x = 0; x < r.xsize(); ++x) {
+        const int32_t qy_l = (x > 0) ? qy[x - 1] : (y > 0 ? qy_p[x] : 0);
+        const int32_t qy_t = (y > 0) ? qy_p[x] : qy_l;
+        const int32_t qy_tl = (x > 0 && y > 0) ? qy_p[x - 1] : qy_l;
+        const int32_t dq_y = qy[x] - ClampedGradI32(qy_t, qy_l, qy_tl);
+        if (dq_y == 0) continue;
+        const float dy = static_cast<float>(dq_y) * half_y_step;
+
+        const float rx_l = (x > 0) ? rx[x - 1] : (y > 0 ? rx_p[x] : 0.0f);
+        const float rx_t = (y > 0) ? rx_p[x] : rx_l;
+        const float rx_tl = (x > 0 && y > 0) ? rx_p[x - 1] : rx_l;
+        const float dx = rx[x] - ClampedGradF32(rx_t, rx_l, rx_tl);
+
+        const float b_cur = rb[x] - b_y_comp * ry[x];
+        const float b_l =
+            (x > 0) ? (rb[x - 1] - b_y_comp * ry[x - 1])
+                    : (y > 0 ? (rb_p[x] - b_y_comp * ry_p[x]) : 0.0f);
+        const float b_t = (y > 0) ? (rb_p[x] - b_y_comp * ry_p[x]) : b_l;
+        const float b_tl =
+            (x > 0 && y > 0) ? (rb_p[x - 1] - b_y_comp * ry_p[x - 1]) : b_l;
+        const float db_raw = b_cur - ClampedGradF32(b_t, b_l, b_tl);
+        const float db = db_raw - (base_b - b_y_comp) * dy;
+
+        const float w =
+            1.0f / std::sqrt(1.0f + 0.04f * static_cast<float>(dq_y * dq_y));
+        num_x += w * dy * dx;
+        den_x += w * dy * dy;
+        num_b += w * dy * db;
+        den_b += w * dy * dy;
+
+        const uint64_t abs_dq = static_cast<uint64_t>(std::abs(dq_y));
+        const int32_t kx =
+            Clamp1<int32_t>(std::lround((dx / dy) * color_factor), -128, 127);
+        const int32_t kb =
+            Clamp1<int32_t>(std::lround((db / dy) * color_factor), -128, 127);
+        l1_weights_x[kx + 128] += abs_dq;
+        l1_weights_b[kb + 128] += abs_dq;
+        total_w_x += abs_dq;
+        total_w_b += abs_dq;
+      }
+    }
+  }
+
+  auto find_l1_median = [](const uint64_t weights[256],
+                           uint64_t total_w) -> int32_t {
+    if (total_w == 0) return 0;
+    const uint64_t half = (total_w + 1) / 2;
+    uint64_t acc = 0;
+    for (int i = 0; i < 256; ++i) {
+      acc += weights[i];
+      if (acc >= half) return i - 128;
+    }
+    return 0;
+  };
+
+  const int32_t est_x_l2 =
+      Clamp1<int32_t>(std::lround((num_x / den_x) * color_factor), -128, 127);
+  const int32_t est_b_l2 =
+      Clamp1<int32_t>(std::lround((num_b / den_b) * color_factor), -128, 127);
+  const int32_t est_x_l1 = find_l1_median(l1_weights_x, total_w_x);
+  const int32_t est_b_l1 = find_l1_median(l1_weights_b, total_w_b);
+
+  constexpr double kLambdaX = 3.5;
+  constexpr double kLambdaB = 4.5;
+  const size_t num_blocks = frame_dim.xsize_blocks * frame_dim.ysize_blocks;
+  const double min_ch_gain = 4.0 + 0.002 * static_cast<double>(num_blocks);
+
+  auto search_channel = [&](size_t c, float inv_dc, int32_t seed_l2,
+                            int32_t seed_l1, double lambda_d,
+                            double* out_gain) -> int32_t {
+    auto eval = [&](int32_t idx) -> DcChannelRdCost {
+      const float ratio = (c == 0) ? shared->cmap.base().YtoXRatio(idx)
+                                   : shared->cmap.base().YtoBRatio(idx);
+      return EvalChromaDcChannelCost(frame_dim, dc, dc, quant_y, c, inv_dc,
+                                     half_y_step, ratio, b_y_comp);
+    };
+    const DcChannelRdCost base = eval(0);
+    const double base_score = base.total(lambda_d);
+    double best_score = base_score;
+    int32_t best_idx = 0;
+    bool seen[256] = {false};
+    seen[128] = true;
+    auto try_cand = [&](int32_t raw_cand) {
+      const int32_t cand = Clamp1<int32_t>(raw_cand, -128, 127);
+      if (seen[cand + 128]) return;
+      seen[cand + 128] = true;
+      const DcChannelRdCost cost = eval(cand);
+      if (cost.dist > base.dist * 1.03) return;
+      const double score = cost.total(lambda_d);
+      if (score < best_score) {
+        best_score = score;
+        best_idx = cand;
+      }
+    };
+    try_cand(seed_l2 / 2);
+    try_cand((seed_l2 * 3) / 4);
+    for (int32_t d = -8; d <= 8; ++d) try_cand(seed_l2 + d);
+    for (int32_t d = -6; d <= 6; ++d) try_cand(seed_l1 + d);
+    const double gain = base_score - best_score;
+    if (gain < min_ch_gain) {
+      *out_gain = 0.0;
+      return 0;
+    }
+    *out_gain = gain;
+    return best_idx;
+  };
+
+  double gain_x = 0.0;
+  double gain_b = 0.0;
+  const int32_t best_x =
+      search_channel(0, inv_dc_x, est_x_l2, est_x_l1, kLambdaX, &gain_x);
+  const int32_t best_b =
+      search_channel(2, inv_dc_b, est_b_l2, est_b_l1, kLambdaB, &gain_b);
+
+  if (gain_x + gain_b > kHeaderBits + 4.0) {
+    shared->cmap.base().SetYToXDC(best_x);
+    shared->cmap.base().SetYToBDC(best_b);
+  }
+}
+
+}  // namespace
 
 Status ComputeACMetadata(ThreadPool* pool, PassesEncoderState* enc_state,
                          ModularFrameEncoder* modular_frame_encoder) {
@@ -228,197 +505,37 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
     shared.dc = &shared.dc_storage;
     JXL_ENSURE(encoded_size == 0);
   } else {
-    if (enc_state->initialize_global_state &&
+    const bool nl_dc = enc_state->cparams.speed_tier < SpeedTier::kFalcon;
+    const bool enable_dc_heuristics =
+        !enc_state->streaming_mode && enc_state->initialize_global_state &&
         enc_state->cparams.use_full_image_heuristics &&
         frame_header.chroma_subsampling.Is444() &&
+        frame_header.color_transform == ColorTransform::kXYB &&
         !enc_state->cparams.disable_perceptual_optimizations &&
-        enc_state->cparams.speed_tier <= SpeedTier::kSquirrel &&
-        shared.frame_dim.xsize_blocks * shared.frame_dim.ysize_blocks > 64) {
-      const size_t xsize = shared.frame_dim.xsize_blocks;
-      const size_t ysize = shared.frame_dim.ysize_blocks;
-      const float inv_dc_x = shared.quantizer.GetInvDcStep(0);
-      const float inv_dc_y = shared.quantizer.GetInvDcStep(1);
-      const float inv_dc_b = shared.quantizer.GetInvDcStep(2);
-      const float y_step = shared.quantizer.GetDcStep(1);
-      auto clamped_grad = [](float n, float w, float nw) -> float {
-        const float m = std::min(n, w);
-        const float M = std::max(n, w);
-        return Clamp1(n + w - nw, m, M);
-      };
-      const float inv_fy = inv_dc_y * 2.0f;
-      const float half_y_step = y_step * 0.5f;
-      const float base_b = shared.cmap.base().GetBaseCorrelationB();
-      const bool has_dc_rdo = enc_state->band_qf[0][3].xsize() >= xsize &&
-                              enc_state->band_qf[0][3].ysize() >= ysize;
-      const float b_y_comp = has_dc_rdo ? 0.75f : 0.0f;
-      double num_x = 0.0;
-      double den_x = 1e-5;
-      double num_b = 0.0;
-      double den_b = 1e-5;
-      for (size_t y = 1; y < ysize; ++y) {
-        const float* JXL_RESTRICT rx = dc.ConstPlaneRow(0, y);
-        const float* JXL_RESTRICT rx_p = dc.ConstPlaneRow(0, y - 1);
-        const float* JXL_RESTRICT ry = dc.ConstPlaneRow(1, y);
-        const float* JXL_RESTRICT ry_p = dc.ConstPlaneRow(1, y - 1);
-        const float* JXL_RESTRICT rb = dc.ConstPlaneRow(2, y);
-        const float* JXL_RESTRICT rb_p = dc.ConstPlaneRow(2, y - 1);
-        for (size_t x = 1; x < xsize; ++x) {
-          const float qy_c = std::round(ry[x] * inv_fy);
-          const float qy_n = std::round(ry_p[x] * inv_fy);
-          const float qy_w = std::round(ry[x - 1] * inv_fy);
-          const float qy_nw = std::round(ry_p[x - 1] * inv_fy);
-          const float dq_y = qy_c - clamped_grad(qy_n, qy_w, qy_nw);
-          if (std::abs(dq_y) < 0.25f) continue;
-          const float dy = dq_y * half_y_step;
-          const float dx =
-              rx[x] - clamped_grad(rx_p[x], rx[x - 1], rx_p[x - 1]);
-          const float db_raw =
-              (rb[x] - b_y_comp * ry[x]) -
-              clamped_grad(rb_p[x] - b_y_comp * ry_p[x],
-                           rb[x - 1] - b_y_comp * ry[x - 1],
-                           rb_p[x - 1] - b_y_comp * ry_p[x - 1]);
-          const float db = db_raw - (base_b - b_y_comp) * dy;
-          const float w = 1.0f / std::sqrt(1.0f + 0.04f * dq_y * dq_y);
-          num_x += w * dy * dx;
-          den_x += w * dy * dy;
-          num_b += w * dy * db;
-          den_b += w * dy * dy;
-        }
-      }
-      const int32_t est_x = Clamp1<int32_t>(
-          std::lround((num_x / den_x) * shared.cmap.base().GetColorFactor()),
-          -128, 127);
-      const int32_t est_b = Clamp1<int32_t>(
-          std::lround((num_b / den_b) * shared.cmap.base().GetColorFactor()),
-          -128, 127);
+        enc_state->cparams.speed_tier <= SpeedTier::kSquirrel;
+    const size_t xsize_blocks = shared.frame_dim.xsize_blocks;
+    const size_t ysize_blocks = shared.frame_dim.ysize_blocks;
+    const bool has_dc_rdo = enc_state->band_qf[0][3].xsize() >= xsize_blocks &&
+                            enc_state->band_qf[0][3].ysize() >= ysize_blocks;
 
-      auto eval_cfl_cost = [&](size_t c, float inv_dc, int32_t idx) -> double {
-        const float k = (c == 0) ? shared.cmap.base().YtoXRatio(idx)
-                                 : shared.cmap.base().YtoBRatio(idx);
-        const float y_comp = (c == 2) ? b_y_comp : 0.0f;
-        const float yk_eff = half_y_step * (k - y_comp);
-        const float inv_f = inv_dc * 2.0f;
-        const float dz = (c == 0) ? 0.65f : 0.61f;
-        const float bias1 = (c == 0) ? 0.07f : 0.03f;
-        const float bias2 = (c == 0) ? 0.04f : 0.0f;
-        const float lambda_dist = (c == 0) ? 3.5f : 4.5f;
-        uint32_t hist[64] = {0};
-        uint64_t extra_bits = 0;
-        double dist_cost = 0.0;
-        uint32_t total_n = 0;
-        for (size_t y = 1; y < ysize; ++y) {
-          const float* JXL_RESTRICT rc = dc.ConstPlaneRow(c, y);
-          const float* JXL_RESTRICT rc_p = dc.ConstPlaneRow(c, y - 1);
-          const float* JXL_RESTRICT ry = dc.ConstPlaneRow(1, y);
-          const float* JXL_RESTRICT ry_p = dc.ConstPlaneRow(1, y - 1);
-          for (size_t x = 1; x < xsize; ++x) {
-            const float vc =
-                rc[x] - y_comp * ry[x] - std::round(ry[x] * inv_fy) * yk_eff;
-            const float vn = rc_p[x] - y_comp * ry_p[x] -
-                             std::round(ry_p[x] * inv_fy) * yk_eff;
-            const float vw = rc[x - 1] - y_comp * ry[x - 1] -
-                             std::round(ry[x - 1] * inv_fy) * yk_eff;
-            const float vnw = rc_p[x - 1] - y_comp * ry_p[x - 1] -
-                              std::round(ry_p[x - 1] * inv_fy) * yk_eff;
-            const float s = (vc - clamped_grad(vn, vw, vnw)) * inv_f;
-            const float abs_s = std::abs(s);
-            int32_t q_int = 0;
-            if (abs_s >= dz) {
-              float q_abs = std::round(abs_s - bias1);
-              if (q_abs > 2.0f) {
-                q_abs = std::round(abs_s * 0.5f - bias2) * 2.0f;
-              }
-              q_int = (s >= 0.0f) ? static_cast<int32_t>(q_abs)
-                                  : -static_cast<int32_t>(q_abs);
-            }
-            const float err = s - static_cast<float>(q_int);
-            dist_cost += lambda_dist * err * err;
-            const uint32_t u = static_cast<uint32_t>(
-                (q_int >= 0) ? (2 * q_int) : (-2 * q_int - 1));
-            uint32_t token = u;
-            if (u >= 16u) {
-              const uint32_t n = FloorLog2Nonzero(u);
-              const uint32_t nbits = n - 2u;
-              extra_bits += nbits;
-              token = std::min<uint32_t>(
-                  63u, 16u + ((n - 4u) << 2u) + ((u >> nbits) & 3u));
-            }
-            hist[token]++;
-            total_n++;
-          }
-        }
-        double entropy_bits = 0.0;
-        if (total_n > 0) {
-          entropy_bits =
-              static_cast<double>(total_n) * std::log2(static_cast<double>(total_n));
-          for (uint32_t c_cnt : hist) {
-            if (c_cnt > 0) {
-              entropy_bits -=
-                  static_cast<double>(c_cnt) * std::log2(static_cast<double>(c_cnt));
-            }
-          }
-        }
-        return entropy_bits + static_cast<double>(extra_bits) + dist_cost;
-      };
-
-      const double cost_x0 = eval_cfl_cost(0, inv_dc_x, 0);
-      const double cost_b0 = eval_cfl_cost(2, inv_dc_b, 0);
-      const double min_ch_gain =
-          12.0 + 0.004 * static_cast<double>((xsize - 1) * (ysize - 1));
-      int32_t best_x = 0;
-      double best_cost_x = cost_x0;
-      bool seen_x[256] = {false};
-      seen_x[128] = true;
-      auto try_x = [&](int32_t raw_cand) {
-        const int32_t cand = Clamp1<int32_t>(raw_cand, -128, 127);
-        if (seen_x[cand + 128]) return;
-        seen_x[cand + 128] = true;
-        const double c = eval_cfl_cost(0, inv_dc_x, cand);
-        if (c < best_cost_x) {
-          best_cost_x = c;
-          best_x = cand;
-        }
-      };
-      try_x(est_x / 2);
-      try_x((est_x * 3) / 4);
-      for (int32_t d = -4; d <= 4; ++d) {
-        try_x(est_x + d);
+    ImageI quant_y;
+    if (enable_dc_heuristics && xsize_blocks >= 2 && ysize_blocks >= 2) {
+      JXL_ASSIGN_OR_RETURN(
+          quant_y, ImageI::Create(memory_manager, xsize_blocks, ysize_blocks));
+      for (size_t group_index = 0;
+           group_index < shared.frame_dim.num_dc_groups; ++group_index) {
+        const Rect r = shared.frame_dim.DCGroupRect(group_index);
+        JXL_RETURN_IF_ERROR(modular_frame_encoder->QuantizeVarDCTYDC(
+            frame_header, dc, r, group_index, nl_dc, enc_state, &quant_y));
       }
-      if (cost_x0 - best_cost_x < min_ch_gain) {
-        best_x = 0;
-        best_cost_x = cost_x0;
-      }
-      int32_t best_b = 0;
-      double best_cost_b = cost_b0;
-      bool seen_b[256] = {false};
-      seen_b[128] = true;
-      auto try_b = [&](int32_t raw_cand) {
-        const int32_t cand = Clamp1<int32_t>(raw_cand, -128, 127);
-        if (seen_b[cand + 128]) return;
-        seen_b[cand + 128] = true;
-        const double c = eval_cfl_cost(2, inv_dc_b, cand);
-        if (c < best_cost_b) {
-          best_cost_b = c;
-          best_b = cand;
-        }
-      };
-      try_b(est_b / 2);
-      try_b((est_b * 3) / 4);
-      for (int32_t d = -4; d <= 4; ++d) {
-        try_b(est_b + d);
-      }
-      if (cost_b0 - best_cost_b < min_ch_gain) {
-        best_b = 0;
-        best_cost_b = cost_b0;
-      }
-      const double min_tot_gain =
-          50.0 + (enc_state->streaming_mode ? 0.015 : 0.004) *
-                     static_cast<double>((xsize - 1) * (ysize - 1));
-      if ((cost_x0 - best_cost_x) + (cost_b0 - best_cost_b) > min_tot_gain) {
-        shared.cmap.base().SetYToXDC(best_x);
-        shared.cmap.base().SetYToBDC(best_b);
+      if (xsize_blocks * ysize_blocks > 64) {
+        ComputeClosedLoopDcCfL(shared.frame_dim, dc, quant_y, has_dc_rdo,
+                               &shared);
       }
     }
+
+    const ImageI* precomputed_y_ptr =
+        (quant_y.xsize() > 0) ? &quant_y : nullptr;
     auto compute_dc_coeffs = [&](int group_index, int /* thread */) -> Status {
       const Rect r = enc_state->shared.frame_dim.DCGroupRect(group_index);
       int modular_group_index = group_index;
@@ -427,9 +544,8 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
         modular_group_index = enc_state->dc_group_index;
       }
       JXL_RETURN_IF_ERROR(modular_frame_encoder->AddVarDCTDC(
-          frame_header, dc, r, modular_group_index,
-          enc_state->cparams.speed_tier < SpeedTier::kFalcon, enc_state,
-          /*jpeg_transcode=*/false));
+          frame_header, dc, r, modular_group_index, nl_dc, enc_state,
+          /*jpeg_transcode=*/false, precomputed_y_ptr));
       return true;
     };
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, shared.frame_dim.num_dc_groups,
@@ -452,9 +568,10 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
         JXL_RETURN_IF_ERROR(CopyImageTo(shared.dc_storage, &smoothed_dc));
         JXL_RETURN_IF_ERROR(AdaptiveDCSmoothing(
             memory_manager, shared.quantizer.MulDC(), &smoothed_dc, pool));
-        const float inv_dc_x = shared.quantizer.GetInvDcStep(0);
-        const float inv_dc_y = shared.quantizer.GetInvDcStep(1);
-        const float inv_dc_b = shared.quantizer.GetInvDcStep(2);
+        const float scale_dc = 1.0f / shared.quantizer.inv_quant_dc();
+        const float inv_dc_x = kInvDCQuant[0] * scale_dc;
+        const float inv_dc_y = kInvDCQuant[1] * scale_dc;
+        const float inv_dc_b = kInvDCQuant[2] * scale_dc;
         const float wx = inv_dc_x * inv_dc_x;
         const float wy = inv_dc_y * inv_dc_y;
         const float wb = inv_dc_b * inv_dc_b;
@@ -503,8 +620,12 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
                 static_cast<double>(w_aq) * (1.0f * dy + 0.35f * dx + 0.25f * db);
           }
         }
-        // ~10 header bits penalty in DC quantizer step units (~0.25 step^2/bit).
-        if (total_delta > 2.5) {
+        // Incremental U64 header cost for kSkipAdaptiveDCSmoothing (flag=128).
+        const double skip_header_bits =
+            (frame_header.flags == 0) ? 8.0
+                                      : (frame_header.flags < 17 ? 4.0 : 0.0);
+        const double skip_threshold = 0.25 * skip_header_bits;
+        if (total_delta > skip_threshold) {
           frame_header.UpdateFlag(true, FrameHeader::kSkipAdaptiveDCSmoothing);
         } else {
           shared.dc_storage.Swap(smoothed_dc);

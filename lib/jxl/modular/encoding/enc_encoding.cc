@@ -549,13 +549,51 @@ Tree PredefinedTree(ModularOptions::TreeKind tree_kind, size_t total_pixels,
                            bitdepth);
     }
     case ModularOptions::TreeKind::kGradientFixedDC: {
-      std::vector<int32_t> cutoffs = {
+      std::vector<int32_t> cutoffs_x = {
           -500, -392, -255, -191, -127, -95, -63, -47, -31, -23, -15,
           -11,  -7,   -4,   -3,   -1,   0,   1,   3,   5,   7,   11,
           15,   23,   31,   47,   63,   95,  127, 191, 255, 392, 500};
-      return MakeFixedTree(
-          prevprop > 0 ? kNumNonrefProperties + 2 : kGradientProp, cutoffs,
-          Predictor::Gradient, total_pixels, bitdepth);
+      if (prevprop > 0) {
+        return MakeFixedTree(kNumNonrefProperties + 2, cutoffs_x,
+                             Predictor::Gradient, total_pixels, bitdepth);
+      }
+      std::vector<int32_t> cutoffs_y = {
+          -15, -3,  0,   7,   15,  23,  31,  47,  63,  79,  95,
+          127, 159, 191, 223, 255, 319, 367, 415, 463, 511, 575,
+          639, 703, 767, 831, 879, 911, 943, 967, 991, 1007, 1022};
+      std::vector<int32_t> cutoffs_b = {
+          -255, -191, -127, -95, -63, -47, -39, -31, -23, -19, -15,
+          -11,  -8,   -5,   -3,  -1,  0,   1,   3,   5,   8,   11,
+          15,   19,   23,   31,  39,  47,  63,  95,  127, 191, 255};
+      const size_t chan_px = std::max<size_t>(1, total_pixels / 3);
+      Tree sub[3] = {
+          MakeFixedTree(kGradientProp, cutoffs_y, Predictor::Gradient, chan_px,
+                        bitdepth),
+          MakeFixedTree(kGradientProp, cutoffs_x, Predictor::Gradient, chan_px,
+                        bitdepth),
+          MakeFixedTree(kGradientProp, cutoffs_b, Predictor::Gradient, chan_px,
+                        bitdepth),
+      };
+      const size_t s0 = sub[0].size();
+      const size_t s1 = sub[1].size();
+      const size_t s2 = sub[2].size();
+      Tree tree;
+      tree.reserve(2 + s0 + s1 + s2);
+      tree.push_back(PropertyDecisionNode::Split(0, 0, 1, 2));
+      tree.push_back(
+          PropertyDecisionNode::Split(0, 1, 2 + s0 + s1, 2 + s0));
+      size_t base = 2;
+      for (size_t c = 0; c < 3; ++c) {
+        for (PropertyDecisionNode node : sub[c]) {
+          if (node.property != -1) {
+            node.lchild += base;
+            node.rchild += base;
+          }
+          tree.push_back(node);
+        }
+        base += sub[c].size();
+      }
+      return tree;
     }
     case ModularOptions::TreeKind::kLearn: {
       JXL_DEBUG_ABORT("internal: kLearn is not predefined tree");

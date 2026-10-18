@@ -66,13 +66,21 @@ class ModularFrameEncoder {
       size_t dc_group_id, size_t ac_group_id,
       const FrameDimensions& patch_dim) const;
 
+  // Pre-quantizes the Y DC plane (channel 1) for a given DC group `r` into
+  // `quant_y_out` using the exact predictor and RDO settings of AddVarDCTDC.
+  Status QuantizeVarDCTYDC(const FrameHeader& frame_header, const Image3F& dc,
+                           const Rect& r, size_t group_index, bool nl_dc,
+                           PassesEncoderState* enc_state,
+                           ImageI* quant_y_out) const;
+
   // Creates a modular image for a given DC group of VarDCT mode. `dc` is the
   // input DC image, not quantized; the group is specified by `group_index`, and
   // `nl_dc` decides whether to apply a near-lossless processing to the DC or
-  // not.
+  // not. If `precomputed_quant_y` is non-null, channel 1 (Y) is copied from it.
   Status AddVarDCTDC(const FrameHeader& frame_header, const Image3F& dc,
                      const Rect& r, size_t group_index, bool nl_dc,
-                     PassesEncoderState* enc_state, bool jpeg_transcode);
+                     PassesEncoderState* enc_state, bool jpeg_transcode,
+                     const ImageI* precomputed_quant_y = nullptr);
   // Creates a modular image for the AC metadata of the given group
   // (`group_index`).
   Status AddACMetadata(const Rect& r, size_t group_index, bool jpeg_transcode,
