@@ -1586,12 +1586,27 @@ inline float DcGreedyRdCost(float s, const DcRdoParams& p, float w_aq) {
   return best;
 }
 
+constexpr int32_t kModular16BitMin = -32768;
+constexpr int32_t kModular16BitMax = 32767;
+
+inline int32_t ClampDcSample(int32_t v, bool clamp_i16) {
+  return clamp_i16 ? Clamp1<int32_t>(v, kModular16BitMin, kModular16BitMax) : v;
+}
+
+inline int32_t RoundAndClampDc(float v, bool clamp_i16) {
+  if (clamp_i16) {
+    v = Clamp1(v, static_cast<float>(kModular16BitMin),
+               static_cast<float>(kModular16BitMax));
+  }
+  return static_cast<int32_t>(std::round(v));
+}
+
 int QuantizeDcResidualRdo(const int32_t* qrow, size_t onerow, size_t c,
                           size_t x, size_t y, int32_t guess, float raw_target,
                           float diff_w, float w_aq, float target_w,
                           float target_n, bool has_e, float target_e,
                           float w_aq_e, bool has_s, float target_s,
-                          float target_sw, float w_aq_s) {
+                          float target_sw, float w_aq_s, bool clamp_i16) {
   float diff_adj = 0.0f;
   if (x > 0) {
     const float sw =
@@ -1646,7 +1661,7 @@ int QuantizeDcResidualRdo(const int32_t* qrow, size_t onerow, size_t c,
   }
 
   auto eval_cand = [&](int m, float rate_cost) -> float {
-    const int q_cand = guess + sign * m;
+    const int32_t q_cand = ClampDcSample(guess + sign * m, clamp_i16);
     const float err = target - static_cast<float>(q_cand);
     float total = rate_cost + (p.lambda_d * w_aq) * err * err;
     if (has_e) {
@@ -1674,7 +1689,7 @@ int QuantizeDcResidualRdo(const int32_t* qrow, size_t onerow, size_t c,
 
   const int best_m =
       (eval_cand(m1, cost_m1) < eval_cand(m0, cost_m0)) ? m1 : m0;
-  return guess + sign * best_m;
+  return ClampDcSample(guess + sign * best_m, clamp_i16);
 }
 
 int QuantizeWP(const int32_t* qrow, size_t onerow, size_t c, size_t x, size_t y,
@@ -1682,7 +1697,7 @@ int QuantizeWP(const int32_t* qrow, size_t onerow, size_t c, size_t x, size_t y,
                float inv_factor, bool enable_rdo, float diff_w, float w_aq,
                float target_w, float target_n, bool has_e, float target_e,
                float w_aq_e, bool has_s, float target_s, float target_sw,
-               float w_aq_s, bool* has_outliers) {
+               float w_aq_s, bool clamp_i16, bool* has_outliers) {
   const float raw_target = value * inv_factor;
   PredictionResult pred =
       PredictNoTreeWP(w, qrow + x, onerow, x, y, Predictor::Weighted, wp_state);
@@ -1691,18 +1706,18 @@ int QuantizeWP(const int32_t* qrow, size_t onerow, size_t c, size_t x, size_t y,
       svalue > static_cast<float>(std::numeric_limits<int>::max()) ||
       svalue < static_cast<float>(std::numeric_limits<int>::min())) {
     *has_outliers = true;
-    return pred.guess;
+    return ClampDcSample(pred.guess, clamp_i16);
   }
   if (!enable_rdo) {
     if (svalue > -q_deadzone && svalue < q_deadzone) svalue = 0;
     int residual = std::round(svalue);
     if (residual > 2 || residual < -2) residual = std::round(svalue * 0.5f) * 2;
-    return residual + pred.guess;
+    return ClampDcSample(residual + pred.guess, clamp_i16);
   }
   return QuantizeDcResidualRdo(qrow, onerow, c, x, y, pred.guess, raw_target,
                                diff_w, w_aq, target_w, target_n, has_e,
                                target_e, w_aq_e, has_s, target_s, target_sw,
-                               w_aq_s);
+                               w_aq_s, clamp_i16);
 }
 
 int QuantizeGradient(const int32_t* qrow, size_t onerow, size_t c, size_t x,
@@ -1710,7 +1725,7 @@ int QuantizeGradient(const int32_t* qrow, size_t onerow, size_t c, size_t x,
                      bool enable_rdo, float diff_w, float w_aq, float target_w,
                      float target_n, bool has_e, float target_e, float w_aq_e,
                      bool has_s, float target_s, float target_sw, float w_aq_s,
-                     bool* has_outliers) {
+                     bool clamp_i16, bool* has_outliers) {
   const float raw_target = value * inv_factor;
   PredictionResult pred =
       PredictNoTreeNoWP(w, qrow + x, onerow, x, y, Predictor::Gradient);
@@ -1719,18 +1734,18 @@ int QuantizeGradient(const int32_t* qrow, size_t onerow, size_t c, size_t x,
       svalue > static_cast<float>(std::numeric_limits<int>::max()) ||
       svalue < static_cast<float>(std::numeric_limits<int>::min())) {
     *has_outliers = true;
-    return pred.guess;
+    return ClampDcSample(pred.guess, clamp_i16);
   }
   if (!enable_rdo) {
     if (svalue > -q_deadzone && svalue < q_deadzone) svalue = 0;
     int residual = std::round(svalue);
     if (residual > 2 || residual < -2) residual = std::round(svalue * 0.5f) * 2;
-    return residual + pred.guess;
+    return ClampDcSample(residual + pred.guess, clamp_i16);
   }
   return QuantizeDcResidualRdo(qrow, onerow, c, x, y, pred.guess, raw_target,
                                diff_w, w_aq, target_w, target_n, has_e,
                                target_e, w_aq_e, has_s, target_s, target_sw,
-                               w_aq_s);
+                               w_aq_s, clamp_i16);
 }
 
 Status ModularFrameEncoder::QuantizeVarDCTYDC(
@@ -1741,12 +1756,15 @@ Status ModularFrameEncoder::QuantizeVarDCTYDC(
   JXL_ENSURE(frame_header.chroma_subsampling.Is444());
   const float mul = nl_dc ? 2.0f : 1.0f;
   const float inv_factor = enc_state->shared.quantizer.GetInvDcStep(1) * mul;
+  const bool clamp_i16 =
+      enc_state->shared.metadata != nullptr &&
+      enc_state->shared.metadata->m.modular_16_bit_buffer_sufficient;
   if (!nl_dc) {
     for (size_t y = 0; y < r.ysize(); ++y) {
       const float* JXL_RESTRICT row = r.ConstPlaneRow(dc, 1, y);
       int32_t* JXL_RESTRICT qrow = r.Row(quant_y_out, y);
       for (size_t x = 0; x < r.xsize(); ++x) {
-        qrow[x] = std::round(row[x] * inv_factor);
+        qrow[x] = RoundAndClampDc(row[x] * inv_factor, clamp_i16);
       }
     }
     return true;
@@ -1801,7 +1819,7 @@ Status ModularFrameEncoder::QuantizeVarDCTYDC(
       quant_row[x] = QuantizeGradient(
           quant_row, stride, 1, x, y, r.xsize(), row[x], inv_factor, enable_rdo,
           diff_w, w_aq, target_w, target_n, has_e, target_e, w_aq_e, has_s,
-          target_s, target_sw, w_aq_s, &has_outliers);
+          target_s, target_sw, w_aq_s, clamp_i16, &has_outliers);
     }
   }
   if (has_outliers) {
@@ -1820,6 +1838,9 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
   extra_dc_precision[group_index] = nl_dc ? 1 : 0;
   float mul = 1 << extra_dc_precision[group_index];
   bool has_outliers = false;
+  const bool clamp_i16 =
+      enc_state->shared.metadata != nullptr &&
+      enc_state->shared.metadata->m.modular_16_bit_buffer_sufficient;
 
   size_t stream_id = ModularStreamId::VarDCTDC(group_index).ID(frame_dim_);
   stream_options_[stream_id].max_chan_size = 0xFFFFFF;
@@ -1932,13 +1953,14 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
               quant_row[x] = QuantizeGradient(
                   quant_row, stride, c, x, y, r.xsize(), row[x], inv_factor,
                   enable_rdo, diff_w, w_aq, target_w, target_n, has_e, target_e,
-                  w_aq_e, has_s, target_s, target_sw, w_aq_s, &has_outliers);
+                  w_aq_e, has_s, target_s, target_sw, w_aq_s, clamp_i16,
+                  &has_outliers);
             } else {
               quant_row[x] = QuantizeWP(
                   quant_row, stride, c, x, y, r.xsize(), &wp_state, row[x],
                   inv_factor, enable_rdo, diff_w, w_aq, target_w, target_n,
                   has_e, target_e, w_aq_e, has_s, target_s, target_sw, w_aq_s,
-                  &has_outliers);
+                  clamp_i16, &has_outliers);
               wp_state.UpdateErrors(quant_row[x], x, y, r.xsize());
             }
           }
@@ -1996,13 +2018,14 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
               quant_row[x] = QuantizeGradient(
                   quant_row, stride, c, x, y, r.xsize(), val_c, inv_factor,
                   enable_rdo, diff_w, w_aq, target_w, target_n, has_e, target_e,
-                  w_aq_e, has_s, target_s, target_sw, w_aq_s, &has_outliers);
+                  w_aq_e, has_s, target_s, target_sw, w_aq_s, clamp_i16,
+                  &has_outliers);
             } else {
               quant_row[x] = QuantizeWP(
                   quant_row, stride, c, x, y, r.xsize(), &wp_state, val_c,
                   inv_factor, enable_rdo, diff_w, w_aq, target_w, target_n,
                   has_e, target_e, w_aq_e, has_s, target_s, target_sw, w_aq_s,
-                  &has_outliers);
+                  clamp_i16, &has_outliers);
               wp_state.UpdateErrors(quant_row[x], x, y, r.xsize());
             }
           }
@@ -2026,15 +2049,16 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
             continue;
           }
           for (size_t x = 0; x < r.xsize(); x++) {
-            quant_row[x] = std::round(row[x] * inv_factor);
+            quant_row[x] = RoundAndClampDc(row[x] * inv_factor, clamp_i16);
           }
         } else {
           int32_t* quant_row_y =
               stream_images_[stream_id].channel[0].plane.Row(y);
           for (size_t x = 0; x < r.xsize(); x++) {
-            quant_row[x] =
-                std::round((row[x] - quant_row_y[x] * (y_factor * cfl_factor)) *
-                           inv_factor);
+            quant_row[x] = RoundAndClampDc(
+                (row[x] - quant_row_y[x] * (y_factor * cfl_factor)) *
+                    inv_factor,
+                clamp_i16);
           }
         }
       }
@@ -2056,7 +2080,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
         int32_t* quant_row = ch.plane.Row(y);
         const float* row = rect.ConstPlaneRow(dc, c, y);
         for (size_t x = 0; x < xs; x++) {
-          quant_row[x] = std::round(row[x] * inv_factor);
+          quant_row[x] = RoundAndClampDc(row[x] * inv_factor, clamp_i16);
         }
       }
     }

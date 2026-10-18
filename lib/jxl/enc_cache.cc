@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -93,18 +94,24 @@ double HistogramEntropyBits(const uint32_t hist[64], uint32_t total_n,
   return bits;
 }
 
+// Maximum |q_val| in EvalChromaDcChannelCost when 16-bit Modular buffers are
+// used. QuantizeDcResidualRdo in AddVarDCTDC can shift a block's quantized DC
+// value by at most |diff_adj| + |best_m - abs_s| <= 0.15 + 2.0 = 2.15 from
+// raw_target, while q_val is within 1.0 of raw_target, so |q_out - q_val| <= 4.
+// 32760 leaves 7 steps of margin below int16_t max (32767).
+constexpr int32_t kMaxSafeAbsQ = 32760;
+
 struct DcChannelRdCost {
   double bits = 0.0;
   double dist = 0.0;
+  bool valid = true;
   double total(double lambda_dist) const { return bits + lambda_dist * dist; }
 };
 
-DcChannelRdCost EvalChromaDcChannelCost(const FrameDimensions& frame_dim,
-                                        const Image3F& dc_src,
-                                        const Image3F& dc_orig,
-                                        const ImageI& quant_y, size_t c,
-                                        float inv_dc_c, float half_y_step,
-                                        float k_ratio, float b_y_comp) {
+DcChannelRdCost EvalChromaDcChannelCost(
+    const FrameDimensions& frame_dim, const Image3F& dc_src,
+    const Image3F& dc_orig, const ImageI& quant_y, size_t c, float inv_dc_c,
+    float half_y_step, float k_ratio, float b_y_comp, int32_t max_abs_q) {
   const float y_comp = (c == 2) ? b_y_comp : 0.0f;
   const float yk_eff = half_y_step * (k_ratio - y_comp);
   const float inv_f = inv_dc_c * 2.0f;
@@ -144,6 +151,13 @@ DcChannelRdCost EvalChromaDcChannelCost(const FrameDimensions& frame_dim,
           }
         }
         const int32_t q_val = guess + res;
+        if (max_abs_q < std::numeric_limits<int32_t>::max() &&
+            (std::abs(raw_target) > static_cast<float>(max_abs_q) ||
+             q_val > max_abs_q || q_val < -max_abs_q)) {
+          DcChannelRdCost out;
+          out.valid = false;
+          return out;
+        }
         q_cur[x] = q_val;
         const float err = orig_target - static_cast<float>(q_val);
         dist += static_cast<double>(err * err);
@@ -168,6 +182,10 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
   const float base_b = shared->cmap.base().GetBaseCorrelationB();
   const float color_factor = shared->cmap.base().GetColorFactor();
   const float b_y_comp = has_dc_rdo ? 0.75f : 0.0f;
+  const bool clamp_i16 = shared->metadata != nullptr &&
+                         shared->metadata->m.modular_16_bit_buffer_sufficient;
+  const int32_t max_abs_q =
+      clamp_i16 ? kMaxSafeAbsQ : std::numeric_limits<int32_t>::max();
 
   // Check if AC CfL already modified the global ColorCorrelation header.
   const bool header_already_paid =
@@ -275,9 +293,13 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
       const float ratio = (c == 0) ? shared->cmap.base().YtoXRatio(idx)
                                    : shared->cmap.base().YtoBRatio(idx);
       return EvalChromaDcChannelCost(frame_dim, dc, dc, quant_y, c, inv_dc,
-                                     half_y_step, ratio, b_y_comp);
+                                     half_y_step, ratio, b_y_comp, max_abs_q);
     };
     const DcChannelRdCost base = eval(0);
+    if (!base.valid) {
+      *out_gain = 0.0;
+      return 0;
+    }
     const double base_score = base.total(lambda_d);
     double best_score = base_score;
     int32_t best_idx = 0;
@@ -288,7 +310,7 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
       if (seen[cand + 128]) return;
       seen[cand + 128] = true;
       const DcChannelRdCost cost = eval(cand);
-      if (cost.dist > base.dist * 1.03) return;
+      if (!cost.valid || cost.dist > base.dist * 1.03) return;
       const double score = cost.total(lambda_d);
       if (score < best_score) {
         best_score = score;
@@ -621,9 +643,14 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
           }
         }
         // Incremental U64 header cost for kSkipAdaptiveDCSmoothing (flag=128).
+        const uint64_t effective_flags =
+            frame_header.flags |
+            (shared.image_features.patches.HasAny() ? FrameHeader::kPatches
+                                                    : 0) |
+            (shared.image_features.splines.HasAny() ? FrameHeader::kSplines
+                                                    : 0);
         const double skip_header_bits =
-            (frame_header.flags == 0) ? 8.0
-                                      : (frame_header.flags < 17 ? 4.0 : 0.0);
+            (effective_flags == 0) ? 8.0 : (effective_flags < 17 ? 4.0 : 0.0);
         const double skip_threshold = 0.25 * skip_header_bits;
         if (total_delta > skip_threshold) {
           frame_header.UpdateFlag(true, FrameHeader::kSkipAdaptiveDCSmoothing);
