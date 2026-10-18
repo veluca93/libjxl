@@ -218,7 +218,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
                          const ImageF& xyb_y, const ImageF& xyb_b,
                          const Rect& rect_in, const float scale,
                          const Rect& rect_out, ImageF* out,
-                         ImageF (*band_qf)[4]) {
+                         ImageF (*band_qf)[4], bool has_noise) {
   float base_level = 0.48f * scale;
   float kDampenRampStart = 2.0f;
   float kDampenRampEnd = 14.0f;
@@ -440,23 +440,37 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
           const float edge_loc =
               Clamp1(E[c][0] / (E0_harm[c] + 1e-4f), 1.0f, 2.5f);
           const float edge_boost = 1.0f + 0.08f * std::max(0.0f, edge_loc - 1.20f);
-          const float tex_excess = std::max(0.0f, E0_harm[1] - 0.014f);
+          const bool use_chroma_csf = (c != 1) && !has_noise;
+          const float c_tex_harm =
+              use_chroma_csf ? (0.75f * E0_harm[c] + 0.25f * E0_harm[1])
+                             : E0_harm[1];
+          const float tex_thresh = use_chroma_csf ? 0.012f : 0.014f;
+          const float tex_excess = std::max(0.0f, c_tex_harm - tex_thresh);
           for (size_t s = 0; s < 4; ++s) {
             const float rel = (E[c][s] + eps) / e_avg;
             float phi = Clamp1(0.95f + 0.07f * rel, 0.92f, 1.22f) * c_boost;
             if (s == 0) {
               const float hf_mask =
-                  1.0f / (1.0f + 0.32f * (tex_excess / 0.014f) / (edge_loc * edge_loc));
-              phi *= hf_mask * edge_boost;
+                  1.0f / (1.0f + 0.32f * (tex_excess / tex_thresh) /
+                                     (edge_loc * edge_loc));
+              const float c_s0_csf =
+                  use_chroma_csf
+                      ? (0.94f + 0.06f * Clamp1(edge_loc - 1.25f, 0.0f, 1.0f))
+                      : 1.0f;
+              phi *= hf_mask * edge_boost * c_s0_csf;
             } else if (s == 1) {
               const float hf_mask =
-                  1.0f / (1.0f + 0.15f * (tex_excess / 0.014f) / edge_loc);
-              phi *= hf_mask * 1.02f;
+                  1.0f / (1.0f + 0.15f * (tex_excess / tex_thresh) / edge_loc);
+              const float c_s1_csf =
+                  use_chroma_csf
+                      ? (1.01f + 0.04f * Clamp1(edge_loc - 1.20f, 0.0f, 1.0f))
+                      : 1.02f;
+              phi *= hf_mask * c_s1_csf;
             } else if (s == 2) {
-              phi *= 1.02f;
+              phi *= use_chroma_csf ? 1.05f : 1.02f;
             } else {
               // Coarse scale (s = 3, 1:8 LF) cascades across all pyramid levels.
-              phi *= 1.06f;
+              phi *= use_chroma_csf ? 1.09f : 1.06f;
             }
             const float mod_phi =
                 1.0f + band_dist_w * (Clamp1(phi, 0.72f, 1.32f) - 1.0f);
@@ -471,7 +485,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
 struct AdaptiveQuantizationImpl {
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
                      const Rect& rect_in, const Rect& rect_out,
-                     ImageF* mask1x1, ImageF (*band_qf)[4]) {
+                     ImageF* mask1x1, ImageF (*band_qf)[4], bool has_noise) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
     const size_t xsize = xyb.xsize();
@@ -529,7 +543,7 @@ struct AdaptiveQuantizationImpl {
 
     PerBlockModulations(butteraugli_target, xyb.Plane(0), xyb.Plane(1),
                         xyb.Plane(2), rect_in, scale, rect_out, &aq_map,
-                        band_qf);
+                        band_qf, has_noise);
     return true;
   }
   ImageF aq_map;
@@ -569,7 +583,8 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
                                          const Image3F& xyb, const Rect& rect,
                                          float scale, ThreadPool* pool,
                                          ImageF* mask1x1,
-                                         ImageF (*band_qf)[4]) {
+                                         ImageF (*band_qf)[4],
+                                         bool has_noise) {
   JXL_ENSURE(rect.xsize() % kBlockDim == 0);
   JXL_ENSURE(rect.ysize() % kBlockDim == 0);
   AdaptiveQuantizationImpl impl;
@@ -600,7 +615,8 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
     Rect rect_out(bx0, by0, bx1 - bx0, by1 - by0);
     JXL_RETURN_IF_ERROR(impl.ComputeTile(butteraugli_target, scale, xyb, rect,
-                                         rect_out, mask1x1, band_qf));
+                                         rect_out, mask1x1, band_qf,
+                                         has_noise));
     return true;
   };
   size_t num_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks) *
@@ -1162,11 +1178,12 @@ float InitialQuantDC(float butteraugli_target) {
 StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* mask1x1, ImageF (*band_qf)[4]) {
+                                   ImageF* mask1x1, ImageF (*band_qf)[4],
+                                   bool has_noise) {
   const float quant_ac = kAcQuant / std::max(1e-4f, butteraugli_target);
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
       butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask1x1,
-      band_qf);
+      band_qf, has_noise);
 }
 
 Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,

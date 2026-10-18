@@ -144,8 +144,11 @@ static JXL_INLINE void ComputeBlockThresholds(
     zero_thres[1][3] +=
         -0.002f * hr_w + dz_w_rt * (0.0025f + 0.0115f * activity);
     for (int cc : {0, 2}) {
-      zero_thres[cc][1] += 0.18f * luma_hf_dz;
-      zero_thres[cc][2] += 0.18f * luma_hf_dz;
+      const float c_mf_ratio = band_q[cc][2] / std::max(q_block, 1e-4f);
+      const float c_luma_mask_w =
+          Clamp1(1.0f - (c_mf_ratio - 1.04f) * 4.0f, 0.0f, 1.0f);
+      zero_thres[cc][1] += 0.18f * luma_hf_dz * c_luma_mask_w;
+      zero_thres[cc][2] += 0.18f * luma_hf_dz * c_luma_mask_w;
       zero_thres[cc][3] += 0.005f * dz_w_rt + 0.40f * luma_hf_dz;
     }
   }
@@ -168,7 +171,8 @@ StatusOr<ImageF> InitialQuantField(float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
                                    ImageF* initial_quant_mask1x1,
-                                   ImageF (*band_qf)[4] = nullptr);
+                                   ImageF (*band_qf)[4] = nullptr,
+                                   bool has_noise = false);
 
 float InitialQuantDC(float butteraugli_target);
 

@@ -16,11 +16,18 @@
 namespace jxl {
 
 struct AuxOut;
+struct FrameHeader;
 struct PassesEncoderState;
+class ThreadPool;
 
 // Fills DC
 Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
                            const Image3F& opsin, const Rect& rect, Image3F* dc);
+
+Status RefineQuantFieldClosedLoop(const FrameHeader& frame_header,
+                                  const Image3F& opsin, const Rect& rect,
+                                  ThreadPool* pool,
+                                  PassesEncoderState* enc_state);
 
 Status EncodeGroupTokenizedCoefficients(size_t group_idx, size_t pass_idx,
                                         size_t histogram_idx,

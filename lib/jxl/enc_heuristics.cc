@@ -2717,7 +2717,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
                           1.0f, &initial_quant_masking1x1,
-                          enable_rdo ? enc_state->band_qf : nullptr));
+                          enable_rdo ? enc_state->band_qf : nullptr,
+                          (frame_header.flags & FrameHeader::kNoise) != 0));
     float q = 0.39 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }

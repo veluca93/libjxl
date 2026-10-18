@@ -405,6 +405,8 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
   if (enc_state->token_cost_model != nullptr) {
     JXL_RETURN_IF_ERROR(BuildPass2FrozenTokenCostModel(
         frame_header, opsin, rect, pool, enc_state));
+    JXL_RETURN_IF_ERROR(RefineQuantFieldClosedLoop(frame_header, opsin, rect,
+                                                   pool, enc_state));
   }
 
   JXL_ASSIGN_OR_RETURN(
