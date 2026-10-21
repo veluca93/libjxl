@@ -24,3 +24,9 @@ tools/conformance/__pycache__
 
 # macOS Finder state files
 .DS_Store
+
+# jxl_wasserstein Python virtualenv and build/test caches
+tools/jxl_wasserstein/.venv/
+tools/jxl_wasserstein/.pytest_cache/
+tools/jxl_wasserstein/**/__pycache__/
+tools/jxl_wasserstein/**/*.egg-info/

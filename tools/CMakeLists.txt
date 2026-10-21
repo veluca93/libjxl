@@ -188,6 +188,7 @@ if(JPEGXL_ENABLE_DEVTOOLS)
     ssimulacra2
     xyb_range
     jxl_from_tree
+    jxl_wasserstein_helper
     icc_simplify
   )
 
@@ -209,6 +210,7 @@ if(JPEGXL_ENABLE_DEVTOOLS)
   add_executable(generate_lut_template hdr/generate_lut_template.cc)
   add_executable(xyb_range xyb_range.cc)
   add_executable(jxl_from_tree jxl_from_tree.cc)
+  add_executable(jxl_wasserstein_helper jxl_wasserstein_helper.cc)
   add_executable(icc_simplify icc_simplify.cc)
 
   list(APPEND FUZZER_CORPUS_BINARIES djxl_fuzzer_corpus)

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jxl-wasserstein"
+version = "0.1.0"
+description = "Gradient-based JPEG XL Wasserstein Distortion encoder and differentiable JXL entropy proxy in JAX"
+requires-python = ">=3.11"
+dependencies = [
+    "jax[cuda12]",
+    "flax",
+    "optax",
+    "chex",
+    "numpy",
+    "scipy",
+    "Pillow",
+    "h5py",
+    "pytest",
+]
+
+[project.scripts]
+jxl-wasserstein = "jxl_wasserstein.cli:main"
+jxl-wasserstein-benchmark = "jxl_wasserstein.benchmark:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["jxl_wasserstein*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
