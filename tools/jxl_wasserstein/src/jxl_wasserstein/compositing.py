@@ -27,6 +27,7 @@ and `compute_spatial_rate_map_bits`). Zero `libjxl` per-block choices (`dump_ini
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 import functools
@@ -37,6 +38,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
+_CPP_ENCODE_POOL = ThreadPoolExecutor(max_workers=4)
 
 _JAX_CACHE_DIR = "/tmp/jxl_wasserstein_jax_cache"
 try:
@@ -97,13 +100,20 @@ from jxl_wasserstein.forward_model import (
     upsample_jxl,
 )
 from jxl_wasserstein.optimizer import (
+    DEFAULT_CANDIDATE_AC_STRATEGIES,
     _compute_precond_scales_jax,
     _jit_extract_vgg_features,
     _jit_wd_eval_chw,
     _jit_wd_val_and_grad_chw,
     _normalize_init_mode,
+    broadcast_quant_field_to_ac_strategy,
     mask_llf_jax,
+    mask_llf_numpy,
+    select_cfl_jax,
     select_num_scales,
+    select_quant_and_epf_jax,
+    stage2_select_non_overlapping_ac_strategy,
+    validate_ac_strategy_tiling,
 )
 from jxl_wasserstein.vgg import load_vgg16_params
 from jxl_wasserstein.wasserstein import compute_spatial_wd_map, compute_wd
@@ -310,16 +320,47 @@ def _parse_alpha_blend_mode(alpha_blend_mode: int | str | None) -> int | str:
   return bm_int
 
 
-def _resolve_custom_dequant_flag(
-    custom_dequant: bool | None = None,
-    opt_custom_dequant: bool | None = None,
-    optimize_dequant: bool | None = None,
-    optimize_dequant_matrices: bool | None = None,
-    enable_custom_dequant: bool | None = None,
-    use_custom_dequant: bool | None = None,
-    default: bool = True,
-) -> bool:
-  """Resolves `custom_dequant` boolean across all alias keyword arguments."""
+def calibrate_rd_lambda(distance: float) -> float:
+  """Calibrates Stage 1/2/3 Rate-WD Lagrangian multiplier smoothly across all `d`."""
+  d = max(float(distance), 0.05)
+  if d < 1.0:
+    return float(0.08 * (d ** 1.55))
+  return float(0.08 * (d ** 1.15))
+
+
+def _calibrate_ref_distance(
+    d_main: float, eff_lambda: float, ref_distance: float | None = None
+) -> float:
+  """Calibrates ReferenceOnly frame distance from `d_main` (amortized by 1/U^2 pixel area)."""
+  del eff_lambda
+  if ref_distance is not None:
+    return float(ref_distance)
+  return max(0.10, max(float(d_main), 0.05) * 0.72)
+
+
+def estimate_frame_bits(height: int, width: int, distance: float) -> float:
+  """Estimates frame bit budget `N * 0.85 * max(d, 0.05)^(-0.78)` from frame dimensions & distance."""
+  n_px = float(max(int(height) * int(width), 1))
+  d_eff = max(float(distance), 0.05)
+  return float(n_px * 0.85 * (d_eff ** -0.78))
+
+
+DEQUANT_MODE_DOF: dict[str, int] = {
+    "none": 0,
+    "compact": 9,
+    "full_bands": 33,
+}
+
+
+def _resolve_custom_dequant_spec(
+    custom_dequant: bool | str | None = None,
+    opt_custom_dequant: bool | str | None = None,
+    optimize_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
+) -> bool | str | None:
+  """Resolves `custom_dequant` specification (`bool | str | None`) across alias arguments."""
   for val in (
       custom_dequant,
       opt_custom_dequant,
@@ -329,8 +370,134 @@ def _resolve_custom_dequant_flag(
       use_custom_dequant,
   ):
     if val is not None:
+      if isinstance(val, str):
+        v_low = val.strip().lower()
+        if v_low in ("true", "1", "yes"):
+          return True
+        if v_low in ("false", "0", "no"):
+          return False
+        if v_low in ("auto", "none", "compact", "full_bands"):
+          return v_low
+        raise ValueError(
+            f"Unsupported custom_dequant mode {val!r}; expected bool or one of "
+            "{'auto', 'none', 'compact', 'full_bands'}"
+        )
       return bool(val)
-  return bool(default)
+  return None
+
+
+def _resolve_custom_dequant_flag(
+    custom_dequant: bool | str | None = None,
+    opt_custom_dequant: bool | str | None = None,
+    optimize_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
+    default: bool = True,
+) -> bool:
+  """Resolves `custom_dequant` boolean across all alias keyword arguments."""
+  spec = _resolve_custom_dequant_spec(
+      custom_dequant=custom_dequant,
+      opt_custom_dequant=opt_custom_dequant,
+      optimize_dequant=optimize_dequant,
+      optimize_dequant_matrices=optimize_dequant_matrices,
+      enable_custom_dequant=enable_custom_dequant,
+      use_custom_dequant=use_custom_dequant,
+  )
+  if spec is None:
+    return bool(default)
+  if isinstance(spec, str):
+    return spec != "none"
+  return bool(spec)
+
+
+def select_dequant_mode_for_frame(
+    height: int,
+    width: int,
+    distance: float,
+    custom_dequant: bool | str | None = None,
+    *,
+    is_reference: bool = False,
+) -> str:
+  """Selects `DequantMatrices` parameterization (`'none'`, `'compact'`, `'full_bands'`) from frame bit budget.
+
+  - `< 16 kbits`: `'none'` (0 DoF, default library weights, 1-bit overhead).
+  - `16 kbits <= bits < 96 kbits`: `'compact'` (9 DoF: 3 channel scales + 3 frequency tilts + 3 high-freq tapers).
+  - `>= 96 kbits`: `'full_bands'` (33 DoF: 3 channel scales + 24 radial log-freq band multipliers + 6 LF corners).
+  """
+  if isinstance(custom_dequant, str):
+    cd_low = custom_dequant.strip().lower()
+    if cd_low in ("none", "compact", "full_bands"):
+      return cd_low
+    if cd_low != "auto":
+      raise ValueError(f"Unknown dequant mode: {custom_dequant!r}")
+  elif custom_dequant is False:
+    return "none"
+
+  est_bits = estimate_frame_bits(height, width, distance)
+  if custom_dequant is True:
+    if is_reference and est_bits < 16_000.0:
+      return "none"
+    return "full_bands" if est_bits >= 96_000.0 else "compact"
+
+  if est_bits < 16_000.0:
+    return "none"
+  if est_bits < 96_000.0:
+    return "compact"
+  return "full_bands"
+
+
+def _init_dq_log_vec(dq_mode: str, *, is_reference: bool = False) -> jax.Array:
+  """Initializes the `dq_log_scale` parameter vector of shape `(0,)`, `(9,)`, or `(33,)`."""
+  del is_reference
+  if dq_mode == "none":
+    return jnp.zeros((0,), dtype=jnp.float32)
+  if dq_mode == "compact":
+    return jnp.zeros((9,), dtype=jnp.float32)
+  if dq_mode == "full_bands":
+    return jnp.zeros((33,), dtype=jnp.float32)
+  raise ValueError(f"Unsupported dq_mode: {dq_mode!r}")
+
+
+def _init_frame_state_with_aq_epf_cfl(
+    srgb_hwc: np.ndarray | jax.Array,
+    distance: float,
+    *,
+    ac_strategy: np.ndarray | None = None,
+    ac_anchors: np.ndarray | None = None,
+    gab: bool | None = None,
+    enable_noise: bool = False,
+) -> JxlVarDCTState:
+  """Initializes a `JxlVarDCTState` with adaptive `raw_quant_field`, `epf_iters`, and CfL."""
+  arr = _normalize_srgb_hwc(srgb_hwc)
+  h, w, _ = arr.shape
+  h8, w8 = (h + 7) // 8, (w + 7) // 8
+  eff_gab = bool(float(distance) > 0.5) if gab is None else bool(gab)
+  acs = (
+      np.asarray(ac_strategy, dtype=np.int32)
+      if ac_strategy is not None
+      else np.zeros((h8, w8), dtype=np.int32)
+  )
+  raw_quant_field, epf_sharpness, epf_iters = select_quant_and_epf_jax(
+      arr, distance=float(distance), ac_strategy=acs
+  )
+  ytox_map, ytob_map, ytox_dc, ytob_dc = select_cfl_jax(arr, gab=eff_gab)
+  if enable_noise:
+    ytox_dc, ytob_dc = 0, 0
+  return init_state_from_rgb_jax(
+      arr,
+      distance=float(distance),
+      epf_iters=int(epf_iters),
+      gab=eff_gab,
+      ac_strategy=ac_strategy,
+      ac_anchors=ac_anchors,
+      raw_quant_field=raw_quant_field,
+      epf_sharpness=epf_sharpness,
+      ytox_map=ytox_map,
+      ytob_map=ytob_map,
+      ytox_dc=int(ytox_dc),
+      ytob_dc=int(ytob_dc),
+  )
 
 
 def estimate_noise_lut_jax(xyb_chw: jax.Array) -> jax.Array:
@@ -344,109 +511,560 @@ def estimate_noise_lut_jax(xyb_chw: jax.Array) -> jax.Array:
   return jnp.full((8,), base, dtype=jnp.float32)
 
 
+_TARGET_FEATS_CACHE: dict[tuple[Any, ...], list[jax.Array]] = {}
+
+
+def _get_cached_target_feats(
+    target_hwc: jax.Array, vgg_params: Any, eff_scales: int
+) -> list[jax.Array]:
+  h, w = int(target_hwc.shape[0]), int(target_hwc.shape[1])
+  max_s = max(int(eff_scales), int(select_num_scales(h, w, max_scales=3)))
+  key = (
+      h,
+      w,
+      max_s,
+      round(float(target_hwc[0, 0, 0]), 6),
+      round(float(target_hwc[h // 2, w // 2, 1]), 6),
+      round(float(target_hwc[-1, -1, 2]), 6),
+  )
+  if key not in _TARGET_FEATS_CACHE:
+    _TARGET_FEATS_CACHE.clear()
+    _TARGET_FEATS_CACHE[key] = _jit_extract_vgg_features(
+        vgg_params, jnp.moveaxis(target_hwc, -1, 0), eff_scales=max_s
+    )
+  return list(_TARGET_FEATS_CACHE[key][: 1 + 5 * int(eff_scales)])
+
+
 @functools.lru_cache(maxsize=8)
 def _get_compiled_wd_val_and_grad(num_levels: int = 2, num_scales: int = 3):
-  return jax.jit(
-      jax.value_and_grad(compute_wd, argnums=0),
-      static_argnames=("num_levels", "num_scales"),
-  )
+  def _fn(
+      rec_hwc: jax.Array,
+      target_hwc: jax.Array,
+      vgg_params: Any,
+      log2_sigma: float = 1.0,
+      num_levels: int = num_levels,
+      num_scales: int = num_scales,
+  ) -> tuple[jax.Array, jax.Array]:
+    h, w = int(rec_hwc.shape[0]), int(rec_hwc.shape[1])
+    eff_scales = int(select_num_scales(h, w, max_scales=int(num_scales)))
+    t_feats = _get_cached_target_feats(target_hwc, vgg_params, eff_scales)
+    ls_map = jnp.full((h, w), float(log2_sigma), dtype=jnp.float32)
+    wd_v, g_chw = _jit_wd_val_and_grad_chw(
+        vgg_params,
+        jnp.moveaxis(rec_hwc, -1, 0),
+        t_feats,
+        ls_map,
+        eff_scales,
+        int(num_levels),
+    )
+    return wd_v, jnp.moveaxis(g_chw, 0, -1)
+
+  return _fn
 
 
 @functools.lru_cache(maxsize=8)
 def _get_compiled_wd_only(num_levels: int = 2, num_scales: int = 3):
-  return jax.jit(
-      compute_wd,
-      static_argnames=("num_levels", "num_scales"),
-  )
+  def _fn(
+      rec_hwc: jax.Array,
+      target_hwc: jax.Array,
+      vgg_params: Any,
+      log2_sigma: float = 1.0,
+      num_levels: int = num_levels,
+      num_scales: int = num_scales,
+  ) -> jax.Array:
+    h, w = int(rec_hwc.shape[0]), int(rec_hwc.shape[1])
+    eff_scales = int(select_num_scales(h, w, max_scales=int(num_scales)))
+    t_feats = _get_cached_target_feats(target_hwc, vgg_params, eff_scales)
+    ls_map = jnp.full((h, w), float(log2_sigma), dtype=jnp.float32)
+    return _jit_wd_eval_chw(
+        vgg_params,
+        jnp.moveaxis(rec_hwc, -1, 0),
+        t_feats,
+        ls_map,
+        eff_scales,
+        int(num_levels),
+    )
+
+  return _fn
 
 
 @functools.lru_cache(maxsize=8)
 def _get_compiled_spatial_wd_map(
     block_size: int = 8, num_levels: int = 2, num_scales: int = 3
 ):
-  return jax.jit(
-      compute_spatial_wd_map,
-      static_argnames=("block_size", "num_levels", "num_scales"),
+  from jxl_wasserstein.optimizer import _jit_spatial_wd_map_chw
+
+  def _fn(
+      rec_hwc: jax.Array,
+      target_hwc: jax.Array,
+      vgg_params: Any,
+      block_size: int = block_size,
+      log2_sigma: float = 1.0,
+      num_levels: int = num_levels,
+      num_scales: int = num_scales,
+  ) -> tuple[jax.Array, jax.Array]:
+    h, w = int(rec_hwc.shape[0]), int(rec_hwc.shape[1])
+    if int(block_size) != 8:
+      return compute_spatial_wd_map(
+          rec_hwc,
+          target_hwc,
+          vgg_params,
+          block_size=int(block_size),
+          log2_sigma=float(log2_sigma),
+          num_levels=int(num_levels),
+          num_scales=int(num_scales),
+      )
+    h8, w8 = (h + 7) // 8, (w + 7) // 8
+    eff_scales = int(select_num_scales(h, w, max_scales=int(num_scales)))
+    t_feats = _get_cached_target_feats(target_hwc, vgg_params, eff_scales)
+    ls_map = jnp.full((h, w), float(log2_sigma), dtype=jnp.float32)
+    return _jit_spatial_wd_map_chw(
+        vgg_params,
+        jnp.moveaxis(rec_hwc, -1, 0),
+        t_feats,
+        ls_map,
+        h8,
+        w8,
+        eff_scales,
+        int(num_levels),
+    )
+
+  return _fn
+
+
+def _precompute_dq_geometry(
+    used_s: Sequence[int], default_dq: dict[int, np.ndarray]
+) -> dict[int, dict[str, Any]]:
+  """Precomputes radial coordinates, 8-band interpolation indices, and LF corner masks per AcStrategy."""
+  geom: dict[int, dict[str, Any]] = {}
+  for s in used_s:
+    s_int = int(s)
+    wrows, wcols = default_dq[s_int].shape[1], default_dq[s_int].shape[2]
+    cy = int(ACS_COVERED_BLOCKS_Y[s_int])
+    cx = int(ACS_COVERED_BLOCKS_X[s_int])
+    cy_l, cx_l = min(cy, cx), max(cy, cx)
+    yy = np.arange(wrows, dtype=np.float32)[:, None] / max(1.0, float(wrows - 1))
+    xx = np.arange(wcols, dtype=np.float32)[None, :] / max(1.0, float(wcols - 1))
+    r_norm = (np.sqrt(yy * yy + xx * xx) / np.float32(np.sqrt(2.0))).astype(
+        np.float32
+    )
+    u_rad = (7.0 * np.log2(1.0 + 3.0 * r_norm) / 2.0).astype(np.float32)
+    k0 = np.clip(np.floor(u_rad).astype(np.int32), 0, 6)
+    alpha_rad = (u_rad - k0.astype(np.float32)).astype(np.float32)
+
+    yi = np.arange(wrows, dtype=np.int32)[:, None]
+    xi = np.arange(wcols, dtype=np.int32)[None, :]
+    non_llf = ~((yi < cy_l) & (xi < cx_l))
+    corner_idx: tuple[int, int] | None = None
+    if s_int == 0:
+      cmask = (non_llf & ((yi + xi) <= 2)).astype(np.float32)
+      corner_idx = (27, 28)
+    elif s_int in (4, 6, 7):
+      cmask = (non_llf & (yi < 4) & (xi < 4)).astype(np.float32)
+      corner_idx = (29, 30)
+    elif s_int in (5, 8, 9, 10, 11):
+      cmask = (non_llf & (yi < 6) & (xi < 6)).astype(np.float32)
+      corner_idx = (31, 32)
+    else:
+      cmask = np.zeros((wrows, wcols), dtype=np.float32)
+
+    geom[s_int] = {
+        "r_norm": r_norm,
+        "k0": k0,
+        "alpha_rad": alpha_rad,
+        "non_llf": non_llf.astype(np.float32),
+        "corner_mask": cmask,
+        "corner_idx": corner_idx,
+    }
+  return geom
+
+
+_RADIAL_DCT_STRATEGIES: tuple[int, ...] = (0, 4, 5, 6, 7, 8, 9, 10, 11)
+
+
+def _eval_dq_log_vec_np(
+    dq_log_vec: np.ndarray | jax.Array | None,
+    used_s: Sequence[int],
+    default_dq: dict[int, np.ndarray] | None = None,
+) -> tuple[dict[int, np.ndarray], np.ndarray]:
+  """Evaluates `'none'` (0 DoF), `'compact'` (9 DoF), or `'full_bands'` (33 DoF) dequant tables in NumPy."""
+  if default_dq is None:
+    default_dq = get_default_dequant_matrices()
+  if dq_log_vec is None:
+    return (
+        {int(s): np.asarray(default_dq[int(s)], dtype=np.float32).copy() for s in used_s},
+        np.array(DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32),
+    )
+  dq_log = np.asarray(dq_log_vec, dtype=np.float32).ravel()
+  n_dof = int(dq_log.size)
+  if n_dof == 0:
+    return (
+        {int(s): np.asarray(default_dq[int(s)], dtype=np.float32).copy() for s in used_s},
+        np.array(DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32),
+    )
+
+  geom = _precompute_dq_geometry(used_s, default_dq)
+  scales = np.clip(np.exp(dq_log[0:3]), 0.65, 1.55).astype(np.float32)
+  dc_scales = np.clip(np.exp(0.5 * dq_log[0:3]), 0.75, 1.35).astype(np.float32)
+  dc_w = (np.asarray(DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32) * dc_scales).astype(
+      np.float32
   )
+  mats: dict[int, np.ndarray] = {}
+
+  if n_dof <= 9:
+    freq_tilt = (
+        np.clip(dq_log[3:6], -0.25, 0.25).astype(np.float32)
+        if n_dof >= 6
+        else np.zeros((3,), dtype=np.float32)
+    )
+    hf_taper = (
+        np.clip(dq_log[6:9], -0.30, 0.30).astype(np.float32)
+        if n_dof >= 9
+        else np.zeros((3,), dtype=np.float32)
+    )
+    for s in used_s:
+      s_int = int(s)
+      if s_int in _RADIAL_DCT_STRATEGIES:
+        rn = geom[s_int]["r_norm"][None, :, :]
+        log_mul = freq_tilt[:, None, None] * (rn - 0.35) + hf_taper[
+            :, None, None
+        ] * np.square(np.maximum(rn - 0.5, 0.0))
+        mul = np.exp(log_mul).astype(np.float32)
+      else:
+        mul = np.float32(1.0)
+      mats[s_int] = (default_dq[s_int] * scales[:, None, None] * mul).astype(
+          np.float32
+      )
+    return mats, dc_w
+
+  bands_log = np.clip(dq_log[3:27].reshape(3, 8), -0.35, 0.35).astype(np.float32)
+  corners_log = (
+      np.clip(dq_log[27:33], -0.035, 0.035).astype(np.float32)
+      if n_dof >= 33
+      else np.zeros((6,), dtype=np.float32)
+  )
+  for s in used_s:
+    s_int = int(s)
+    if s_int not in _RADIAL_DCT_STRATEGIES:
+      mats[s_int] = (default_dq[s_int] * scales[:, None, None]).astype(np.float32)
+      continue
+    g = geom[s_int]
+    k0 = g["k0"]
+    a_r = g["alpha_rad"][None, :, :]
+    band_l = (1.0 - a_r) * bands_log[:, k0] + a_r * bands_log[:, k0 + 1]
+    c_idx = g["corner_idx"]
+    if c_idx is not None:
+      iy, ixb = c_idx[0] - 27, c_idx[1] - 27
+      c_ch = np.array(
+          [corners_log[ixb], corners_log[iy], corners_log[ixb]], dtype=np.float32
+      )
+      band_l = band_l + c_ch[:, None, None] * g["corner_mask"][None, :, :]
+    mats[s_int] = (
+        default_dq[s_int] * scales[:, None, None] * np.exp(band_l)
+    ).astype(np.float32)
+  return mats, dc_w
 
 
-_FRAME_KERNEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any]] = {}
+_FRAME_KERNEL_CACHE: dict[tuple[Any, ...], tuple[Any, Any, Any, tuple[int, ...]]] = {}
 
 
-def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
-  """Returns cached `(forward_xyb_fn, vjp_and_rate_grad_fn)` compiled per topology & `ac_strategy`."""
-  acs_bytes = np.asarray(state.ac_strategy, dtype=np.int32).tobytes()
-  key = (int(state.height), int(state.width), bool(enable_noise), acs_bytes)
+def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
+  """Returns `(raw_forward_xyb_fn, raw_vjp_fn, raw_hard_xyb_fn, canon_s, use_traced_acs, acs_np)`."""
+  h_int, w_int = int(state.height), int(state.width)
+  h8_int, w8_int = int(state.h8), int(state.w8)
+  acs_np = np.asarray(state.ac_strategy, dtype=np.int32)
+  all_zero = bool(np.all(acs_np == 0))
+  used_unique = tuple(sorted(set(int(x) for x in np.unique(acs_np)) | {0}))
+  # Check if multi-block anchors in acs_np are cell-aligned (required for traced acs_grid)
+  traced_ok = True
+  for s_u in used_unique:
+    cy_u, cx_u = int(ACS_COVERED_BLOCKS_Y[s_u]), int(ACS_COVERED_BLOCKS_X[s_u])
+    if cy_u > 1 or cx_u > 1:
+      anc_u = np.asarray(state.ac_strategy_Anchor, dtype=bool) & (acs_np == s_u)
+      bys_u, bxs_u = np.nonzero(anc_u)
+      if bys_u.size > 0 and (
+          not np.all((bys_u % cy_u) == 0)
+          or not np.all((bxs_u % cx_u) == 0)
+          or not np.all((bys_u + cy_u) <= (h8_int // cy_u) * cy_u)
+          or not np.all((bxs_u + cx_u) <= (w8_int // cx_u) * cx_u)
+      ):
+        traced_ok = False
+        break
+
+  default_cands = tuple(
+      int(s)
+      for s in DEFAULT_CANDIDATE_AC_STRATEGIES
+      if h8_int >= ACS_COVERED_BLOCKS_Y[s] and w8_int >= ACS_COVERED_BLOCKS_X[s]
+  )
+  if all_zero:
+    canon_s: tuple[int, ...] = (0,)
+    use_traced_acs = True
+  elif traced_ok and set(used_unique).issubset(set(default_cands)):
+    canon_s = default_cands
+    use_traced_acs = True
+  elif traced_ok:
+    canon_s = used_unique
+    use_traced_acs = True
+  else:
+    canon_s = used_unique
+    use_traced_acs = False
+
+  if use_traced_acs:
+    key: tuple[Any, ...] = (
+        h_int,
+        w_int,
+        int(state.epf_iters),
+        bool(state.gab),
+        bool(enable_noise),
+        canon_s,
+    )
+  else:
+    key = (
+        h_int,
+        w_int,
+        int(state.epf_iters),
+        bool(state.gab),
+        bool(enable_noise),
+        acs_np.tobytes(),
+    )
+
   if key not in _FRAME_KERNEL_CACHE:
+    if len(_FRAME_KERNEL_CACHE) >= 32:
+      _FRAME_KERNEL_CACHE.clear()
     template_state = copy.deepcopy(state)
+    if use_traced_acs:
+      template_state.ac_strategy = np.zeros((h8_int, w8_int), dtype=np.int32)
+      template_state.ac_strategy_Anchor = np.ones((h8_int, w8_int), dtype=bool)
     template_state.dequant_matrices = get_default_dequant_matrices()
     template_state.dc_quant_weights = np.array(
         DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32
     )
-    topo = StaticVarDCTTopology(template_state)
+    topo = StaticVarDCTTopology(
+        template_state,
+        force_strategies=canon_s if use_traced_acs else None,
+    )
     default_dq = get_default_dequant_matrices()
-    used_s = sorted(set(int(x) for x in np.unique(template_state.ac_strategy)) | {0})
-    r_norm_s_j: dict[int, jax.Array] = {}
-    for s in used_s:
-      wrows, wcols = default_dq[s].shape[1], default_dq[s].shape[2]
-      yy = np.arange(wrows, dtype=np.float32)[:, None] / max(1.0, float(wrows - 1))
-      xx = np.arange(wcols, dtype=np.float32)[None, :] / max(1.0, float(wcols - 1))
-      r_norm_s_j[s] = jnp.asarray(
-          np.sqrt(yy * yy + xx * xx) / np.float32(np.sqrt(2.0)),
-          dtype=jnp.float32,
-      )
+    used_s = list(canon_s)
+    geom_np = _precompute_dq_geometry(used_s, default_dq)
+    geom_j = {
+        s: {
+            "dq0": jnp.asarray(default_dq[s], dtype=jnp.float32),
+            "r_norm": jnp.asarray(geom_np[s]["r_norm"], dtype=jnp.float32),
+            "k0": jnp.asarray(geom_np[s]["k0"], dtype=jnp.int32),
+            "alpha_rad": jnp.asarray(geom_np[s]["alpha_rad"], dtype=jnp.float32),
+            "non_llf": jnp.asarray(geom_np[s]["non_llf"], dtype=jnp.float32),
+            "corner_mask": jnp.asarray(
+                geom_np[s]["corner_mask"], dtype=jnp.float32
+            ),
+            "corner_idx": geom_np[s]["corner_idx"],
+        }
+        for s in used_s
+    }
+    dc_w_def_j = jnp.asarray(DEFAULT_DC_QUANT_WEIGHTS, dtype=jnp.float32)
 
-    def _build_dq_mats_and_dc_w(dq_log_vec: jax.Array):
-      scales = jnp.clip(jnp.exp(dq_log_vec[:3]), 0.65, 1.55)
-      dc_scales = jnp.clip(jnp.exp(dq_log_vec[3:6]), 0.75, 1.35)
-      hf_tilt = (
-          jnp.clip(dq_log_vec[6:9], -0.15, 0.15)
-          if dq_log_vec.shape[0] >= 9
-          else jnp.zeros((3,), dtype=jnp.float32)
-      )
+    def _build_dq_mats_and_dc_w(dq_log_vec: jax.Array | None):
+      if dq_log_vec is None or int(dq_log_vec.shape[0]) == 0:
+        dq_mats_def = {s: geom_j[s]["dq0"] for s in used_s}
+        ones3 = jnp.ones((3,), dtype=jnp.float32)
+        return dq_mats_def, dc_w_def_j, ones3, ones3
+      n_dof = int(dq_log_vec.shape[0])
+      scales = jnp.clip(jnp.exp(dq_log_vec[0:3]), 0.65, 1.55)
+      dc_scales = jnp.clip(jnp.exp(0.5 * dq_log_vec[0:3]), 0.75, 1.35)
+      dc_w = dc_w_def_j * dc_scales
       dq_mats = {}
+      if n_dof <= 9:
+        freq_tilt = (
+            jnp.clip(dq_log_vec[3:6], -0.25, 0.25)
+            if n_dof >= 6
+            else jnp.zeros((3,), dtype=jnp.float32)
+        )
+        hf_taper = (
+            jnp.clip(dq_log_vec[6:9], -0.30, 0.30)
+            if n_dof >= 9
+            else jnp.zeros((3,), dtype=jnp.float32)
+        )
+        for s in used_s:
+          if s in _RADIAL_DCT_STRATEGIES:
+            rn = geom_j[s]["r_norm"][None, :, :]
+            log_mul = freq_tilt[:, None, None] * (rn - 0.35) + hf_taper[
+                :, None, None
+            ] * jnp.square(jnp.maximum(rn - 0.5, 0.0))
+            dq_mats[s] = geom_j[s]["dq0"] * scales[:, None, None] * jnp.exp(log_mul)
+          else:
+            dq_mats[s] = geom_j[s]["dq0"] * scales[:, None, None]
+        return dq_mats, dc_w, scales, dc_scales
+
+      bands_log = jnp.clip(dq_log_vec[3:27].reshape(3, 8), -0.35, 0.35)
+      corners_log = (
+          jnp.clip(dq_log_vec[27:33], -0.035, 0.035)
+          if n_dof >= 33
+          else jnp.zeros((6,), dtype=jnp.float32)
+      )
       for s in used_s:
-        if s in (0, 4, 5, 6, 7):
-          tilt_s = jnp.exp(
-              hf_tilt[:, None, None] * (r_norm_s_j[s][None, :, :] - 0.5)
+        if s not in _RADIAL_DCT_STRATEGIES:
+          dq_mats[s] = geom_j[s]["dq0"] * scales[:, None, None]
+          continue
+        g_s = geom_j[s]
+        k0 = g_s["k0"]
+        a_r = g_s["alpha_rad"][None, :, :]
+        band_l = (1.0 - a_r) * bands_log[:, k0] + a_r * bands_log[:, k0 + 1]
+        c_idx = g_s["corner_idx"]
+        if c_idx is not None:
+          iy, ixb = c_idx[0] - 27, c_idx[1] - 27
+          c_ch = jnp.stack(
+              [corners_log[ixb], corners_log[iy], corners_log[ixb]], axis=0
           )
-        else:
-          tilt_s = 1.0
-        dq_mats[s] = default_dq[s] * scales[:, None, None] * tilt_s
-      dc_w = jnp.asarray(DEFAULT_DC_QUANT_WEIGHTS, dtype=jnp.float32) * dc_scales
+          band_l = band_l + c_ch[:, None, None] * g_s["corner_mask"][None, :, :]
+        dq_mats[s] = g_s["dq0"] * scales[:, None, None] * jnp.exp(band_l)
       return dq_mats, dc_w, scales, dc_scales
+
+    def _expand_dq_mats_and_non_llf(
+        dq_mats: dict[int, jax.Array], acs_g: jax.Array | None
+    ) -> tuple[jax.Array, jax.Array]:
+      h8_t, w8_t = topo.h8, topo.w8
+      w_blk = jnp.broadcast_to(
+          dq_mats[0][None, None], (h8_t, w8_t, 3, 8, 8)
+      )
+      non_llf_blk = jnp.broadcast_to(
+          geom_j[0]["non_llf"][None, None], (h8_t, w8_t, 8, 8)
+      )
+      for grp1 in topo.groups_1x1:
+        s_id = int(grp1["s"])
+        if s_id == 0:
+          continue
+        m2d = (acs_g == s_id) if acs_g is not None else grp1["mask_2d"]
+        w_blk = jnp.where(
+            m2d[:, :, None, None, None], dq_mats[s_id][None, None], w_blk
+        )
+      for grp in topo.multi_groups:
+        s_id = int(grp["s"])
+        cy, cx = int(grp["cy"]), int(grp["cx"])
+        dq_s = dq_mats[s_id].reshape(3, cy, 8, cx, 8).transpose(1, 3, 0, 2, 4)
+        nllf_s = geom_j[s_id]["non_llf"].reshape(cy, 8, cx, 8).transpose(
+            0, 2, 1, 3
+        )
+        if grp.get("grid_aligned", False):
+          nh_c, nw_c = int(grp["nh_cell"]), int(grp["nw_cell"])
+          h_l, w_l = int(grp["h_lim"]), int(grp["w_lim"])
+          if acs_g is not None:
+            cm = acs_g[:h_l:cy, :w_l:cx] == s_id
+            bm = jnp.broadcast_to(
+                cm[:, None, :, None], (nh_c, cy, nw_c, cx)
+            ).reshape(h_l, w_l)
+          else:
+            bm = grp["blk_mask"]
+          dq_tile = jnp.broadcast_to(
+              dq_s[None, :, None, :, :, :, :], (nh_c, cy, nw_c, cx, 3, 8, 8)
+          ).reshape(h_l, w_l, 3, 8, 8)
+          nllf_tile = jnp.broadcast_to(
+              nllf_s[None, :, None, :, :, :], (nh_c, cy, nw_c, cx, 8, 8)
+          ).reshape(h_l, w_l, 8, 8)
+          sub_w = jnp.where(
+              bm[:, :, None, None, None], dq_tile, w_blk[:h_l, :w_l]
+          )
+          sub_m = jnp.where(bm[:, :, None, None], nllf_tile, non_llf_blk[:h_l, :w_l])
+          if h_l == h8_t and w_l == w8_t:
+            w_blk = sub_w
+            non_llf_blk = sub_m
+          else:
+            w_blk = w_blk.at[:h_l, :w_l].set(sub_w)
+            non_llf_blk = non_llf_blk.at[:h_l, :w_l].set(sub_m)
+        else:
+          by, bx = grp["by"], grp["bx"]
+          m_cnt = int(by.shape[0])
+          if m_cnt > 0:
+            dy = jnp.arange(cy)[None, :, None]
+            dx = jnp.arange(cx)[None, None, :]
+            w_blk = w_blk.at[
+                by[:, None, None] + dy, bx[:, None, None] + dx
+            ].set(jnp.broadcast_to(dq_s[None], (m_cnt, cy, cx, 3, 8, 8)))
+            non_llf_blk = non_llf_blk.at[
+                by[:, None, None] + dy, bx[:, None, None] + dx
+            ].set(jnp.broadcast_to(nllf_s[None], (m_cnt, cy, cx, 8, 8)))
+      w_3hw = jnp.transpose(w_blk, (2, 0, 3, 1, 4)).reshape(
+          3, h8_t * 8, w8_t * 8
+      )
+      non_llf_hw = jnp.transpose(non_llf_blk, (0, 2, 1, 3)).reshape(
+          h8_t * 8, w8_t * 8
+      )
+      return w_3hw, non_llf_hw
 
     def _couple_ac_dc(
         ac: jax.Array,
         dc: jax.Array,
         rq: jax.Array,
         rq_base: jax.Array | None,
-        dq_log: jax.Array | None,
+        dq_mats_cur: dict[int, jax.Array],
+        dc_w_cur: jax.Array,
         dq_log_base: jax.Array | None,
+        x_qm: jax.Array,
+        b_qm: jax.Array,
+        yx: jax.Array | None = None,
+        yb: jax.Array | None = None,
+        yx_base: jax.Array | None = None,
+        yb_base: jax.Array | None = None,
+        acs_g: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
+      h8_t, w8_t = topo.h8, topo.w8
       if rq_base is not None:
-        rq_tl = jnp.clip(rq, 1.0, 256.0)[topo.tl_by_grid, topo.tl_bx_grid]
-        rq_b_tl = jnp.clip(rq_base, 1.0, 256.0)[topo.tl_by_grid, topo.tl_bx_grid]
+        rq_tl = topo.broadcast_top_left_grid(
+            jnp.clip(rq, 1.0, 256.0), acs_grid=acs_g
+        )
+        rq_b_tl = topo.broadcast_top_left_grid(
+            jnp.clip(rq_base, 1.0, 256.0), acs_grid=acs_g
+        )
         rq_ratio_tl = rq_tl / jnp.maximum(rq_b_tl, 1.0)
-        rq_ratio_px = jnp.repeat(jnp.repeat(rq_ratio_tl, 8, axis=0), 8, axis=1)[
-            None, : topo.height, : topo.width
-        ]
+        rq_ratio_px = jnp.broadcast_to(
+            rq_ratio_tl[:, None, :, None], (h8_t, 8, w8_t, 8)
+        ).reshape(1, h8_t * 8, w8_t * 8)
       else:
-        rq_ratio_px = 1.0
-      if dq_log is not None and dq_log_base is not None:
-        ac_s = jnp.clip(jnp.exp(dq_log[:3]), 0.65, 1.55)
-        ac_s_b = jnp.clip(jnp.exp(dq_log_base[:3]), 0.65, 1.55)
-        dc_s = jnp.clip(jnp.exp(dq_log[3:6]), 0.75, 1.35)
-        dc_s_b = jnp.clip(jnp.exp(dq_log_base[3:6]), 0.75, 1.35)
-        u_ac = ac * rq_ratio_px / (ac_s / ac_s_b)[:, None, None]
-        u_dc = dc / (dc_s / dc_s_b)[:, None, None]
+        rq_ratio_px = jnp.float32(1.0)
+
+      w_cur, non_llf_hw = _expand_dq_mats_and_non_llf(dq_mats_cur, acs_g)
+      if dq_log_base is not None and int(dq_log_base.shape[0]) > 0:
+        dq_mats_b, dc_w_b, _, _ = _build_dq_mats_and_dc_w(dq_log_base)
+        w_base, _ = _expand_dq_mats_and_non_llf(dq_mats_b, acs_g)
+        u_ac = ac * rq_ratio_px * (w_base / jnp.maximum(w_cur, 1e-12))
+        u_dc = dc * (dc_w_b / jnp.maximum(dc_w_cur, 1e-12))[:, None, None]
       else:
         u_ac = ac * rq_ratio_px
         u_dc = dc
+
+      if (
+          yx is not None
+          and yb is not None
+          and yx_base is not None
+          and yb_base is not None
+      ):
+        ht_t, wt_t = topo.ht, topo.wt
+        cf_f = jnp.float32(topo.color_factor)
+        dx_tile = (
+            jnp.clip(yx, -128.0, 127.0) - jnp.clip(yx_base, -128.0, 127.0)
+        ) / cf_f
+        db_tile = (
+            jnp.clip(yb, -128.0, 127.0) - jnp.clip(yb_base, -128.0, 127.0)
+        ) / cf_f
+        dx_px = jnp.broadcast_to(
+            dx_tile[:, None, :, None], (ht_t, 64, wt_t, 64)
+        ).reshape(ht_t * 64, wt_t * 64)[: h8_t * 8, : w8_t * 8]
+        db_px = jnp.broadcast_to(
+            db_tile[:, None, :, None], (ht_t, 64, wt_t, 64)
+        ).reshape(ht_t * 64, wt_t * 64)[: h8_t * 8, : w8_t * 8]
+        x_qm_mul = jnp.power(jnp.float32(1.25), x_qm - 2.0)
+        b_qm_mul = jnp.power(jnp.float32(1.25), b_qm - 2.0)
+        u_y = u_ac[1] * non_llf_hw
+        u_x = u_ac[0] - dx_px * u_y * (
+            (w_cur[1] * x_qm_mul) / jnp.maximum(w_cur[0], 1e-12)
+        )
+        u_b = u_ac[2] - db_px * u_y * (
+            (w_cur[1] * b_qm_mul) / jnp.maximum(w_cur[2], 1e-12)
+        )
+        u_ac = jnp.stack([u_x, u_ac[1], u_b], axis=0)
       return u_ac, u_dc
 
     @jax.jit
-    def forward_xyb_fn(
+    def _raw_forward_xyb_fn(
+        acs_g,
         ac,
         dc,
         rq,
@@ -454,41 +1072,115 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
         yb,
         gs,
         qdc,
+        x_qm,
+        b_qm,
+        ytox_dc,
+        ytob_dc,
+        epf_sharp,
         noise_lut,
         dq_log_scale=None,
         rq_base=None,
         dq_log_base=None,
+        yx_base=None,
+        yb_base=None,
     ):
-      topo_gs = float(topo.global_scale)
-      topo_qdc = float(topo.quant_dc)
-      eff_rq = jnp.clip(rq, 1.0, 256.0) * (gs / topo_gs)
-      u_ac, u_dc = _couple_ac_dc(ac, dc, rq, rq_base, dq_log_scale, dq_log_base)
-      eff_dc = u_dc * (topo_gs / gs) * (topo_qdc / qdc)
-      dq_mats = None
-      dc_w = None
-      if dq_log_scale is not None:
-        dq_mats, dc_w, _, _ = _build_dq_mats_and_dc_w(dq_log_scale)
+      dq_mats, dc_w, _, _ = _build_dq_mats_and_dc_w(dq_log_scale)
+      u_ac, u_dc = _couple_ac_dc(
+          ac,
+          dc,
+          rq,
+          rq_base,
+          dq_mats,
+          dc_w,
+          dq_log_base,
+          x_qm,
+          b_qm,
+          yx=yx,
+          yb=yb,
+          yx_base=yx_base,
+          yb_base=yb_base,
+          acs_g=acs_g,
+      )
       return reconstruct_single_frame_xyb(
           topo,
+          params_override={
+              "global_scale": gs,
+              "quant_dc": qdc,
+              "x_qm_scale": x_qm,
+              "b_qm_scale": b_qm,
+              "ytox_dc": ytox_dc,
+              "ytob_dc": ytob_dc,
+              "epf_sharpness": epf_sharp,
+          },
           quant_ac=u_ac,
-          dc_quant=eff_dc,
-          raw_quant_field=eff_rq,
+          dc_quant=u_dc,
+          raw_quant_field=jnp.clip(rq, 1.0, 256.0),
+          ytox_map=jnp.clip(yx, -128.0, 127.0),
+          ytob_map=jnp.clip(yb, -128.0, 127.0),
+          dequant_matrices=dq_mats if dq_log_scale is not None else None,
+          dc_quant_weights=dc_w if dq_log_scale is not None else None,
+          hard=False,
+          include_noise=enable_noise,
+          noise_lut=noise_lut if enable_noise else None,
+          acs_grid=acs_g,
+      )
+
+    @jax.jit
+    def _raw_hard_xyb_fn(
+        acs_g,
+        ac,
+        dc,
+        rq,
+        yx,
+        yb,
+        gs,
+        qdc,
+        x_qm,
+        b_qm,
+        ytox_dc,
+        ytob_dc,
+        epf_sharp,
+        noise_lut,
+        dq_mats,
+        dc_w,
+    ):
+      return reconstruct_single_frame_xyb(
+          topo,
+          params_override={
+              "global_scale": gs,
+              "quant_dc": qdc,
+              "x_qm_scale": x_qm,
+              "b_qm_scale": b_qm,
+              "ytox_dc": ytox_dc,
+              "ytob_dc": ytob_dc,
+              "epf_sharpness": epf_sharp,
+          },
+          quant_ac=ac,
+          dc_quant=dc,
+          raw_quant_field=jnp.clip(rq, 1.0, 256.0),
           ytox_map=jnp.clip(yx, -128.0, 127.0),
           ytob_map=jnp.clip(yb, -128.0, 127.0),
           dequant_matrices=dq_mats,
           dc_quant_weights=dc_w,
-          hard=False,
+          hard=True,
           include_noise=enable_noise,
           noise_lut=noise_lut if enable_noise else None,
+          acs_grid=acs_g,
       )
 
     def frame_surrogate(
         p,
+        acs_g,
         rq_base,
         yx_base,
         yb_base,
         gs,
         qdc,
+        x_qm,
+        b_qm,
+        ytox_dc,
+        ytob_dc,
+        epf_sharp,
         ac_mask,
         dc_mask,
         dc_bg,
@@ -497,6 +1189,7 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
         custom_dequant_weight,
         dq_log_base=None,
         ac_rate_weight=1.0,
+        cluster_blend=0.0,
     ):
       ac = p["ac"] * ac_mask
       dc = p["dc"] * dc_mask + dc_bg
@@ -504,26 +1197,48 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
       rq = jnp.clip(rq_base + p.get("rq_delta", 0.0), 1.0, 256.0)
       yx = jnp.clip(yx_base + p.get("yx_delta", 0.0), -128.0, 127.0)
       yb = jnp.clip(yb_base + p.get("yb_delta", 0.0), -128.0, 127.0)
-      dq_log = p.get("dq_log_scale", jnp.zeros((9,), dtype=jnp.float32))
+      dq_log = p.get("dq_log_scale", None)
       dq_mats, dc_w, _, _ = _build_dq_mats_and_dc_w(dq_log)
-      u_ac, u_dc = _couple_ac_dc(ac, dc, rq, rq_base, dq_log, dq_log_base)
+      has_dq = dq_log is not None and int(dq_log.shape[0]) > 0
+      u_ac, u_dc = _couple_ac_dc(
+          ac,
+          dc,
+          rq,
+          rq_base,
+          dq_mats,
+          dc_w,
+          dq_log_base,
+          x_qm,
+          b_qm,
+          yx=yx,
+          yb=yb,
+          yx_base=yx_base,
+          yb_base=yb_base,
+          acs_g=acs_g,
+      )
 
-      topo_gs = float(topo.global_scale)
-      topo_qdc = float(topo.quant_dc)
-      eff_rq = rq * (gs / topo_gs)
-      eff_dc = u_dc * (topo_gs / gs) * (topo_qdc / qdc)
       xyb = reconstruct_single_frame_xyb(
           topo,
+          params_override={
+              "global_scale": gs,
+              "quant_dc": qdc,
+              "x_qm_scale": x_qm,
+              "b_qm_scale": b_qm,
+              "ytox_dc": ytox_dc,
+              "ytob_dc": ytob_dc,
+              "epf_sharpness": epf_sharp,
+          },
           quant_ac=u_ac,
-          dc_quant=eff_dc,
-          raw_quant_field=eff_rq,
+          dc_quant=u_dc,
+          raw_quant_field=rq,
           ytox_map=yx,
           ytob_map=yb,
-          dequant_matrices=dq_mats,
-          dc_quant_weights=dc_w,
+          dequant_matrices=dq_mats if has_dq else None,
+          dc_quant_weights=dc_w if has_dq else None,
           hard=False,
           include_noise=enable_noise,
           noise_lut=n_lut if enable_noise else None,
+          acs_grid=acs_g,
       )
       ac_r = ac * ac_rate_weight + jax.lax.stop_gradient(ac) * (
           1.0 - ac_rate_weight
@@ -532,7 +1247,20 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
           1.0 - ac_rate_weight
       )
       u_ac_r, u_dc_r = _couple_ac_dc(
-          ac_r, dc_r, rq, rq_base, dq_log, dq_log_base
+          ac_r,
+          dc_r,
+          rq,
+          rq_base,
+          dq_mats,
+          dc_w,
+          dq_log_base,
+          x_qm,
+          b_qm,
+          yx=yx,
+          yb=yb,
+          yx_base=yx_base,
+          yb_base=yb_base,
+          acs_g=acs_g,
       )
       bits = soft_jxl_rate_proxy(
           template_state,
@@ -541,20 +1269,145 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
           raw_quant_field=rq,
           ytox_map=yx,
           ytob_map=yb,
+          ytox_dc=ytox_dc,
+          ytob_dc=ytob_dc,
+          epf_sharpness=epf_sharp,
+          global_scale=gs,
+          quant_dc=qdc,
           enable_noise=enable_noise,
           noise_lut=n_lut if enable_noise else None,
+          ac_strategy=acs_g,
+          topology=topo,
+          cluster_blend=cluster_blend,
       )
-      dq_bits = custom_dequant_weight * soft_dequant_matrices_rate_bits(
-          dq_mats, dc_quant=dc_w
+      dq_bits = (
+          custom_dequant_weight
+          * soft_dequant_matrices_rate_bits(
+              dq_mats, dc_quant=dc_w, ac_strategy=acs_g
+          )
+          if has_dq
+          else jnp.float32(1.0)
       )
       total_bits = bits + dq_bits
       return jnp.sum(xyb * cotangent_xyb) + lam_per_px * total_bits, total_bits
 
-    vjp_and_rate_grad_fn = jax.jit(
-        jax.value_and_grad(frame_surrogate, has_aux=True)
+    _raw_vjp_fn = jax.jit(jax.value_and_grad(frame_surrogate, has_aux=True))
+    _FRAME_KERNEL_CACHE[key] = (
+        _raw_forward_xyb_fn,
+        _raw_vjp_fn,
+        _raw_hard_xyb_fn,
+        canon_s,
     )
-    _FRAME_KERNEL_CACHE[key] = (forward_xyb_fn, vjp_and_rate_grad_fn)
-  return _FRAME_KERNEL_CACHE[key]
+
+  _raw_forward_xyb_fn, _raw_vjp_fn, _raw_hard_xyb_fn, canon_s = (
+      _FRAME_KERNEL_CACHE[key]
+  )
+  return (
+      _raw_forward_xyb_fn,
+      _raw_vjp_fn,
+      _raw_hard_xyb_fn,
+      canon_s,
+      use_traced_acs,
+      acs_np,
+  )
+
+
+def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
+  """Returns cached `(forward_xyb_fn, vjp_and_rate_grad_fn)` compiled per resolution & canonical strategy set."""
+  (
+      _raw_forward_xyb_fn,
+      _raw_vjp_fn,
+      _,
+      _,
+      use_traced_acs,
+      acs_np,
+  ) = _resolve_frame_kernel_entry(state, enable_noise)
+  acs_arg = jnp.asarray(acs_np, dtype=jnp.int32) if use_traced_acs else None
+  x_qm_arg = jnp.float32(state.x_qm_scale)
+  b_qm_arg = jnp.float32(state.b_qm_scale)
+  ytox_dc_arg = jnp.float32(state.ytox_dc)
+  ytob_dc_arg = jnp.float32(state.ytob_dc)
+  epf_sharp_arg = jnp.asarray(state.epf_sharpness, dtype=jnp.int32)
+
+  def forward_xyb_fn(
+      ac,
+      dc,
+      rq,
+      yx,
+      yb,
+      gs,
+      qdc,
+      noise_lut,
+      dq_log_scale=None,
+      rq_base=None,
+      dq_log_base=None,
+      yx_base=None,
+      yb_base=None,
+  ):
+    return _raw_forward_xyb_fn(
+        acs_arg,
+        ac,
+        dc,
+        rq,
+        yx,
+        yb,
+        gs,
+        qdc,
+        x_qm_arg,
+        b_qm_arg,
+        ytox_dc_arg,
+        ytob_dc_arg,
+        epf_sharp_arg,
+        noise_lut,
+        dq_log_scale,
+        rq_base,
+        dq_log_base,
+        yx_base,
+        yb_base,
+    )
+
+  def vjp_and_rate_grad_fn(
+      p,
+      rq_base,
+      yx_base,
+      yb_base,
+      gs,
+      qdc,
+      ac_mask,
+      dc_mask,
+      dc_bg,
+      cotangent_xyb,
+      lam_per_px,
+      custom_dequant_weight,
+      dq_log_base=None,
+      ac_rate_weight=1.0,
+      cluster_blend=0.0,
+  ):
+    return _raw_vjp_fn(
+        p,
+        acs_arg,
+        rq_base,
+        yx_base,
+        yb_base,
+        gs,
+        qdc,
+        x_qm_arg,
+        b_qm_arg,
+        ytox_dc_arg,
+        ytob_dc_arg,
+        epf_sharp_arg,
+        ac_mask,
+        dc_mask,
+        dc_bg,
+        cotangent_xyb,
+        lam_per_px,
+        custom_dequant_weight,
+        dq_log_base,
+        ac_rate_weight,
+        cluster_blend,
+    )
+
+  return forward_xyb_fn, vjp_and_rate_grad_fn
 
 
 @functools.lru_cache(maxsize=16)
@@ -672,6 +1525,256 @@ def _get_alpha_combine_kernels(
   return combine_fn, combine_grad_fn
 
 
+@functools.lru_cache(maxsize=4)
+def _get_xyb_to_srgb_kernels():
+  """Returns cached `(_xyb_to_srgb_hwc, grad_srgb)` JIT kernels."""
+  dummy_state = init_state_from_rgb_jax(
+      np.zeros((8, 8, 3), dtype=np.float32), distance=1.0, epf_iters=0
+  )
+  topo = StaticVarDCTTopology(dummy_state)
+  inv_mat, biases = topo.opsin_inv_matrix, topo.opsin_biases
+
+  @jax.jit
+  def _xyb_to_srgb_hwc(xyb):
+    return jnp.moveaxis(opsin_to_srgb(xyb, inv_mat, biases, clamp=True), 0, -1)
+
+  grad_srgb = jax.jit(
+      jax.grad(lambda xyb, cot: jnp.sum(_xyb_to_srgb_hwc(xyb) * cot))
+  )
+  return _xyb_to_srgb_hwc, grad_srgb
+
+
+@functools.lru_cache(maxsize=32)
+def _get_alpha_hard_combine_kernel(
+    h: int,
+    w: int,
+    u: int,
+    d_shift: int,
+    alpha_blend_mode: int = PATCH_BLEND_ALPHA_BELOW,
+    enable_noise: bool = False,
+):
+  """Returns cached `@jax.jit` kernel for hard XYB `PatchDictionary` alpha compositing."""
+  dummy_state = init_state_from_rgb_jax(
+      np.zeros((8, 8, 3), dtype=np.float32), distance=1.0, epf_iters=0
+  )
+  topo = StaticVarDCTTopology(dummy_state)
+  inv_mat = topo.opsin_inv_matrix
+  biases = topo.opsin_biases
+  ytox = float(topo.base_correlation_x)
+  ytob = float(topo.base_correlation_b)
+  step_a = 1 << int(d_shift)
+  bm = int(alpha_blend_mode)
+
+  @jax.jit
+  def _combine_hard(ref_xyb, main_xyb, alpha_01, noise_lut):
+    ref_xyb_ups = upsample_jxl(ref_xyb, u, out_hw=(h, w))
+    a_q = ste_quantize_alpha_01(alpha_01, hard=True)
+    if step_a > 1:
+      a_ups = upsample_jxl(a_q[None, :, :], step_a, out_hw=(h, w))[0]
+    else:
+      a_ups = a_q[:h, :w]
+    a_3d = jnp.clip(a_ups, 0.0, 1.0)[None, :, :]
+    comp_xyb = _blend_xyb_pair(
+        cur_xyb=main_xyb,
+        ref_xyb=ref_xyb_ups,
+        blend_mode=bm,
+        alpha_3d=a_3d,
+    )
+    if enable_noise:
+      comp_xyb = synthesize_jxl_noise_xyb(
+          xyb=comp_xyb,
+          noise_lut=jnp.clip(noise_lut, 0.0, 0.5),
+          ytox=ytox,
+          ytob=ytob,
+          visible_frame_index=1,
+          nonvisible_frame_index=0,
+          ste_quantize_lut=True,
+      )
+    srgb_chw = opsin_to_srgb(comp_xyb, inv_mat, biases, clamp=True)
+    return jnp.moveaxis(srgb_chw, 0, -1)
+
+  return _combine_hard
+
+
+def _fast_reconstruct_xyb(
+    state: JxlVarDCTState,
+    include_noise: bool = False,
+    noise_lut: Any = None,
+) -> jax.Array:
+  """JIT-compiled `reconstruct_single_frame_xyb(state, hard=True)`."""
+  do_noise = bool(include_noise and noise_lut is not None)
+  (
+      _,
+      _,
+      _raw_hard_xyb_fn,
+      canon_s,
+      use_traced_acs,
+      acs_np,
+  ) = _resolve_frame_kernel_entry(state, do_noise)
+  acs_arg = jnp.asarray(acs_np, dtype=jnp.int32) if use_traced_acs else None
+  default_dq = get_default_dequant_matrices()
+  dq_dict = state.dequant_matrices if state.dequant_matrices else default_dq
+  dq_mats_arg = {
+      int(s): jnp.asarray(dq_dict.get(int(s), default_dq[int(s)]), dtype=jnp.float32)
+      for s in canon_s
+  }
+  dc_w_arg = jnp.asarray(
+      state.dc_quant_weights
+      if getattr(state, "dc_quant_weights", None) is not None
+      else DEFAULT_DC_QUANT_WEIGHTS,
+      dtype=jnp.float32,
+  )
+  n_lut_arg = (
+      jnp.asarray(noise_lut, dtype=jnp.float32)
+      if do_noise
+      else jnp.zeros((8,), dtype=jnp.float32)
+  )
+  return _raw_hard_xyb_fn(
+      acs_arg,
+      jnp.asarray(state.quant_ac, dtype=jnp.float32),
+      jnp.asarray(state.dc_quant, dtype=jnp.float32),
+      jnp.asarray(state.raw_quant_field, dtype=jnp.float32),
+      jnp.asarray(state.ytox_map, dtype=jnp.float32),
+      jnp.asarray(state.ytob_map, dtype=jnp.float32),
+      jnp.float32(state.global_scale),
+      jnp.float32(state.quant_dc),
+      jnp.float32(state.x_qm_scale),
+      jnp.float32(state.b_qm_scale),
+      jnp.float32(state.ytox_dc),
+      jnp.float32(state.ytob_dc),
+      jnp.asarray(state.epf_sharpness, dtype=jnp.int32),
+      n_lut_arg,
+      dq_mats_arg,
+      dc_w_arg,
+  )
+
+
+def _fast_reconstruct_single_frame(
+    state: JxlVarDCTState,
+    include_noise: bool = False,
+    noise_lut: Any = None,
+) -> jax.Array:
+  """JIT-compiled `reconstruct_single_frame(state, hard=True)`."""
+  xyb = _fast_reconstruct_xyb(
+      state, include_noise=include_noise, noise_lut=noise_lut
+  )
+  xyb_to_srgb, _ = _get_xyb_to_srgb_kernels()
+  return xyb_to_srgb(xyb)
+
+
+def _fast_reconstruct_patch_composite(
+    ref_state: JxlVarDCTState,
+    main_state: JxlVarDCTState,
+    upsampling: int,
+    patches: Sequence[PatchEntry],
+    include_noise: bool = False,
+    noise_lut: Any = None,
+    w_ref_main_override: tuple[jax.Array, jax.Array] | None = None,
+) -> jax.Array:
+  """JIT-compiled `reconstruct_patch_composite(..., hard=True)`."""
+  h, w = int(main_state.height), int(main_state.width)
+  u = int(upsampling)
+  if w_ref_main_override is not None or all(
+      p.ref == 0
+      and int(p.x0) == int(p.x)
+      and int(p.y0) == int(p.y)
+      and int(p.blend_mode) in (PATCH_BLEND_REPLACE, PATCH_BLEND_ADD)
+      for p in patches
+  ):
+    do_noise = bool(include_noise and noise_lut is not None)
+    r_xyb = _fast_reconstruct_xyb(ref_state, include_noise=False)
+    m_xyb = _fast_reconstruct_xyb(main_state, include_noise=False)
+    w_ref, w_main = (
+        w_ref_main_override
+        if w_ref_main_override is not None
+        else _patches_to_weights(patches, h, w)
+    )
+    combine_fn, _ = _get_patch_combine_kernels(
+        h, w, u, enable_noise=do_noise
+    )
+    n_lut_arg = (
+        jnp.asarray(noise_lut, dtype=jnp.float32)
+        if do_noise
+        else jnp.zeros((8,), dtype=jnp.float32)
+    )
+    return combine_fn(r_xyb, m_xyb, w_ref, w_main, n_lut_arg)
+  return reconstruct_patch_composite(
+      ref_state,
+      main_state,
+      u,
+      patches,
+      include_noise=include_noise,
+      noise_lut=noise_lut,
+      hard=True,
+  )
+
+
+def _fast_reconstruct_alpha_composite(
+    ref_state: JxlVarDCTState,
+    main_state: JxlVarDCTState,
+    upsampling: int,
+    dim_shift: int,
+    alpha_01: jax.Array | np.ndarray,
+    include_noise: bool = False,
+    noise_lut: Any = None,
+    alpha_blend_mode: int = PATCH_BLEND_ALPHA_BELOW,
+    patches: Sequence[PatchEntry] | None = None,
+    ref_xyb_override: jax.Array | None = None,
+    main_xyb_override: jax.Array | None = None,
+) -> jax.Array:
+  """JIT-compiled `reconstruct_alpha_composite(..., hard=True)`."""
+  h, w = int(main_state.height), int(main_state.width)
+  u = int(upsampling)
+  ds = int(dim_shift)
+  bm = int(alpha_blend_mode)
+  if patches is None or (
+      len(patches) == 1
+      and patches[0].ref == 0
+      and int(patches[0].x0) == 0
+      and int(patches[0].y0) == 0
+      and int(patches[0].x) == 0
+      and int(patches[0].y) == 0
+      and int(patches[0].xsize) == w
+      and int(patches[0].ysize) == h
+  ):
+    if patches is not None and len(patches) == 1:
+      bm = int(patches[0].blend_mode)
+    do_noise = bool(include_noise and noise_lut is not None)
+    r_xyb = (
+        ref_xyb_override
+        if ref_xyb_override is not None
+        else _fast_reconstruct_xyb(ref_state, include_noise=False)
+    )
+    m_xyb = (
+        main_xyb_override
+        if main_xyb_override is not None
+        else _fast_reconstruct_xyb(main_state, include_noise=False)
+    )
+    combine_hard = _get_alpha_hard_combine_kernel(
+        h, w, u, ds, alpha_blend_mode=bm, enable_noise=do_noise
+    )
+    n_lut_arg = (
+        jnp.asarray(noise_lut, dtype=jnp.float32)
+        if do_noise
+        else jnp.zeros((8,), dtype=jnp.float32)
+    )
+    return combine_hard(
+        r_xyb, m_xyb, jnp.asarray(alpha_01, dtype=jnp.float32), n_lut_arg
+    )
+  return reconstruct_alpha_composite(
+      ref_state,
+      main_state,
+      u,
+      ds,
+      alpha_01,
+      include_noise=include_noise,
+      noise_lut=noise_lut,
+      hard=True,
+      alpha_blend_mode=bm,
+      patches=patches,
+  )
+
+
 def downsample_rgb_jax(
     srgb_hwc: np.ndarray | jax.Array, upsampling: int
 ) -> jax.Array:
@@ -690,6 +1793,87 @@ def downsample_rgb_jax(
   if pad_h > 0 or pad_w > 0:
     arr = jnp.pad(arr, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
   return arr.reshape(h_low, u, w_low, u, c).mean(axis=(1, 3))
+
+
+@functools.lru_cache(maxsize=16)
+def _get_compiled_lowres_upsample_kernels(h: int, w: int, u: int):
+  """Cached forward and VJP kernels for `sRGB(upsample_jxl(XYB(rgb_low), u))`."""
+  xyb_to_srgb, _ = _get_xyb_to_srgb_kernels()
+
+  @jax.jit
+  def _fwd_fn(r_low: jax.Array) -> jax.Array:
+    x_in = srgb_to_xyb(jnp.moveaxis(jnp.clip(r_low, 0.0, 1.0), -1, 0))
+    return xyb_to_srgb(upsample_jxl(x_in, u, out_hw=(h, w)))
+
+  @jax.jit
+  def _vjp_fn(r_low: jax.Array, g_rgb: jax.Array) -> jax.Array:
+    def _f(z: jax.Array) -> jax.Array:
+      x_in = srgb_to_xyb(jnp.moveaxis(jnp.clip(z, 0.0, 1.0), -1, 0))
+      return xyb_to_srgb(upsample_jxl(x_in, u, out_hw=(h, w)))
+
+    _, vjp_f = jax.vjp(_f, r_low)
+    return vjp_f(g_rgb)[0]
+
+  return _fwd_fn, _vjp_fn
+
+
+def _project_lowres_rgb_wd_jax(
+    smooth_full: jax.Array,
+    upsampling: int,
+    vgg_params: Any,
+    log2_sigma: float = 1.0,
+) -> jax.Array:
+  """Stage 1 WD-driven low-resolution projection compensating `upsample_jxl` passband & texture variance."""
+  u = int(upsampling)
+  rgb0 = downsample_rgb_jax(smooth_full, u)
+  h, w = int(smooth_full.shape[0]), int(smooth_full.shape[1])
+  if u == 1 or h < 16 or w < 16:
+    return rgb0
+
+  fwd_up, vjp_up = _get_compiled_lowres_upsample_kernels(h, w, u)
+  wd_vg = _get_compiled_wd_val_and_grad(num_levels=2, num_scales=3)
+  n_iters = 16 if h * w <= 16384 else 5
+  lr_proj = 0.003 if n_iters >= 8 else 0.004
+  tx = optax.adam(lr_proj, b1=0.5, eps=1e-5)
+  r_low = rgb0
+  opt_st = tx.init(r_low)
+  best_r_low = rgb0
+  best_obj = float("inf")
+
+  for _ in range(n_iters):
+    rec_sf = fwd_up(r_low)
+    wd_v, g_rgb = wd_vg(
+        rec_sf,
+        smooth_full,
+        vgg_params,
+        float(log2_sigma),
+        num_levels=2,
+        num_scales=3,
+    )
+    diff0 = r_low - rgb0
+    obj = float(wd_v) + 0.025 * float(jnp.sum(jnp.square(diff0)))
+    if obj < best_obj:
+      best_obj = obj
+      best_r_low = r_low
+    g = vjp_up(r_low, g_rgb) + 0.05 * diff0
+    upd, opt_st = tx.update(g, opt_st, r_low)
+    r_low = jnp.clip(optax.apply_updates(r_low, upd), 0.0, 1.0)
+
+  rec_final = fwd_up(r_low)
+  wd_final = float(
+      _get_compiled_wd_only(num_levels=2, num_scales=3)(
+          rec_final,
+          smooth_full,
+          vgg_params,
+          float(log2_sigma),
+          num_levels=2,
+          num_scales=3,
+      )
+  )
+  obj_final = wd_final + 0.025 * float(jnp.sum(jnp.square(r_low - rgb0)))
+  if obj_final < best_obj:
+    best_r_low = r_low
+  return best_r_low
 
 
 def _dilate_bool_grid(mask: np.ndarray, radius: int = 1) -> np.ndarray:
@@ -801,6 +1985,61 @@ def _compute_state_precond_scales_jax(
   return _compute_precond_scales_jax(topo, rq_tl)
 
 
+@functools.lru_cache(maxsize=16)
+def _get_compiled_continuous_dc_ac(
+    h: int,
+    w: int,
+    do_inv_gab: bool,
+    canon_s: tuple[int, ...] = (0,),
+    x_qm_scale: int = 3,
+    b_qm_scale: int = 2,
+):
+  """Returns JIT-compiled `compute_continuous_dc_ac_jax` kernel."""
+  dummy_state = init_state_from_rgb_jax(
+      np.zeros((h, w, 3), dtype=np.float32),
+      distance=1.0,
+      epf_iters=0,
+      gab=bool(do_inv_gab),
+  )
+  dummy_state.x_qm_scale = int(x_qm_scale)
+  dummy_state.b_qm_scale = int(b_qm_scale)
+  topo = StaticVarDCTTopology(dummy_state, force_strategies=canon_s)
+
+  @jax.jit
+  def _fn(
+      xyb_chw: jax.Array,
+      acs_grid: jax.Array,
+      rq: jax.Array,
+      gs: jax.Array,
+      qdc: jax.Array,
+      yx: jax.Array,
+      yb: jax.Array,
+      ytox_dc: jax.Array,
+      ytob_dc: jax.Array,
+      dq_mats: dict[int, jax.Array],
+      dc_w: jax.Array,
+  ) -> tuple[jax.Array, jax.Array]:
+    return compute_continuous_dc_ac_jax(
+        xyb_chw,
+        dummy_state,
+        apply_inv_gab=bool(do_inv_gab),
+        init_mode="dct",
+        topology=topo,
+        acs_grid=acs_grid,
+        raw_quant_field=rq,
+        ytox_map=yx,
+        ytob_map=yb,
+        global_scale=gs,
+        quant_dc=qdc,
+        ytox_dc=ytox_dc,
+        ytob_dc=ytob_dc,
+        dequant_matrices=dq_mats,
+        dc_quant_weights=dc_w,
+    )
+
+  return _fn
+
+
 def compute_continuous_dc_ac_jax(
     xyb_chw: jax.Array,
     state: JxlVarDCTState,
@@ -808,16 +2047,73 @@ def compute_continuous_dc_ac_jax(
     *,
     init_mode: str = "dct",
     seed: int = 0,
+    topology: StaticVarDCTTopology | None = None,
+    acs_grid: jax.Array | None = None,
+    raw_quant_field: jax.Array | None = None,
+    ytox_map: jax.Array | None = None,
+    ytob_map: jax.Array | None = None,
+    global_scale: float | jax.Array | None = None,
+    quant_dc: float | jax.Array | None = None,
+    ytox_dc: float | jax.Array | None = None,
+    ytob_dc: float | jax.Array | None = None,
+    dequant_matrices: dict[int, jax.Array] | None = None,
+    dc_quant_weights: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Computes continuous pre-rounded `(dc_quant, quant_ac)` in JAX from XYB `(3, H, W)` across all `AcStrategy` shapes."""
   mode = _normalize_init_mode(init_mode)
-  topo = StaticVarDCTTopology(state)
-  h, w = state.height, state.width
-  h8, w8 = state.h8, state.w8
+  h, w = int(state.height), int(state.width)
+  h8, w8 = int(state.h8), int(state.w8)
   if mode == "zero":
     dc_cont = jnp.zeros((3, h8, w8), dtype=jnp.float32)
     ac_cont = jnp.zeros((3, h8 * 8, w8 * 8), dtype=jnp.float32)
     return dc_cont, ac_cont
+  if topology is None and mode == "dct":
+    acs_np = np.asarray(state.ac_strategy, dtype=np.int32)
+    all_zero = bool(np.all(acs_np == 0))
+    default_cands = tuple(
+        int(s)
+        for s in DEFAULT_CANDIDATE_AC_STRATEGIES
+        if h8 >= ACS_COVERED_BLOCKS_Y[s] and w8 >= ACS_COVERED_BLOCKS_X[s]
+    )
+    used_unique = tuple(sorted(set(int(x) for x in np.unique(acs_np)) | {0}))
+    if all_zero or set(used_unique).issubset(set(default_cands)):
+      canon_s = (0,) if all_zero else default_cands
+      default_dq = get_default_dequant_matrices()
+      dq_dict = state.dequant_matrices if state.dequant_matrices else default_dq
+      dq_mats_arg = {
+          int(s): jnp.asarray(
+              dq_dict.get(int(s), default_dq[int(s)]), dtype=jnp.float32
+          )
+          for s in canon_s
+      }
+      dc_w_arg = jnp.asarray(
+          state.dc_quant_weights
+          if getattr(state, "dc_quant_weights", None) is not None
+          else K_DC_QUANT,
+          dtype=jnp.float32,
+      )
+      fn = _get_compiled_continuous_dc_ac(
+          h,
+          w,
+          bool(apply_inv_gab and state.gab),
+          canon_s,
+          int(state.x_qm_scale),
+          int(state.b_qm_scale),
+      )
+      return fn(
+          jnp.asarray(xyb_chw, dtype=jnp.float32),
+          jnp.asarray(acs_np, dtype=jnp.int32),
+          jnp.asarray(state.raw_quant_field, dtype=jnp.float32),
+          jnp.float32(state.global_scale),
+          jnp.float32(state.quant_dc),
+          jnp.asarray(state.ytox_map, dtype=jnp.float32),
+          jnp.asarray(state.ytob_map, dtype=jnp.float32),
+          jnp.float32(state.ytox_dc),
+          jnp.float32(state.ytob_dc),
+          dq_mats_arg,
+          dc_w_arg,
+      )
+  topo = topology if topology is not None else StaticVarDCTTopology(state)
   if mode == "random":
     scale_dc, scale_ac = _compute_state_precond_scales_jax(state, topo)
     key = jax.random.PRNGKey(int(seed))
@@ -838,115 +2134,245 @@ def compute_continuous_dc_ac_jax(
     xyb = jnp.pad(xyb, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
   xyb_blocks = jnp.transpose(xyb.reshape(3, h8, 8, w8, 8), (1, 3, 0, 2, 4))
 
-  raw_q_f = jnp.maximum(jnp.array(state.raw_quant_field, dtype=jnp.float32), 1.0)
-  qac_scale_grid = (float(state.global_scale) / K_GLOBAL_SCALE_DENOM) * raw_q_f
+  rq_arr = (
+      jnp.asarray(raw_quant_field, dtype=jnp.float32)
+      if raw_quant_field is not None
+      else jnp.array(state.raw_quant_field, dtype=jnp.float32)
+  )
+  gs_val = (
+      jnp.asarray(global_scale, dtype=jnp.float32)
+      if global_scale is not None
+      else float(state.global_scale)
+  )
+  qdc_val = (
+      jnp.asarray(quant_dc, dtype=jnp.float32)
+      if quant_dc is not None
+      else float(state.quant_dc)
+  )
+  yx_arr = (
+      jnp.asarray(ytox_map, dtype=jnp.float32)
+      if ytox_map is not None
+      else jnp.array(state.ytox_map, dtype=jnp.float32)
+  )
+  yb_arr = (
+      jnp.asarray(ytob_map, dtype=jnp.float32)
+      if ytob_map is not None
+      else jnp.array(state.ytob_map, dtype=jnp.float32)
+  )
+  ytox_dc_val = (
+      jnp.asarray(ytox_dc, dtype=jnp.float32)
+      if ytox_dc is not None
+      else float(state.ytox_dc)
+  )
+  ytob_dc_val = (
+      jnp.asarray(ytob_dc, dtype=jnp.float32)
+      if ytob_dc is not None
+      else float(state.ytob_dc)
+  )
+
+  raw_q_f = jnp.maximum(rq_arr, 1.0)
+  qac_scale_grid = (gs_val / K_GLOBAL_SCALE_DENOM) * raw_q_f
   x_qm_mul = float(1.25 ** (state.x_qm_scale - 2.0))
   b_qm_mul = float(1.25 ** (state.b_qm_scale - 2.0))
   x_cc_tile = (
       float(state.base_correlation_x)
-      + jnp.array(state.ytox_map, dtype=jnp.float32) / float(state.color_factor)
+      + yx_arr / float(state.color_factor)
   )
   b_cc_tile = (
       float(state.base_correlation_b)
-      + jnp.array(state.ytob_map, dtype=jnp.float32) / float(state.color_factor)
+      + yb_arr / float(state.color_factor)
   )
 
   dc_continuous = jnp.zeros((3, h8, w8), dtype=jnp.float32)
   q_ac_blocks = jnp.zeros((h8, w8, 3, 8, 8), dtype=jnp.float32)
 
-  if topo.has_1x1:
-    by, bx = topo.by_1x1, topo.bx_1x1
-    px_b = xyb_blocks[by, bx].reshape(-1, 3, 64)
-    coeffs = jnp.einsum("nij,ncj->nci", topo.fwd_basis_1x1, px_b).reshape(
-        -1, 3, 8, 8
-    )
-    dc_continuous = dc_continuous.at[:, by, bx].set(
-        jnp.transpose(coeffs[:, :, 0, 0], (1, 0))
-    )
+  ntiles_y, ntiles_x = x_cc_tile.shape
+  x_cc_grid = jnp.broadcast_to(
+      x_cc_tile[:, None, :, None], (ntiles_y, 8, ntiles_x, 8)
+  ).reshape(ntiles_y * 8, ntiles_x * 8)[:h8, :w8]
+  b_cc_grid = jnp.broadcast_to(
+      b_cc_tile[:, None, :, None], (ntiles_y, 8, ntiles_x, 8)
+  ).reshape(ntiles_y * 8, ntiles_x * 8)[:h8, :w8]
 
-    qs = qac_scale_grid[by, bx][:, None, None]
-    ty, tx = by // 8, bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
-    wy, wx, wb = topo.dq_1x1[:, 1], topo.dq_1x1[:, 0], topo.dq_1x1[:, 2]
-    cy_val = coeffs[:, 1]
-    cx_val = coeffs[:, 0] - x_cc * cy_val
-    cb_val = coeffs[:, 2] - b_cc * cy_val
-    qy = cy_val * (qs / wy)
-    qx = cx_val * (qs * x_qm_mul / wx)
-    qb = cb_val * (qs * b_qm_mul / wb)
-    q_blk = jnp.stack([qx, qy, qb], axis=1).at[:, :, 0, 0].set(0.0)
-    q_ac_blocks = q_ac_blocks.at[by, bx].set(q_blk)
+  acs_g = (
+      jnp.asarray(acs_grid, dtype=jnp.int32) if acs_grid is not None else None
+  )
+
+  if len(topo.groups_1x1) > 0:
+    px_flat = xyb_blocks.reshape(h8, w8, 3, 64)
+    qs_all = qac_scale_grid[:, :, None, None]
+    x_cc_all = x_cc_grid[:, :, None, None]
+    b_cc_all = b_cc_grid[:, :, None, None]
+    for grp1 in topo.groups_1x1:
+      if acs_g is not None:
+        mask_2d = (acs_g == int(grp1["s"])).astype(jnp.float32)
+      else:
+        with jax.ensure_compile_time_eval():
+          mask_2d = jnp.asarray(grp1["mask_2d"], dtype=jnp.float32)
+      coeffs = jnp.einsum("ij,hwcj->hwci", grp1["fwd_basis"], px_flat).reshape(
+          h8, w8, 3, 8, 8
+      )
+      dc_continuous = dc_continuous + (
+          jnp.transpose(coeffs[:, :, :, 0, 0], (2, 0, 1)) * mask_2d[None, :, :]
+      )
+      dq_mat = (
+          dequant_matrices[int(grp1["s"])]
+          if dequant_matrices is not None and int(grp1["s"]) in dequant_matrices
+          else grp1["dq_mat"]
+      )
+      wy, wx, wb = dq_mat[1][None, None], dq_mat[0][None, None], dq_mat[2][None, None]
+      cy_val = coeffs[:, :, 1]
+      cx_val = coeffs[:, :, 0] - x_cc_all * cy_val
+      cb_val = coeffs[:, :, 2] - b_cc_all * cy_val
+      qy = cy_val * (qs_all / wy)
+      qx = cx_val * (qs_all * x_qm_mul / wx)
+      qb = cb_val * (qs_all * b_qm_mul / wb)
+      q_blk = jnp.stack([qx, qy, qb], axis=2).at[:, :, :, 0, 0].set(0.0)
+      q_ac_blocks = q_ac_blocks + q_blk * mask_2d[:, :, None, None, None]
 
   for grp in topo.multi_groups:
     cy = grp["cy"]
     cx = grp["cx"]
     cy_l = grp["cy_l"]
     cx_l = grp["cx_l"]
-    by = grp["by"]
-    bx = grp["bx"]
-    m = by.shape[0]
-    dy = jnp.arange(cy)[None, :, None]
-    dx = jnp.arange(cx)[None, None, :]
-
-    px_sub = xyb_blocks[by[:, None, None] + dy, bx[:, None, None] + dx]
-    px_full = jnp.transpose(px_sub, (0, 3, 1, 4, 2, 5)).reshape(
-        m, 3, 8 * cy, 8 * cx
+    dq_mat = (
+        dequant_matrices[int(grp["s"])]
+        if dequant_matrices is not None and int(grp["s"]) in dequant_matrices
+        else grp["dq_mat"]
     )
-    coeffs_rc = jnp.einsum(
-        "ij,mcjk,lk->mcil", grp["dct_r"], px_full, grp["dct_c"]
+    if grp.get("grid_aligned", False):
+      nh_cell = grp["nh_cell"]
+      nw_cell = grp["nw_cell"]
+      h_lim = grp["h_lim"]
+      w_lim = grp["w_lim"]
+      if acs_g is not None:
+        cell_mask_f = (
+            acs_g[:h_lim:cy, :w_lim:cx] == int(grp["s"])
+        ).astype(jnp.float32)
+        blk_mask = jnp.broadcast_to(
+            cell_mask_f[:, None, :, None], (nh_cell, cy, nw_cell, cx)
+        ).reshape(h_lim, w_lim)
+      else:
+        with jax.ensure_compile_time_eval():
+          blk_mask = jnp.asarray(grp["blk_mask"], dtype=jnp.float32)
+      px_cell = xyb_blocks[:h_lim, :w_lim].reshape(
+          nh_cell, cy, nw_cell, cx, 3, 8, 8
+      )
+      px_full = jnp.transpose(px_cell, (0, 2, 4, 1, 5, 3, 6)).reshape(
+          nh_cell, nw_cell, 3, 8 * cy, 8 * cx
+      )
+      coeffs_rc = jnp.einsum(
+          "ij,abcjk,lk->abcil", grp["dct_r"], px_full, grp["dct_c"]
+      )
+      coeffs = jnp.swapaxes(coeffs_rc, -2, -1) if cy >= cx else coeffs_rc
+      llf = coeffs[:, :, :, :cy_l, :cx_l]
+      llf_rc = jnp.swapaxes(llf, -2, -1) if cy >= cx else llf
+      llf_scaled = llf_rc * (
+          grp["rs_from_llf_y"][None, None, None, :, None]
+          * grp["rs_from_llf_x"][None, None, None, None, :]
+      )
+      dc_sub = jnp.einsum(
+          "ij,abcjk,lk->abcil", grp["idct_cy"], llf_scaled, grp["idct_cx"]
+      )
+      dc_grid = (
+          jnp.transpose(dc_sub, (2, 0, 3, 1, 4)).reshape(3, h_lim, w_lim)
+          * blk_mask[None, :, :]
+      )
+      if h_lim == h8 and w_lim == w8:
+        dc_continuous = dc_continuous + dc_grid
+      else:
+        dc_continuous = dc_continuous.at[:, :h_lim, :w_lim].add(dc_grid)
+
+      qs = qac_scale_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      x_cc = x_cc_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      b_cc = b_cc_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      cy_val = coeffs[:, :, 1]
+      cx_val = coeffs[:, :, 0] - x_cc * cy_val
+      cb_val = coeffs[:, :, 2] - b_cc * cy_val
+      qy = cy_val * (qs / dq_mat[1][None, None])
+      qx = cx_val * (qs * x_qm_mul / dq_mat[0][None, None])
+      qb = cb_val * (qs * b_qm_mul / dq_mat[2][None, None])
+      q_canon = (
+          jnp.stack([qx, qy, qb], axis=2).at[:, :, :, :cy_l, :cx_l].set(0.0)
+      )
+      q_sub = (
+          jnp.transpose(
+              q_canon.reshape(nh_cell, nw_cell, 3, cy, 8, cx, 8),
+              (0, 3, 1, 5, 2, 4, 6),
+          ).reshape(h_lim, w_lim, 3, 8, 8)
+          * blk_mask[:, :, None, None, None]
+      )
+      if h_lim == h8 and w_lim == w8:
+        q_ac_blocks = q_ac_blocks + q_sub
+      else:
+        q_ac_blocks = q_ac_blocks.at[:h_lim, :w_lim].add(q_sub)
+    else:
+      by = grp["by"]
+      bx = grp["bx"]
+      m = by.shape[0]
+      dy = jnp.arange(cy)[None, :, None]
+      dx = jnp.arange(cx)[None, None, :]
+
+      px_sub = xyb_blocks[by[:, None, None] + dy, bx[:, None, None] + dx]
+      px_full = jnp.transpose(px_sub, (0, 3, 1, 4, 2, 5)).reshape(
+          m, 3, 8 * cy, 8 * cx
+      )
+      coeffs_rc = jnp.einsum(
+          "ij,mcjk,lk->mcil", grp["dct_r"], px_full, grp["dct_c"]
+      )
+      coeffs = jnp.swapaxes(coeffs_rc, -2, -1) if cy >= cx else coeffs_rc
+
+      llf = coeffs[:, :, :cy_l, :cx_l]
+      llf_rc = jnp.swapaxes(llf, -2, -1) if cy >= cx else llf
+      llf_scaled = llf_rc * (
+          grp["rs_from_llf_y"][None, None, :, None]
+          * grp["rs_from_llf_x"][None, None, None, :]
+      )
+      dc_sub = jnp.einsum(
+          "ij,mcjk,lk->mcil", grp["idct_cy"], llf_scaled, grp["idct_cx"]
+      )
+      dc_continuous = dc_continuous.at[
+          :, by[:, None, None] + dy, bx[:, None, None] + dx
+      ].set(jnp.transpose(dc_sub, (1, 0, 2, 3)))
+
+      qs = qac_scale_grid[by, bx][:, None, None]
+      ty = by // 8
+      tx = bx // 8
+      x_cc = x_cc_tile[ty, tx][:, None, None]
+      b_cc = b_cc_tile[ty, tx][:, None, None]
+
+      cy_val = coeffs[:, 1]
+      cx_val = coeffs[:, 0] - x_cc * cy_val
+      cb_val = coeffs[:, 2] - b_cc * cy_val
+
+      qy = cy_val * (qs / dq_mat[1][None])
+      qx = cx_val * (qs * x_qm_mul / dq_mat[0][None])
+      qb = cb_val * (qs * b_qm_mul / dq_mat[2][None])
+      q_canon = jnp.stack([qx, qy, qb], axis=1).at[:, :, :cy_l, :cx_l].set(0.0)
+      q_sub = jnp.transpose(
+          q_canon.reshape(m, 3, cy, 8, cx, 8), (0, 2, 4, 1, 3, 5)
+      )
+      q_ac_blocks = q_ac_blocks.at[
+          by[:, None, None] + dy, bx[:, None, None] + dx
+      ].set(q_sub)
+
+  inv_global_scale = K_GLOBAL_SCALE_DENOM / gs_val
+  if dc_quant_weights is not None:
+    dc_w_j = jnp.asarray(dc_quant_weights, dtype=jnp.float32)
+    mul_dc = [inv_global_scale / qdc_val * dc_w_j[c] for c in range(3)]
+  else:
+    dc_weights = (
+        np.asarray(state.dc_quant_weights, dtype=np.float32)
+        if getattr(state, "dc_quant_weights", None) is not None
+        else np.asarray(K_DC_QUANT, dtype=np.float32)
     )
-    coeffs = jnp.swapaxes(coeffs_rc, -2, -1) if cy >= cx else coeffs_rc
-
-    llf = coeffs[:, :, :cy_l, :cx_l]
-    llf_rc = jnp.swapaxes(llf, -2, -1) if cy >= cx else llf
-    llf_scaled = llf_rc * (
-        grp["rs_from_llf_y"][None, None, :, None]
-        * grp["rs_from_llf_x"][None, None, None, :]
-    )
-    dc_sub = jnp.einsum(
-        "ij,mcjk,lk->mcil", grp["idct_cy"], llf_scaled, grp["idct_cx"]
-    )
-    dc_continuous = dc_continuous.at[
-        :, by[:, None, None] + dy, bx[:, None, None] + dx
-    ].set(jnp.transpose(dc_sub, (1, 0, 2, 3)))
-
-    qs = qac_scale_grid[by, bx][:, None, None]
-    ty = by // 8
-    tx = bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
-
-    dq_mat = grp["dq_mat"]
-    cy_val = coeffs[:, 1]
-    cx_val = coeffs[:, 0] - x_cc * cy_val
-    cb_val = coeffs[:, 2] - b_cc * cy_val
-
-    qy = cy_val * (qs / dq_mat[1][None])
-    qx = cx_val * (qs * x_qm_mul / dq_mat[0][None])
-    qb = cb_val * (qs * b_qm_mul / dq_mat[2][None])
-    q_canon = jnp.stack([qx, qy, qb], axis=1).at[:, :, :cy_l, :cx_l].set(0.0)
-    q_sub = jnp.transpose(
-        q_canon.reshape(m, 3, cy, 8, cx, 8), (0, 2, 4, 1, 3, 5)
-    )
-    q_ac_blocks = q_ac_blocks.at[
-        by[:, None, None] + dy, bx[:, None, None] + dx
-    ].set(q_sub)
-
-
-  inv_global_scale = K_GLOBAL_SCALE_DENOM / float(state.global_scale)
-  dc_weights = (
-      np.asarray(state.dc_quant_weights, dtype=np.float32)
-      if getattr(state, "dc_quant_weights", None) is not None
-      else np.asarray(K_DC_QUANT, dtype=np.float32)
-  )
-  mul_dc = [
-      inv_global_scale / float(state.quant_dc) * float(k) for k in dc_weights
-  ]
-  cfl_dc_x = float(state.base_correlation_x) + float(state.ytox_dc) / float(
+    mul_dc = [
+        inv_global_scale / qdc_val * float(k) for k in dc_weights
+    ]
+  cfl_dc_x = float(state.base_correlation_x) + ytox_dc_val / float(
       state.color_factor
   )
-  cfl_dc_b = float(state.base_correlation_b) + float(state.ytob_dc) / float(
+  cfl_dc_b = float(state.base_correlation_b) + ytob_dc_val / float(
       state.color_factor
   )
   q_dc_y = dc_continuous[1] / mul_dc[1]
@@ -963,20 +2389,145 @@ def compute_continuous_dc_ac_jax(
   return dc_cont, ac_cont
 
 
+@functools.lru_cache(maxsize=16)
+def _get_compiled_stage1_eval(
+    h: int,
+    w: int,
+    epf_iters: int = 1,
+    gab: bool = True,
+    canon_s: tuple[int, ...] = (0,),
+    x_qm_scale: int = 3,
+    b_qm_scale: int = 2,
+):
+  """Returns JIT-compiled `(dc_cont, ac_cont, dc_q, ac_q, rec_srgb, rate_map_bits)` evaluator."""
+  dummy_state = init_state_from_rgb_jax(
+      np.zeros((h, w, 3), dtype=np.float32),
+      distance=1.0,
+      epf_iters=int(epf_iters),
+      gab=bool(gab),
+  )
+  dummy_state.x_qm_scale = int(x_qm_scale)
+  dummy_state.b_qm_scale = int(b_qm_scale)
+  topo = StaticVarDCTTopology(dummy_state, force_strategies=canon_s)
+
+  @jax.jit
+  def _eval_fn(
+      target_xyb: jax.Array,
+      acs_grid: jax.Array,
+      gs: jax.Array,
+      qdc: jax.Array,
+      rq: jax.Array,
+      yx: jax.Array,
+      yb: jax.Array,
+      ytox_dc: jax.Array,
+      ytob_dc: jax.Array,
+      epf_sharpness: jax.Array,
+  ):
+    dc_c, ac_c = compute_continuous_dc_ac_jax(
+        target_xyb,
+        dummy_state,
+        apply_inv_gab=True,
+        topology=topo,
+        acs_grid=acs_grid,
+        raw_quant_field=rq,
+        ytox_map=yx,
+        ytob_map=yb,
+        global_scale=gs,
+        quant_dc=qdc,
+        ytox_dc=ytox_dc,
+        ytob_dc=ytob_dc,
+    )
+    dc_q = jnp.round(dc_c)
+    ac_q = jnp.round(ac_c)
+    epf_s_i32 = jnp.asarray(epf_sharpness, dtype=jnp.int32)
+    rec_xyb = reconstruct_single_frame_xyb(
+        topo,
+        params_override={
+            "global_scale": gs,
+            "quant_dc": qdc,
+            "ytox_dc": ytox_dc,
+            "ytob_dc": ytob_dc,
+            "epf_sharpness": epf_s_i32,
+        },
+        quant_ac=ac_q,
+        dc_quant=dc_q,
+        raw_quant_field=jnp.clip(rq, 1.0, 256.0),
+        ytox_map=yx,
+        ytob_map=yb,
+        hard=True,
+        include_noise=False,
+        acs_grid=acs_grid,
+    )
+    rec_srgb = jnp.moveaxis(
+        opsin_to_srgb(
+            rec_xyb, topo.opsin_inv_matrix, topo.opsin_biases, clamp=True
+        ),
+        0,
+        -1,
+    )
+    rate_info = compute_spatial_rate_map_bits(
+        dummy_state,
+        quant_ac=ac_q,
+        dc_quant=dc_q,
+        raw_quant_field=rq,
+        ytox_map=yx,
+        ytob_map=yb,
+        ytox_dc=ytox_dc,
+        ytob_dc=ytob_dc,
+        ac_strategy=acs_grid,
+        epf_sharpness=epf_sharpness,
+        global_scale=gs,
+        quant_dc=qdc,
+        topology=topo,
+    )
+    return dc_c, ac_c, dc_q, ac_q, rec_srgb, rate_info["block_bits"]
+
+  return _eval_fn
+
+
 def init_state_from_xyb_jax(
     xyb_chw: jax.Array,
     distance: float = 1.0,
-    epf_iters: int = 0,
-    gab: bool = True,
+    epf_iters: int | None = None,
+    gab: bool | None = None,
     *,
     init_mode: str = "dct",
     seed: int = 0,
+    enable_noise: bool = False,
 ) -> tuple[JxlVarDCTState, jax.Array, jax.Array]:
   """Initializes a `JxlVarDCTState` directly from an XYB `(3, H, W)` tensor (e.g. `kAdd` residual)."""
   _, h, w = xyb_chw.shape
-  dummy_rgb = np.zeros((h, w, 3), dtype=np.float32)
+  eff_gab = bool(float(distance) > 0.5) if gab is None else bool(gab)
+  xyb_to_srgb, _ = _get_xyb_to_srgb_kernels()
+  # Shift residual around mid-gray XYB before converting for AQ/CfL estimation if zero-mean
+  xyb_mid = jnp.asarray([0.0, 0.45, 0.45], dtype=jnp.float32)[:, None, None]
+  y_mean = float(jnp.mean(xyb_chw[1]))
+  xyb_probe = xyb_chw + xyb_mid if y_mean < 0.08 else xyb_chw
+  approx_rgb = np.asarray(xyb_to_srgb(xyb_probe), dtype=np.float32)
+  raw_quant_field, epf_sharpness, epf_iters_auto = select_quant_and_epf_jax(
+      approx_rgb, distance=float(distance)
+  )
+  ytox_map, ytob_map, ytox_dc, ytob_dc = select_cfl_jax(
+      approx_rgb, gab=eff_gab
+  )
+  if enable_noise:
+    ytox_dc, ytob_dc = 0, 0
+  eff_epf = (
+      int(epf_iters_auto)
+      if epf_iters is None
+      else int(epf_iters)
+  )
   state = init_state_from_rgb_jax(
-      dummy_rgb, distance=distance, epf_iters=epf_iters, gab=gab
+      approx_rgb,
+      distance=distance,
+      epf_iters=eff_epf,
+      gab=eff_gab,
+      raw_quant_field=raw_quant_field,
+      epf_sharpness=epf_sharpness,
+      ytox_map=ytox_map,
+      ytob_map=ytob_map,
+      ytox_dc=int(ytox_dc),
+      ytob_dc=int(ytob_dc),
   )
   dc_cont, ac_cont = compute_continuous_dc_ac_jax(
       xyb_chw, state, apply_inv_gab=True, init_mode=init_mode, seed=seed
@@ -1001,6 +2552,8 @@ def _build_uniform_ac_strategy_grid(
   cy, cx = _acs_covered_yx(acs_id)
   acs_grid = np.zeros((h8, w8), dtype=np.int32)
   anchor_grid = np.ones((h8, w8), dtype=bool)
+  if int(acs_id) < 0 or int(acs_id) >= 18:
+    return acs_grid, anchor_grid
   if cy == 1 and cx == 1:
     acs_grid[:, :] = int(acs_id)
     return acs_grid, anchor_grid
@@ -1021,37 +2574,48 @@ _STAGE1_AC_CANDIDATE_CACHE: dict[tuple[Any, ...], dict[int, dict[str, Any]]] = {
 def stage1_explore_ac_candidates_compositing(
     srgb_hwc: np.ndarray | jax.Array,
     distance: float = 1.0,
-    rd_lambda: float = 0.08,
+    rd_lambda: float | None = None,
     vgg_params: Any | None = None,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     candidate_strategies: Sequence[int] | None = None,
 ) -> dict[int, dict[str, Any]]:
-  """Stage 1: Evaluates candidate `AcStrategy` block shapes on an image using spatial Rate-WD maps."""
+  """Stage 1: Evaluates candidate `<= 32x32` `AcStrategy` block shapes (`0..17`) using spatial Rate-WD maps."""
   arr = _normalize_srgb_hwc(srgb_hwc)
   h, w, _ = arr.shape
   h8, w8 = (h + 7) // 8, (w + 7) // 8
+  eff_lam = (
+      float(rd_lambda)
+      if rd_lambda is not None
+      else calibrate_rd_lambda(distance)
+  )
 
   if candidate_strategies is None:
-    cands = [0, 2, 3, 14]
-    if h8 >= 2 and w8 >= 1:
-      cands.append(6)  # DCT16X8
-    if h8 >= 1 and w8 >= 2:
-      cands.append(7)  # DCT8X16
-    if h8 >= 2 and w8 >= 2:
-      cands.append(4)  # DCT16X16
-    if h8 >= 4 and w8 >= 4:
-      cands.append(5)  # DCT32X32
+    cands = [
+        int(s_id)
+        for s_id in DEFAULT_CANDIDATE_AC_STRATEGIES
+        if h8 >= ACS_COVERED_BLOCKS_Y[s_id] and w8 >= ACS_COVERED_BLOCKS_X[s_id]
+    ]
   else:
-    cands = [int(s) for s in candidate_strategies]
+    cands = [
+        int(s)
+        for s in candidate_strategies
+        if 0 <= int(s) < 18
+    ]
 
+  arr_sig = (
+      round(float(arr[0, 0, 0]), 6),
+      round(float(arr[h // 2, w // 2, 1]), 6),
+      round(float(arr[-1, -1, 2]), 6),
+      round(float(np.mean(arr)), 6),
+  )
   cache_key = (
       h,
       w,
       round(float(distance), 6),
-      round(float(rd_lambda), 6),
+      round(float(eff_lam), 6),
       round(float(log2_sigma), 6),
       tuple(cands),
-      arr.tobytes(),
+      arr_sig,
   )
   if cache_key in _STAGE1_AC_CANDIDATE_CACHE:
     return copy.deepcopy(_STAGE1_AC_CANDIDATE_CACHE[cache_key])
@@ -1064,40 +2628,85 @@ def stage1_explore_ac_candidates_compositing(
       block_size=8, num_levels=1, num_scales=2
   )
 
-  base_state = init_state_from_rgb_jax(
-      arr, distance=distance, epf_iters=0, gab=True
+  base_state = None
+  eval_fn = None
+  default_cands = tuple(
+      int(s_id)
+      for s_id in DEFAULT_CANDIDATE_AC_STRATEGIES
+      if h8 >= ACS_COVERED_BLOCKS_Y[s_id] and w8 >= ACS_COVERED_BLOCKS_X[s_id]
   )
-  lam_per_px = float(rd_lambda) / float(max(h * w, 1))
+  lam_per_px = float(eff_lam) / float(max(h * w, 1))
   results: dict[int, dict[str, Any]] = {}
 
   for s in cands:
     cy, cx = _acs_covered_yx(s)
     if h8 < cy or w8 < cx:
       continue
+    s_key = (
+        h,
+        w,
+        round(float(distance), 6),
+        round(float(eff_lam), 6),
+        round(float(log2_sigma), 6),
+        int(s),
+        arr_sig,
+    )
+    if s_key in _STAGE1_AC_CANDIDATE_CACHE:
+      results[int(s)] = copy.deepcopy(_STAGE1_AC_CANDIDATE_CACHE[s_key])
+      continue
+    if base_state is None:
+      base_state = _init_frame_state_with_aq_epf_cfl(
+          arr, distance=distance, gab=None
+      )
+      eval_fn = _get_compiled_stage1_eval(
+          h,
+          w,
+          epf_iters=int(base_state.epf_iters),
+          gab=bool(base_state.gab),
+          canon_s=default_cands,
+          x_qm_scale=int(base_state.x_qm_scale),
+          b_qm_scale=int(base_state.b_qm_scale),
+      )
     st = copy.deepcopy(base_state)
     acs_grid, anchor_grid = _build_uniform_ac_strategy_grid(h8, w8, s)
     st.ac_strategy = acs_grid
     st.ac_strategy_Anchor = anchor_grid
-    dc_c, ac_c = compute_continuous_dc_ac_jax(target_xyb, st, apply_inv_gab=True)
-    st.dc_quant = np.asarray(jnp.round(dc_c), dtype=np.int32)
-    st.quant_ac = np.asarray(jnp.round(ac_c), dtype=np.int32)
-    rec_srgb = reconstruct_single_frame(st, hard=True)
+    st.raw_quant_field = np.asarray(
+        broadcast_quant_field_to_ac_strategy(st.raw_quant_field, acs_grid),
+        dtype=np.int32,
+    )
+    assert eval_fn is not None
+    dc_c, ac_c, dc_q_j, ac_q_j, rec_srgb, rate_map_j = eval_fn(
+        target_xyb,
+        jnp.asarray(acs_grid, dtype=jnp.int32),
+        jnp.float32(st.global_scale),
+        jnp.float32(st.quant_dc),
+        jnp.asarray(st.raw_quant_field, dtype=jnp.float32),
+        jnp.asarray(st.ytox_map, dtype=jnp.float32),
+        jnp.asarray(st.ytob_map, dtype=jnp.float32),
+        jnp.float32(st.ytox_dc),
+        jnp.float32(st.ytob_dc),
+        jnp.asarray(st.epf_sharpness, dtype=jnp.float32),
+    )
+    st.dc_quant = np.asarray(dc_q_j, dtype=np.int32)
+    st.quant_ac = np.asarray(ac_q_j, dtype=np.int32)
+    s1_log2_sigma = (
+        float(log2_sigma)
+        * float(np.clip((float(distance) - 0.18) / 0.57, 0.0, 1.0))
+        if float(distance) < 0.75
+        else float(log2_sigma)
+    )
     _, wd_map_jax = spatial_wd_fn(
         rec_srgb,
         target_j,
         vgg_params,
         block_size=8,
-        log2_sigma=float(log2_sigma),
+        log2_sigma=s1_log2_sigma,
         num_levels=1,
         num_scales=2,
     )
     wd_map = np.asarray(wd_map_jax, dtype=np.float32)
-    rate_info = compute_spatial_rate_map_bits(
-        st,
-        quant_ac=jnp.asarray(st.quant_ac, dtype=jnp.float32),
-        dc_quant=jnp.asarray(st.dc_quant, dtype=jnp.float32),
-    )
-    rate_map = np.asarray(rate_info["block_bits"], dtype=np.float32)
+    rate_map = np.asarray(rate_map_j, dtype=np.float32)
     j_map = wd_map + lam_per_px * rate_map
     j_sum = float(np.sum(j_map))
     results[int(s)] = {
@@ -1112,143 +2721,68 @@ def stage1_explore_ac_candidates_compositing(
         "j_score": j_sum,
         "j_init": j_sum,
         "state": st,
-        "dc_cont": dc_c,
-        "ac_cont": ac_c,
+        "dc_cont": np.asarray(dc_c, dtype=np.float32),
+        "ac_cont": np.asarray(ac_c, dtype=np.float32),
     }
-  if len(_STAGE1_AC_CANDIDATE_CACHE) < 32:
-    _STAGE1_AC_CANDIDATE_CACHE[cache_key] = copy.deepcopy(results)
+    if len(_STAGE1_AC_CANDIDATE_CACHE) >= 32:
+      _STAGE1_AC_CANDIDATE_CACHE.clear()
+    _STAGE1_AC_CANDIDATE_CACHE[s_key] = copy.deepcopy(results[int(s)])
+  _STAGE1_AC_CANDIDATE_CACHE[cache_key] = copy.deepcopy(results)
   return results
+
+
+def _build_anchor_grid_from_acs(acs_grid: np.ndarray) -> np.ndarray:
+  """Constructs boolean `ac_strategy_Anchor` `(h8, w8)` from valid `acs_grid`."""
+  h8, w8 = acs_grid.shape
+  anchor = np.zeros((h8, w8), dtype=bool)
+  visited = np.zeros((h8, w8), dtype=bool)
+  for by in range(h8):
+    for bx in range(w8):
+      if visited[by, bx]:
+        continue
+      s = int(acs_grid[by, bx])
+      cy, cx = _acs_covered_yx(s)
+      anchor[by, bx] = True
+      visited[by : by + cy, bx : bx + cx] = True
+  return anchor
 
 
 def stage2_select_non_overlapping_ac_strategy_compositing(
     stage1_candidates: dict[int, dict[str, Any]],
     h8: int,
     w8: int,
-    multi_block_margin: float = 0.96,
+    multi_block_margin: float = 0.98,
 ) -> tuple[np.ndarray, np.ndarray]:
-  """Stage 2: Dynamic-programming non-overlapping `AcStrategy` tiling minimizing local Rate-WD cost."""
-  acs_grid = np.zeros((h8, w8), dtype=np.int32)
-  anchor_grid = np.ones((h8, w8), dtype=bool)
+  """Stage 2: Hierarchical 4x4 DP non-overlapping `<= 32x32` `AcStrategy` tiling within 64x64 CfL tiles."""
   if not stage1_candidates:
-    return acs_grid, anchor_grid
+    return np.zeros((h8, w8), dtype=np.int32), np.ones((h8, w8), dtype=bool)
 
-  cands_1x1 = [
-      s for s in stage1_candidates if _acs_covered_yx(s) == (1, 1)
-  ]
-  if not cands_1x1:
-    cands_1x1 = [0]
+  weighted_maps: dict[int, np.ndarray] = {}
+  mb_inv = 1.0 / max(float(multi_block_margin), 1e-6)
+  for s, info in stage1_candidates.items():
+    s_int = int(s)
+    if s_int < 0 or s_int >= 18:
+      continue
+    j_map = np.asarray(info["j_map"], dtype=np.float32)
+    cy, cx = _acs_covered_yx(s_int)
+    if s_int == 0:
+      weighted_maps[s_int] = j_map
+    elif cy == 1 and cx == 1:
+      weighted_maps[s_int] = j_map * 1.015
+    else:
+      weighted_maps[s_int] = j_map * mb_inv
 
-  best_1x1_id = np.zeros((h8, w8), dtype=np.int32)
-  best_1x1_cost = np.full((h8, w8), np.inf, dtype=np.float32)
-  for s in cands_1x1:
-    j_map = np.asarray(stage1_candidates[s]["j_map"], dtype=np.float32)
-    # Give slight preference to DCT8 (s==0) unless another 1x1 strategy strictly improves J
-    eff_map = j_map if s == 0 else j_map * 1.015
-    better = eff_map < best_1x1_cost
-    best_1x1_cost = np.where(better, eff_map, best_1x1_cost)
-    best_1x1_id = np.where(better, int(s), best_1x1_id)
-
-  acs_grid[:, :] = best_1x1_id
-  cost_grid = best_1x1_cost.copy()
-
-  # Step 1: Within each 2x2 block cell (aligned inside 8x8 block group), choose the lowest-cost
-  # disjoint tiling among: (A) vertical 2x1 columns (s=6) / 1x1s, (B) horizontal 1x2 rows (s=7) / 1x1s,
-  # and (C) one 2x2 block (s=4, DCT16X16).
-  cand_6 = (
-      np.asarray(stage1_candidates[6]["j_map"], dtype=np.float32)
-      if 6 in stage1_candidates
-      else None
+  acs_u8 = stage2_select_non_overlapping_ac_strategy(
+      weighted_maps, allow_multiblock=True, h8=h8, w8=w8
   )
-  cand_7 = (
-      np.asarray(stage1_candidates[7]["j_map"], dtype=np.float32)
-      if 7 in stage1_candidates
-      else None
-  )
-  cand_4 = (
-      np.asarray(stage1_candidates[4]["j_map"], dtype=np.float32)
-      if 4 in stage1_candidates
-      else None
-  )
-  for by in range(0, h8 - 1, 2):
-    for bx in range(0, w8 - 1, 2):
-      if (by // 8) != ((by + 1) // 8) or (bx // 8) != ((bx + 1) // 8):
-        continue
-      # Baseline 1x1 tiling of this 2x2 cell
-      best_cell_acs = acs_grid[by : by + 2, bx : bx + 2].copy()
-      best_cell_anc = np.ones((2, 2), dtype=bool)
-      best_cell_cost_map = cost_grid[by : by + 2, bx : bx + 2].copy()
-      best_cell_total = float(np.sum(best_cell_cost_map))
-
-      # Option A: vertical 2x1 columns (s=6)
-      if cand_6 is not None:
-        acs_a = acs_grid[by : by + 2, bx : bx + 2].copy()
-        anc_a = np.ones((2, 2), dtype=bool)
-        cmap_a = cost_grid[by : by + 2, bx : bx + 2].copy()
-        for dx in (0, 1):
-          sub_c = float(np.sum(cmap_a[:, dx]))
-          c6 = float(np.sum(cand_6[by : by + 2, bx + dx]))
-          if c6 < multi_block_margin * sub_c:
-            acs_a[:, dx] = 6
-            anc_a[:, dx] = [True, False]
-            cmap_a[:, dx] = cand_6[by : by + 2, bx + dx]
-        tot_a = float(np.sum(cmap_a))
-        if tot_a < best_cell_total:
-          best_cell_total = tot_a
-          best_cell_acs = acs_a
-          best_cell_anc = anc_a
-          best_cell_cost_map = cmap_a
-
-      # Option B: horizontal 1x2 rows (s=7)
-      if cand_7 is not None:
-        acs_b = acs_grid[by : by + 2, bx : bx + 2].copy()
-        anc_b = np.ones((2, 2), dtype=bool)
-        cmap_b = cost_grid[by : by + 2, bx : bx + 2].copy()
-        for dy in (0, 1):
-          sub_r = float(np.sum(cmap_b[dy, :]))
-          c7 = float(np.sum(cand_7[by + dy, bx : bx + 2]))
-          if c7 < multi_block_margin * sub_r:
-            acs_b[dy, :] = 7
-            anc_b[dy, :] = [True, False]
-            cmap_b[dy, :] = cand_7[by + dy, bx : bx + 2]
-        tot_b = float(np.sum(cmap_b))
-        if tot_b < best_cell_total:
-          best_cell_total = tot_b
-          best_cell_acs = acs_b
-          best_cell_anc = anc_b
-          best_cell_cost_map = cmap_b
-
-      # Option C: single 2x2 block (s=4)
-      if cand_4 is not None:
-        c4 = float(np.sum(cand_4[by : by + 2, bx : bx + 2]))
-        if c4 < multi_block_margin * best_cell_total:
-          best_cell_total = c4
-          best_cell_acs = np.full((2, 2), 4, dtype=np.int32)
-          best_cell_anc = np.zeros((2, 2), dtype=bool)
-          best_cell_anc[0, 0] = True
-          best_cell_cost_map = cand_4[by : by + 2, bx : bx + 2].copy()
-
-      acs_grid[by : by + 2, bx : bx + 2] = best_cell_acs
-      anchor_grid[by : by + 2, bx : bx + 2] = best_cell_anc
-      cost_grid[by : by + 2, bx : bx + 2] = best_cell_cost_map
-
-  # Step 2: Within each 4x4 block cell (union of four complete 2x2 cells), test s=5 (DCT32X32)
-  if 5 in stage1_candidates:
-    cand_5 = np.asarray(stage1_candidates[5]["j_map"], dtype=np.float32)
-    for by in range(0, h8 - 3, 4):
-      for bx in range(0, w8 - 3, 4):
-        if (by // 8) != ((by + 3) // 8) or (bx // 8) != ((bx + 3) // 8):
-          continue
-        sub_cost = float(np.sum(cost_grid[by : by + 4, bx : bx + 4]))
-        c5 = float(np.sum(cand_5[by : by + 4, bx : bx + 4]))
-        if c5 < multi_block_margin * sub_cost:
-          acs_grid[by : by + 4, bx : bx + 4] = 5
-          anchor_grid[by : by + 4, bx : bx + 4] = False
-          anchor_grid[by, bx] = True
-          cost_grid[by : by + 4, bx : bx + 4] = cand_5[
-              by : by + 4, bx : bx + 4
-          ]
-
+  acs_grid = np.asarray(acs_u8, dtype=np.int32)
+  validate_ac_strategy_tiling(acs_grid)
+  anchor_grid = _build_anchor_grid_from_acs(acs_grid)
   return acs_grid, anchor_grid
+
+
+_STAGE1_MULTIRES_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_STAGE1_MAIN_DP_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def _stage1_multires_rate_wd_analysis(
@@ -1256,28 +2790,45 @@ def _stage1_multires_rate_wd_analysis(
     upsampling: int = 2,
     distance: float = 1.0,
     ref_distance: float | None = None,
-    rd_lambda: float = 0.08,
+    rd_lambda: float | None = None,
     dilate_blocks: int = 0,
     vgg_params: Any | None = None,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     explore_ac_strategy: bool = True,
 ) -> dict[str, Any]:
-  """Computes multi-resolution Rate-WD spatial advantage maps `Delta J_patch(by, bx) = J_main - J_{ref, U}`.
-
-  Replaces all static sRGB pixel-MSE thresholding (`F3`) with genuine Rate-WD
-  spatial cost comparisons using `compute_spatial_wd_map` and
-  `compute_spatial_rate_map_bits`.
-  """
+  """Computes multi-resolution Rate-WD spatial advantage maps `Delta J_patch(by, bx) = J_main - J_{ref, U}`."""
   arr = _normalize_srgb_hwc(srgb_hwc)
   h, w, _ = arr.shape
   h8, w8 = (h + 7) // 8, (w + 7) // 8
   u = int(upsampling)
   d_main = float(distance)
-  d_ref = (
-      float(ref_distance)
-      if ref_distance is not None
-      else max(0.35, d_main * 1.35)
+  eff_lam = (
+      float(rd_lambda)
+      if rd_lambda is not None
+      else calibrate_rd_lambda(d_main)
   )
+  d_ref = _calibrate_ref_distance(d_main, eff_lam, ref_distance)
+  arr_sig = (
+      round(float(arr[0, 0, 0]), 6),
+      round(float(arr[h // 2, w // 2, 1]), 6),
+      round(float(arr[-1, -1, 2]), 6),
+      round(float(np.mean(arr)), 6),
+  )
+  m_cache_key = (
+      h,
+      w,
+      u,
+      round(d_main, 6),
+      round(d_ref, 6),
+      round(float(eff_lam), 6),
+      int(dilate_blocks),
+      round(float(log2_sigma), 6),
+      bool(explore_ac_strategy),
+      arr_sig,
+  )
+  if m_cache_key in _STAGE1_MULTIRES_CACHE:
+    return copy.deepcopy(_STAGE1_MULTIRES_CACHE[m_cache_key])
+
   target_j = jnp.asarray(arr, dtype=jnp.float32)
   target_xyb = srgb_to_xyb(jnp.moveaxis(target_j, -1, 0))
 
@@ -1287,62 +2838,128 @@ def _stage1_multires_rate_wd_analysis(
       block_size=8, num_levels=1, num_scales=2
   )
 
-  # 1. Stage 1 & 2 on full-resolution main candidate
-  cand_strats = (0, 2, 3, 14, 4) if explore_ac_strategy else (0,)
-  stage1_cands = stage1_explore_ac_candidates_compositing(
-      arr,
-      distance=d_main,
-      rd_lambda=rd_lambda,
-      vgg_params=vgg_params,
-      log2_sigma=log2_sigma,
-      candidate_strategies=cand_strats,
+  # 1. Stage 1 & 2 on full-resolution main candidate (independent of upsampling U)
+  main_dp_key = (
+      h,
+      w,
+      round(d_main, 6),
+      round(float(eff_lam), 6),
+      round(float(log2_sigma), 6),
+      bool(explore_ac_strategy),
+      arr_sig,
   )
-  stage2_acs, stage2_anchors = (
-      stage2_select_non_overlapping_ac_strategy_compositing(
-          stage1_cands, h8, w8
-      )
-  )
-  main_state = copy.deepcopy(stage1_cands[0]["state"])
-  if np.any(stage2_acs != 0):
-    main_state.ac_strategy = stage2_acs
-    main_state.ac_strategy_Anchor = stage2_anchors
-    dc_m, ac_m = compute_continuous_dc_ac_jax(
-        target_xyb, main_state, apply_inv_gab=True
-    )
-    main_state.dc_quant = np.asarray(jnp.round(dc_m), dtype=np.int32)
-    main_state.quant_ac = np.asarray(jnp.round(ac_m), dtype=np.int32)
-    rec_main = reconstruct_single_frame(main_state, hard=True)
-    _, wd_main_jax = spatial_wd_fn(
-        rec_main,
-        target_j,
-        vgg_params,
-        block_size=8,
-        log2_sigma=float(log2_sigma),
-        num_levels=1,
-        num_scales=2,
-    )
-    wd_main_map = np.asarray(wd_main_jax, dtype=np.float32)
-    rate_main_info = compute_spatial_rate_map_bits(
-        main_state,
-        quant_ac=jnp.asarray(main_state.quant_ac, dtype=jnp.float32),
-        dc_quant=jnp.asarray(main_state.dc_quant, dtype=jnp.float32),
-    )
-    rate_main_map = np.asarray(rate_main_info["block_bits"], dtype=np.float32)
+  if main_dp_key in _STAGE1_MAIN_DP_CACHE:
+    dp_cached = copy.deepcopy(_STAGE1_MAIN_DP_CACHE[main_dp_key])
+    stage1_cands = dp_cached["stage1_cands"]
+    stage2_acs = dp_cached["stage2_acs"]
+    stage2_anchors = dp_cached["stage2_anchors"]
+    main_state = dp_cached["main_state"]
+    dc_m = dp_cached["dc_m"]
+    ac_m = dp_cached["ac_m"]
+    wd_main_map = dp_cached["wd_main_map"]
+    rate_main_map = dp_cached["rate_main_map"]
   else:
-    dc_m = stage1_cands[0]["dc_cont"]
-    ac_m = stage1_cands[0]["ac_cont"]
-    wd_main_map = stage1_cands[0]["wd_map"]
-    rate_main_map = stage1_cands[0]["rate_map_bits"]
+    cand_strats = None if explore_ac_strategy else (0,)
+    stage1_cands = stage1_explore_ac_candidates_compositing(
+        arr,
+        distance=d_main,
+        rd_lambda=eff_lam,
+        vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
+        candidate_strategies=cand_strats,
+    )
+    stage2_acs, stage2_anchors = (
+        stage2_select_non_overlapping_ac_strategy_compositing(
+            stage1_cands, h8, w8
+        )
+    )
+    main_state = copy.deepcopy(stage1_cands[0]["state"])
+    if np.any(stage2_acs != 0):
+      main_state.ac_strategy = stage2_acs
+      main_state.ac_strategy_Anchor = stage2_anchors
+      rq_m, epf_s_m, _ = select_quant_and_epf_jax(
+          arr, distance=d_main, ac_strategy=stage2_acs
+      )
+      main_state.raw_quant_field = np.asarray(rq_m, dtype=np.int32)
+      main_state.epf_sharpness = np.asarray(epf_s_m, dtype=np.uint8)
+      default_cands_m = tuple(
+          int(s_id)
+          for s_id in DEFAULT_CANDIDATE_AC_STRATEGIES
+          if h8 >= ACS_COVERED_BLOCKS_Y[s_id] and w8 >= ACS_COVERED_BLOCKS_X[s_id]
+      )
+      eval_main_fn = _get_compiled_stage1_eval(
+          h,
+          w,
+          epf_iters=int(main_state.epf_iters),
+          gab=bool(main_state.gab),
+          canon_s=default_cands_m,
+          x_qm_scale=int(main_state.x_qm_scale),
+          b_qm_scale=int(main_state.b_qm_scale),
+      )
+      dc_m, ac_m, dc_mq_j, ac_mq_j, rec_main, rate_main_j = eval_main_fn(
+          target_xyb,
+          jnp.asarray(stage2_acs, dtype=jnp.int32),
+          jnp.float32(main_state.global_scale),
+          jnp.float32(main_state.quant_dc),
+          jnp.asarray(main_state.raw_quant_field, dtype=jnp.float32),
+          jnp.asarray(main_state.ytox_map, dtype=jnp.float32),
+          jnp.asarray(main_state.ytob_map, dtype=jnp.float32),
+          jnp.float32(main_state.ytox_dc),
+          jnp.float32(main_state.ytob_dc),
+          jnp.asarray(main_state.epf_sharpness, dtype=jnp.float32),
+      )
+      main_state.dc_quant = np.asarray(dc_mq_j, dtype=np.int32)
+      main_state.quant_ac = np.asarray(ac_mq_j, dtype=np.int32)
+      _, wd_main_jax = spatial_wd_fn(
+          rec_main,
+          target_j,
+          vgg_params,
+          block_size=8,
+          log2_sigma=float(log2_sigma),
+          num_levels=1,
+          num_scales=2,
+      )
+      wd_main_map = np.asarray(wd_main_jax, dtype=np.float32)
+      rate_main_map = np.asarray(rate_main_j, dtype=np.float32)
+      dc_m = np.asarray(dc_m, dtype=np.float32)
+      ac_m = np.asarray(ac_m, dtype=np.float32)
+    else:
+      dc_m = np.asarray(stage1_cands[0]["dc_cont"], dtype=np.float32)
+      ac_m = np.asarray(stage1_cands[0]["ac_cont"], dtype=np.float32)
+      wd_main_map = stage1_cands[0]["wd_map"]
+      rate_main_map = stage1_cands[0]["rate_map_bits"]
+    if len(_STAGE1_MAIN_DP_CACHE) >= 2:
+      _STAGE1_MAIN_DP_CACHE.clear()
+    _STAGE1_MAIN_DP_CACHE[main_dp_key] = copy.deepcopy({
+        "stage1_cands": stage1_cands,
+        "stage2_acs": stage2_acs,
+        "stage2_anchors": stage2_anchors,
+        "main_state": main_state,
+        "dc_m": dc_m,
+        "ac_m": ac_m,
+        "wd_main_map": wd_main_map,
+        "rate_main_map": rate_main_map,
+    })
 
-  lam_per_px = float(rd_lambda) / float(max(h * w, 1))
+  lam_per_px = float(eff_lam) / float(max(h * w, 1))
   j_main_map = wd_main_map + lam_per_px * rate_main_map
 
   # 2. Low-resolution reference candidate (downsampled by U, upsampled in XYB)
   rgb_low_raw = downsample_rgb_jax(arr, u)
-  ref_state_init = init_state_from_rgb_jax(
-      rgb_low_raw, distance=d_ref, epf_iters=0, gab=True
+  ref_state_init = _init_frame_state_with_aq_epf_cfl(
+      rgb_low_raw, distance=d_ref, gab=None
   )
-  ref_xyb_rec = reconstruct_single_frame_xyb(ref_state_init, hard=True)
+  ref_fwd_fn, _ = _get_frame_kernels(ref_state_init, enable_noise=False)
+  ref_xyb_rec = ref_fwd_fn(
+      jnp.asarray(ref_state_init.quant_ac, dtype=jnp.float32),
+      jnp.asarray(ref_state_init.dc_quant, dtype=jnp.float32),
+      jnp.asarray(ref_state_init.raw_quant_field, dtype=jnp.float32),
+      jnp.asarray(ref_state_init.ytox_map, dtype=jnp.float32),
+      jnp.asarray(ref_state_init.ytob_map, dtype=jnp.float32),
+      jnp.float32(ref_state_init.global_scale),
+      jnp.float32(ref_state_init.quant_dc),
+      jnp.zeros((8,), dtype=jnp.float32),
+  )
   ref_xyb_ups = upsample_jxl(ref_xyb_rec, u, out_hw=(h, w))
   topo_main = StaticVarDCTTopology(main_state)
   ref_srgb_ups = jnp.moveaxis(
@@ -1362,12 +2979,28 @@ def _stage1_multires_rate_wd_analysis(
       num_scales=2,
   )
   wd_ref_map = np.asarray(wd_ref_jax, dtype=np.float32)
-  rate_ref_info = compute_spatial_rate_map_bits(
-      ref_state_init,
-      quant_ac=jnp.asarray(ref_state_init.quant_ac, dtype=jnp.float32),
-      dc_quant=jnp.asarray(ref_state_init.dc_quant, dtype=jnp.float32),
+  eval_ref_fn = _get_compiled_stage1_eval(
+      int(ref_state_init.height),
+      int(ref_state_init.width),
+      epf_iters=int(ref_state_init.epf_iters),
+      gab=bool(ref_state_init.gab),
+      canon_s=(0,),
+      x_qm_scale=int(ref_state_init.x_qm_scale),
+      b_qm_scale=int(ref_state_init.b_qm_scale),
   )
-  rate_ref_low = np.asarray(rate_ref_info["block_bits"], dtype=np.float32)
+  _, _, _, _, _, rate_ref_j = eval_ref_fn(
+      srgb_to_xyb(jnp.moveaxis(jnp.asarray(rgb_low_raw, dtype=jnp.float32), -1, 0)),
+      jnp.asarray(ref_state_init.ac_strategy, dtype=jnp.int32),
+      jnp.float32(ref_state_init.global_scale),
+      jnp.float32(ref_state_init.quant_dc),
+      jnp.asarray(ref_state_init.raw_quant_field, dtype=jnp.float32),
+      jnp.asarray(ref_state_init.ytox_map, dtype=jnp.float32),
+      jnp.asarray(ref_state_init.ytob_map, dtype=jnp.float32),
+      jnp.float32(ref_state_init.ytox_dc),
+      jnp.float32(ref_state_init.ytob_dc),
+      jnp.asarray(ref_state_init.epf_sharpness, dtype=jnp.float32),
+  )
+  rate_ref_low = np.asarray(rate_ref_j, dtype=np.float32)
   # Map low-res block bit rate to full-res 8x8 blocks (amortized by 1 / U^2)
   by_idx = np.minimum(
       np.arange(h8)[:, None] // u, rate_ref_low.shape[0] - 1
@@ -1378,10 +3011,6 @@ def _stage1_multires_rate_wd_analysis(
   rate_ref_map = rate_ref_low[by_idx, bx_idx] / float(u * u)
   j_ref_map = wd_ref_map + lam_per_px * rate_ref_map
 
-  # Spatial Rate-WD advantage of replacing main block with low-res reference patch:
-  # Delta J_patch(by, bx) = J_main(by, bx) - J_{ref, U}(by, bx).
-  # When Delta J_patch > 0, the low-res reference has lower local Rate-WD cost (background).
-  # When Delta J_patch < 0, full-res main has lower local Rate-WD cost (foreground detail).
   delta_j_patch = j_main_map - j_ref_map
   fg_adv = -delta_j_patch  # > 0 where full-res main beats low-res reference
 
@@ -1402,8 +3031,9 @@ def _stage1_multires_rate_wd_analysis(
     fg_mask_dilated = fg_mask_dilated.copy()
     fg_mask_dilated[min_idx] = False
 
-  # Ensure multi-block AcStrategies don't straddle foreground/background mask boundaries:
+  # Ensure multi-block AcStrategies don't straddle foreground/background or DC-halo boundaries:
   # split any straddling multi-block transform cleanly into 1x1 DCT8 (s=0) blocks.
+  halo_blocks = _dilate_bool_grid(fg_mask_dilated, radius=1)
   split_any = False
   for by in range(h8):
     for bx in range(w8):
@@ -1412,7 +3042,10 @@ def _stage1_multires_rate_wd_analysis(
         cy, cx = _acs_covered_yx(s)
         if cy > 1 or cx > 1:
           sub_m = fg_mask_dilated[by : by + cy, bx : bx + cx]
-          if not (np.all(sub_m) or not np.any(sub_m)):
+          sub_h = halo_blocks[by : by + cy, bx : bx + cx]
+          if not (np.all(sub_m) or not np.any(sub_m)) or not (
+              np.all(sub_h) or not np.any(sub_h)
+          ):
             stage2_acs[by : by + cy, bx : bx + cx] = 0
             stage2_anchors[by : by + cy, bx : bx + cx] = True
             split_any = True
@@ -1420,6 +3053,11 @@ def _stage1_multires_rate_wd_analysis(
   if split_any:
     main_state.ac_strategy = stage2_acs.copy()
     main_state.ac_strategy_Anchor = stage2_anchors.copy()
+    rq_split, epf_s_split, _ = select_quant_and_epf_jax(
+        arr, distance=d_main, ac_strategy=stage2_acs
+    )
+    main_state.raw_quant_field = np.asarray(rq_split, dtype=np.int32)
+    main_state.epf_sharpness = np.asarray(epf_s_split, dtype=np.uint8)
     dc_m, ac_m = compute_continuous_dc_ac_jax(
         target_xyb, main_state, apply_inv_gab=True
     )
@@ -1427,13 +3065,32 @@ def _stage1_multires_rate_wd_analysis(
     main_state.quant_ac = np.asarray(jnp.round(ac_m), dtype=np.int32)
 
   bg_mask_blocks = ~fg_mask_dilated
-  fg_px_mask = np.repeat(np.repeat(fg_mask_blocks, 8, axis=0), 8, axis=1)[
+  fg_px_mask = np.repeat(np.repeat(fg_mask_dilated, 8, axis=0), 8, axis=1)[
       :h, :w, None
   ]
-  smooth_full = jnp.where(jnp.asarray(fg_px_mask), ref_srgb_ups, target_j)
-  rgb_low_smooth = downsample_rgb_jax(smooth_full, u)
+  fg_px_j = jnp.asarray(fg_px_mask, dtype=bool)
+  not_fg_f = (~fg_px_j).astype(jnp.float32)
+  bg_mean = jnp.sum(target_j * not_fg_f, axis=(0, 1), keepdims=True) / jnp.maximum(
+      jnp.sum(not_fg_f), 1.0
+  )
+  smooth_full = jnp.where(fg_px_j, bg_mean, target_j)
+  for _ in range(12):
+    p_sf = jnp.pad(smooth_full, ((2, 2), (2, 2), (0, 0)), mode="edge")
+    blur_sf = (
+        p_sf[:-4, 2:-2]
+        + p_sf[4:, 2:-2]
+        + p_sf[2:-2, :-4]
+        + p_sf[2:-2, 4:]
+        + p_sf[1:-3, 2:-2]
+        + p_sf[3:-1, 2:-2]
+        + p_sf[2:-2, 1:-3]
+        + p_sf[2:-2, 3:-1]
+    ) / 8.0
+    smooth_full = jnp.where(fg_px_j, blur_sf, target_j)
+  rgb_low_smooth = _project_lowres_rgb_wd_jax(
+      smooth_full, u, vgg_params=vgg_params, log2_sigma=float(log2_sigma)
+  )
 
-  # Continuous Rate-WD normalized spatial advantage map in [0, 1] for alpha initialization
   adv_shift = fg_adv - float(np.median(fg_adv))
   adv_scale = max(float(np.percentile(np.abs(adv_shift), 90.0)), 1e-5)
   fg_prob_blocks = 1.0 / (1.0 + np.exp(-np.clip(adv_shift / adv_scale, -8.0, 8.0)))
@@ -1442,7 +3099,7 @@ def _stage1_multires_rate_wd_analysis(
       dtype=jnp.float32,
   )
 
-  return {
+  out_info = {
       "fg_mask_blocks": fg_mask_blocks,
       "fg_mask_dilated": fg_mask_dilated,
       "bg_mask_blocks": bg_mask_blocks,
@@ -1450,16 +3107,20 @@ def _stage1_multires_rate_wd_analysis(
       "spatial_delta_j_map": delta_j_patch,
       "stage1_main_j_map": j_main_map,
       "stage1_ref_j_map": j_ref_map,
-      "detail_map_01": detail_map_01,
-      "rgb_low_smooth": rgb_low_smooth,
-      "rgb_low_raw": rgb_low_raw,
+      "detail_map_01": np.asarray(detail_map_01, dtype=np.float32),
+      "rgb_low_smooth": np.asarray(rgb_low_smooth, dtype=np.float32),
+      "rgb_low_raw": np.asarray(rgb_low_raw, dtype=np.float32),
       "stage1_candidates": stage1_cands,
       "stage2_ac_strategy": stage2_acs,
       "stage2_anchors": stage2_anchors,
       "main_state": main_state,
-      "main_dc_cont": dc_m,
-      "main_ac_cont": ac_m,
+      "main_dc_cont": np.asarray(dc_m, dtype=np.float32),
+      "main_ac_cont": np.asarray(ac_m, dtype=np.float32),
   }
+  if len(_STAGE1_MULTIRES_CACHE) >= 4:
+    _STAGE1_MULTIRES_CACHE.clear()
+  _STAGE1_MULTIRES_CACHE[m_cache_key] = copy.deepcopy(out_info)
+  return out_info
 
 
 def compute_detail_mask_jax(
@@ -1469,14 +3130,10 @@ def compute_detail_mask_jax(
     rel_threshold: float = 0.15,
     abs_threshold: float = 2.0e-4,
     dilate_blocks: int = 0,
-    rd_lambda: float = 0.08,
+    rd_lambda: float | None = None,
     vgg_params: Any | None = None,
 ) -> dict[str, Any]:
-  """Computes multi-resolution spatial detail mask via Stage 1 Rate-WD spatial cost analysis (`F3`).
-
-  Note: `optimize_patch_composite` and `optimize_alpha_composite` call
-  `_stage1_multires_rate_wd_analysis` directly without invoking this function.
-  """
+  """Computes multi-resolution spatial detail mask via Stage 1 Rate-WD spatial cost analysis (`F3`)."""
   del rel_threshold, abs_threshold
   return _stage1_multires_rate_wd_analysis(
       srgb_hwc,
@@ -1489,68 +3146,78 @@ def compute_detail_mask_jax(
   )
 
 
+def _expand_state_dq_3hw_np(state: JxlVarDCTState) -> np.ndarray:
+  """Builds the `(3, h8*8, w8*8)` dequant weight plane matching `state.ac_strategy` & `state.dequant_matrices`."""
+  h8, w8 = int(state.h8), int(state.w8)
+  default_dq = get_default_dequant_matrices()
+  dq_dict = state.dequant_matrices if state.dequant_matrices else default_dq
+  w_blk = np.broadcast_to(
+      np.asarray(dq_dict.get(0, default_dq[0]), dtype=np.float32)[None, None],
+      (h8, w8, 3, 8, 8),
+  ).copy()
+  acs_np = np.asarray(state.ac_strategy, dtype=np.int32)
+  anc_np = np.asarray(state.ac_strategy_Anchor, dtype=bool)
+  for s in np.unique(acs_np).tolist():
+    s_id = int(s)
+    if s_id == 0:
+      continue
+    cy, cx = _acs_covered_yx(s_id)
+    mat_s = np.asarray(dq_dict.get(s_id, default_dq[s_id]), dtype=np.float32)
+    if cy == 1 and cx == 1:
+      w_blk[acs_np == s_id] = mat_s
+    else:
+      dq_s = mat_s.reshape(3, cy, 8, cx, 8).transpose(1, 3, 0, 2, 4)
+      bys, bxs = np.nonzero(anc_np & (acs_np == s_id))
+      for by, bx in zip(bys.tolist(), bxs.tolist()):
+        w_blk[by : by + cy, bx : bx + cx] = dq_s
+  return w_blk.transpose(2, 0, 3, 1, 4).reshape(3, h8 * 8, w8 * 8).astype(
+      np.float32
+  )
+
+
 def _apply_custom_dequant_to_state(
     state: JxlVarDCTState,
-    dq_log_scale: np.ndarray | jax.Array,
-    custom_dequant: bool,
+    dq_log_scale: np.ndarray | jax.Array | None,
+    custom_dequant: bool | str,
     *,
     force_ac_non_default: bool = True,
 ) -> None:
-  """Applies and F16-roundtrips custom `DequantMatrices` & `DCQuants` on `state` when `custom_dequant=True`."""
+  """Applies `'none'` (0 DoF), `'compact'` (9 DoF), or `'full_bands'` (33 DoF) `DequantMatrices` to `state`."""
   default_dq = get_default_dequant_matrices()
-  if not custom_dequant:
-    state.dequant_matrices = {}
+  used_s = sorted(set(int(x) for x in np.unique(state.ac_strategy)) | {0})
+  setattr(state, "_orig_dequant_matrices", default_dq)
+
+  is_none_mode = (
+      custom_dequant is False
+      or (isinstance(custom_dequant, str) and custom_dequant.lower() == "none")
+      or dq_log_scale is None
+      or int(np.asarray(dq_log_scale).size) == 0
+  )
+  if is_none_mode:
+    state.dequant_matrices = {
+        s: np.asarray(default_dq[s], dtype=np.float32).copy() for s in used_s
+    }
     state.dc_quant_weights = np.array(
         DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32
     )
     return
 
-  dq_log = np.asarray(dq_log_scale, dtype=np.float32).ravel()
-  scales = np.clip(np.exp(dq_log[:3]), 0.65, 1.55)
-  dc_scales = np.clip(np.exp(dq_log[3:6]), 0.75, 1.35)
-  hf_tilt = (
-      np.clip(dq_log[6:9], -0.15, 0.15)
-      if dq_log.size >= 9
-      else np.zeros((3,), dtype=np.float32)
-  )
-  hf_tilt = np.where(np.abs(hf_tilt) < 0.01, 0.0, hf_tilt).astype(np.float32)
-  if not force_ac_non_default:
-    scales = np.where(np.abs(scales - 1.0) < 0.015, 1.0, scales).astype(
-        np.float32
-    )
-  # Guarantee strictly non-default weights when custom_dequant=True so
-  # inspect_jxl(jxl_bytes)["all_default"] is deterministically False.
-  if (
-      np.all(np.abs(scales - 1.0) < 0.015)
-      and np.all(np.abs(dc_scales - 1.0) < 0.015)
-      and np.all(np.abs(hf_tilt) < 0.01)
-  ):
+  dq_log = np.asarray(dq_log_scale, dtype=np.float32).ravel().copy()
+  if not force_ac_non_default and dq_log.size >= 3:
+    dq_log[:3] = np.where(np.abs(dq_log[:3]) < 0.015, 0.0, dq_log[:3])
+  if np.all(np.abs(dq_log) < 0.008):
     if force_ac_non_default:
-      scales = np.array([0.96, 0.94, 0.97], dtype=np.float32)
-    dc_scales = np.array([0.97, 0.95, 0.98], dtype=np.float32)
-
-  used_s = sorted(set(int(x) for x in np.unique(state.ac_strategy)) | {0})
-  setattr(state, "_orig_dequant_matrices", default_dq)
-  raw_mats: dict[int, np.ndarray] = {}
-  for s in used_s:
-    if s in (0, 4, 5, 6, 7) and np.any(np.abs(hf_tilt) >= 0.01):
-      wrows, wcols = default_dq[s].shape[1], default_dq[s].shape[2]
-      yy = np.arange(wrows, dtype=np.float32)[:, None] / max(
-          1.0, float(wrows - 1)
-      )
-      xx = np.arange(wcols, dtype=np.float32)[None, :] / max(
-          1.0, float(wcols - 1)
-      )
-      r_norm = np.sqrt(yy * yy + xx * xx) / np.float32(np.sqrt(2.0))
-      tilt_s = np.exp(hf_tilt[:, None, None] * (r_norm[None, :, :] - 0.5))
+      dq_log[:3] = np.array([0.012, -0.010, 0.012], dtype=np.float32)
     else:
-      tilt_s = 1.0
-    raw_mats[s] = (default_dq[s] * scales[:, None, None] * tilt_s).astype(
-        np.float32
-    )
-  raw_dc = (
-      np.asarray(DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32) * dc_scales
-  ).astype(np.float32)
+      state.dequant_matrices = {
+          s: np.asarray(default_dq[s], dtype=np.float32).copy() for s in used_s
+      }
+      state.dc_quant_weights = np.array(
+          DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32
+      )
+      return
+
+  raw_mats, raw_dc = _eval_dq_log_vec_np(dq_log, used_s, default_dq)
   _, proj_dc = project_custom_dequant_matrices(
       {0: raw_mats[0]}, dc_quant=raw_dc
   )
@@ -1571,31 +3238,84 @@ def _couple_candidate_ac_dc_np(
     dq_log_cand: np.ndarray | jax.Array | None,
     dq_log_base: np.ndarray | jax.Array | None,
     use_custom_dq: bool,
+    *,
+    rq_cont: np.ndarray | jax.Array | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-  """Couples unquantized DCT `(ac_np, dc_np)` with `cand_state.raw_quant_field` and `dq_log_cand`."""
-  topo_tmp = StaticVarDCTTopology(base_state)
-  rq_tl = np.clip(cand_state.raw_quant_field, 1, 256)[
-      topo_tmp.tl_by_grid, topo_tmp.tl_bx_grid
-  ].astype(np.float32)
+  """Couples unquantized DCT `(ac_np, dc_np)` with continuous `rq`, `DequantMatrices`, and CfL deltas."""
+  cached_topo = getattr(base_state, "_cached_topo_np", None)
+  if cached_topo is None:
+    cached_topo = StaticVarDCTTopology(base_state)
+    setattr(base_state, "_cached_topo_np", cached_topo)
+  tl_by_np, tl_bx_np = cached_topo.tl_by_grid_np, cached_topo.tl_bx_grid_np
+
+  rq_src = (
+      np.clip(np.asarray(rq_cont, dtype=np.float32), 1.0, 256.0)
+      if rq_cont is not None
+      else np.clip(cand_state.raw_quant_field, 1, 256).astype(np.float32)
+  )
+  rq_tl = rq_src[tl_by_np, tl_bx_np]
   rq_base_tl = np.clip(base_state.raw_quant_field, 1, 256)[
-      topo_tmp.tl_by_grid, topo_tmp.tl_bx_grid
+      tl_by_np, tl_bx_np
   ].astype(np.float32)
   rq_ratio_tl = rq_tl / np.maximum(rq_base_tl, 1.0)
   rq_ratio_px = np.repeat(np.repeat(rq_ratio_tl, 8, axis=0), 8, axis=1)[
-      None, : base_state.height, : base_state.width
+      None, :, :
   ]
-  if use_custom_dq and dq_log_cand is not None and dq_log_base is not None:
-    dq_c = np.asarray(dq_log_cand, dtype=np.float32).ravel()
-    dq_b = np.asarray(dq_log_base, dtype=np.float32).ravel()
-    ac_s = np.clip(np.exp(dq_c[:3]), 0.65, 1.55)
-    ac_s_b = np.clip(np.exp(dq_b[:3]), 0.65, 1.55)
-    dc_s = np.clip(np.exp(dq_c[3:6]), 0.75, 1.35)
-    dc_s_b = np.clip(np.exp(dq_b[3:6]), 0.75, 1.35)
-    u_ac_np = ac_np * rq_ratio_px / (ac_s / ac_s_b)[:, None, None]
-    u_dc_np = dc_np / (dc_s / dc_s_b)[:, None, None]
+
+  w_cur = _expand_state_dq_3hw_np(cand_state)
+  if (
+      use_custom_dq
+      and dq_log_cand is not None
+      and dq_log_base is not None
+      and int(np.asarray(dq_log_cand).size) > 0
+  ):
+    w_base = _expand_state_dq_3hw_np(base_state)
+    dc_w_cur = np.asarray(
+        cand_state.dc_quant_weights
+        if getattr(cand_state, "dc_quant_weights", None) is not None
+        else DEFAULT_DC_QUANT_WEIGHTS,
+        dtype=np.float32,
+    )
+    dc_w_base = np.asarray(
+        base_state.dc_quant_weights
+        if getattr(base_state, "dc_quant_weights", None) is not None
+        else DEFAULT_DC_QUANT_WEIGHTS,
+        dtype=np.float32,
+    )
+    u_ac_np = ac_np * rq_ratio_px * (w_base / np.maximum(w_cur, 1e-12))
+    u_dc_np = dc_np * (dc_w_base / np.maximum(dc_w_cur, 1e-12))[:, None, None]
   else:
     u_ac_np = ac_np * rq_ratio_px
     u_dc_np = dc_np
+
+  # Counter-adjust X and B AC coefficients for any tile CfL changes (ytox_map, ytob_map)
+  dx_tile = (
+      cand_state.ytox_map.astype(np.float32)
+      - base_state.ytox_map.astype(np.float32)
+  ) / float(cand_state.color_factor)
+  db_tile = (
+      cand_state.ytob_map.astype(np.float32)
+      - base_state.ytob_map.astype(np.float32)
+  ) / float(cand_state.color_factor)
+  if np.any(dx_tile != 0.0) or np.any(db_tile != 0.0):
+    h8_c, w8_c = int(cand_state.h8), int(cand_state.w8)
+    dx_px = np.repeat(np.repeat(dx_tile, 64, axis=0), 64, axis=1)[
+        : h8_c * 8, : w8_c * 8
+    ]
+    db_px = np.repeat(np.repeat(db_tile, 64, axis=0), 64, axis=1)[
+        : h8_c * 8, : w8_c * 8
+    ]
+    x_qm_mul = float(1.25 ** (float(cand_state.x_qm_scale) - 2.0))
+    b_qm_mul = float(1.25 ** (float(cand_state.b_qm_scale) - 2.0))
+    u_ac_masked = mask_llf_numpy(u_ac_np, cached_topo)
+    u_y = u_ac_masked[1]
+    u_ac_np = u_ac_np.copy()
+    u_ac_np[0] = u_ac_np[0] - dx_px * u_y * (
+        (w_cur[1] * x_qm_mul) / np.maximum(w_cur[0], 1e-12)
+    )
+    u_ac_np[2] = u_ac_np[2] - db_px * u_y * (
+        (w_cur[1] * b_qm_mul) / np.maximum(w_cur[2], 1e-12)
+    )
   return u_ac_np, u_dc_np
 
 
@@ -1603,16 +3323,17 @@ def _build_ac_mask_from_block_mask(
     fg_mask_blocks: np.ndarray, state: JxlVarDCTState
 ) -> tuple[jax.Array, jax.Array]:
   """Builds `(fg_ac_mask_j, fg_dc_mask_j)` respecting multi-block `AcStrategy` transforms."""
-  h8, w8 = state.h8, state.w8
   mask_blk = np.asarray(fg_mask_blocks, dtype=bool).copy()
-  for by in range(h8):
-    for bx in range(w8):
-      if state.ac_strategy_Anchor[by, bx]:
-        s = int(state.ac_strategy[by, bx])
-        cy, cx = _acs_covered_yx(s)
-        if cy > 1 or cx > 1:
-          if np.any(mask_blk[by : by + cy, bx : bx + cx]):
-            mask_blk[by : by + cy, bx : bx + cx] = True
+  acs_np = np.asarray(state.ac_strategy, dtype=np.int32)
+  anc_np = np.asarray(state.ac_strategy_Anchor, dtype=bool)
+  is_multi_anc = anc_np & ~((acs_np <= 3) | ((acs_np >= 12) & (acs_np <= 17)))
+  if np.any(is_multi_anc):
+    m_bys, m_bxs = np.nonzero(is_multi_anc)
+    for by, bx in zip(m_bys.tolist(), m_bxs.tolist()):
+      s = int(acs_np[by, bx])
+      cy, cx = _acs_covered_yx(s)
+      if np.any(mask_blk[by : by + cy, bx : bx + cx]):
+        mask_blk[by : by + cy, bx : bx + cx] = True
   ac_mask_np = np.repeat(
       np.repeat(mask_blk.astype(np.float32), 8, axis=0), 8, axis=1
   )
@@ -1748,13 +3469,60 @@ def _finalize_encode_result(
 
 
 
+def _init_ref_state_with_stage2_acs(
+    r_rgb: np.ndarray | jax.Array,
+    *,
+    d_ref: float,
+    eff_lambda: float,
+    enable_noise: bool,
+    vgg_params: Any,
+    log2_sigma: float,
+) -> JxlVarDCTState:
+  """Initializes `ReferenceOnly` frame state with Stage 1+2 `AcStrategy` selection when >= 16x16."""
+  r_state = _init_frame_state_with_aq_epf_cfl(
+      r_rgb, distance=d_ref, gab=None, enable_noise=enable_noise
+  )
+  if int(r_state.height) >= 16 and int(r_state.width) >= 16:
+    r_h8, r_w8 = int(r_state.h8), int(r_state.w8)
+    ref_cands = tuple(
+        s_id
+        for s_id in (0, 4, 5, 6, 7)
+        if r_h8 >= ACS_COVERED_BLOCKS_Y[s_id]
+        and r_w8 >= ACS_COVERED_BLOCKS_X[s_id]
+    )
+    s1_r = stage1_explore_ac_candidates_compositing(
+        r_rgb,
+        distance=d_ref,
+        rd_lambda=eff_lambda,
+        vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
+        candidate_strategies=ref_cands,
+    )
+    acs_r, anc_r = stage2_select_non_overlapping_ac_strategy_compositing(
+        s1_r, int(r_state.h8), int(r_state.w8)
+    )
+    if np.any(acs_r != 0):
+      r_state.ac_strategy = acs_r.copy()
+      r_state.ac_strategy_Anchor = anc_r.copy()
+      used_r = 0
+      for s_u in np.unique(acs_r):
+        used_r |= 1 << int(s_u)
+      r_state.used_acs = used_r
+      rq_r, epf_r, _ = select_quant_and_epf_jax(
+          r_rgb, distance=d_ref, ac_strategy=acs_r
+      )
+      r_state.raw_quant_field = np.asarray(rq_r, dtype=np.int32)
+      r_state.epf_sharpness = np.asarray(epf_r, dtype=np.uint8)
+  return r_state
+
+
 def optimize_patch_composite(
     rgb_u8: np.ndarray | jax.Array | None = None,
     upsampling: int | str = 2,
     blend_mode: int | str = "auto",
     distance: float = 1.0,
     ref_distance: float | None = None,
-    lambda_rd: float = 0.08,
+    lambda_rd: float | None = None,
     rd_lambda: float | None = None,
     steps: int | None = None,
     num_steps: int | None = None,
@@ -1763,14 +3531,14 @@ def optimize_patch_composite(
     lr_noise: float = 0.005,
     lr_dequant: float = 0.008,
     enable_noise: bool = False,
-    custom_dequant: bool | None = None,
-    enable_custom_dequant: bool | None = None,
-    optimize_dequant_matrices: bool | None = None,
-    use_custom_dequant: bool | None = None,
+    custom_dequant: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
     verify_decoders: bool = True,
     patches: Sequence[PatchEntry] | None = None,
     vgg_params: Any | None = None,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     effort: int = 7,
     candidate_upsamplings: Sequence[int] = (2, 4, 8),
     init_mode: str = "dct",
@@ -1784,18 +3552,25 @@ def optimize_patch_composite(
     raise ValueError("Either rgb_u8 or srgb_hwc must be provided.")
   init_mode_norm = _normalize_init_mode(init_mode)
   default_steps = 60 if init_mode_norm in ("zero", "random") else 24
-  eff_lambda = float(rd_lambda if rd_lambda is not None else lambda_rd)
+  eff_lambda = float(
+      rd_lambda
+      if rd_lambda is not None
+      else (
+          lambda_rd
+          if lambda_rd is not None
+          else calibrate_rd_lambda(distance)
+      )
+  )
   eff_steps = int(
       num_steps
       if num_steps is not None
       else (steps if steps is not None else default_steps)
   )
-  use_custom_dq = _resolve_custom_dequant_flag(
+  dq_spec = _resolve_custom_dequant_spec(
       custom_dequant=custom_dequant,
       enable_custom_dequant=enable_custom_dequant,
       optimize_dequant_matrices=optimize_dequant_matrices,
       use_custom_dequant=use_custom_dequant,
-      default=True,
   )
 
   parsed_bm = _parse_blend_mode(blend_mode)
@@ -1813,7 +3588,7 @@ def optimize_patch_composite(
         lr_noise=lr_noise,
         lr_dequant=lr_dequant,
         enable_noise=enable_noise,
-        custom_dequant=use_custom_dq,
+        custom_dequant=dq_spec,
         verify_decoders=verify_decoders,
         patches=patches,
         vgg_params=vgg_params,
@@ -1836,7 +3611,7 @@ def optimize_patch_composite(
         lr_noise=lr_noise,
         lr_dequant=lr_dequant,
         enable_noise=enable_noise,
-        custom_dequant=use_custom_dq,
+        custom_dequant=dq_spec,
         verify_decoders=verify_decoders,
         patches=patches,
         vgg_params=vgg_params,
@@ -1877,27 +3652,12 @@ def optimize_patch_composite(
 
   dilate = 1 if (h >= 128 and w >= 128) else 0
   d_main = float(distance)
-  d_ref = (
-      float(ref_distance)
-      if ref_distance is not None
-      else max(0.35, d_main * 1.35)
+  d_ref = _calibrate_ref_distance(d_main, eff_lambda, ref_distance)
+  m_dq_mode = select_dequant_mode_for_frame(
+      h, w, d_main, dq_spec, is_reference=False
   )
-  dq_log_init_ref = (
-      jnp.array(
-          [0.0, 0.0, 0.0, -0.02, -0.03, -0.01, 0.0, 0.0, 0.0],
-          dtype=jnp.float32,
-      )
-      if use_custom_dq
-      else jnp.zeros((9,), dtype=jnp.float32)
-  )
-  dq_log_init = (
-      jnp.array(
-          [-0.03, -0.05, -0.02, -0.02, -0.03, -0.01, 0.0, 0.0, 0.0],
-          dtype=jnp.float32,
-      )
-      if use_custom_dq
-      else jnp.zeros((9,), dtype=jnp.float32)
-  )
+  m_use_dq = m_dq_mode != "none"
+  dq_log_init = _init_dq_log_vec(m_dq_mode, is_reference=False)
   noise_lut_init = (
       estimate_noise_lut_jax(target_xyb)
       if enable_noise
@@ -1930,13 +3690,27 @@ def optimize_patch_composite(
     s2_acs_u = s1_info["stage2_ac_strategy"]
 
     r_rgb = s1_info["rgb_low_smooth"]
-    r_state = init_state_from_rgb_jax(
-        r_rgb, distance=d_ref, epf_iters=0, gab=True
+    r_state = _init_ref_state_with_stage2_acs(
+        r_rgb,
+        d_ref=d_ref,
+        eff_lambda=eff_lambda,
+        enable_noise=enable_noise,
+        vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
     )
+    r_dq_mode_u = select_dequant_mode_for_frame(
+        int(r_state.height),
+        int(r_state.width),
+        d_ref,
+        dq_spec,
+        is_reference=True,
+    )
+    r_use_dq_u = r_dq_mode_u != "none"
+    r_dq_init_u = _init_dq_log_vec(r_dq_mode_u, is_reference=True)
     _apply_custom_dequant_to_state(
         r_state,
-        dq_log_init_ref,
-        custom_dequant=use_custom_dq,
+        r_dq_init_u,
+        custom_dequant=r_dq_mode_u,
         force_ac_non_default=False,
     )
     r_xyb_low = srgb_to_xyb(jnp.moveaxis(jnp.asarray(r_rgb), -1, 0))
@@ -1973,18 +3747,79 @@ def optimize_patch_composite(
           w_main_pad.reshape(h8, 8, w8, 8).max(axis=(1, 3)) > 0.0
       )
       m_state = copy.deepcopy(s1_info["main_state"])
-      m_state.raw_quant_field[~fg_m_eff] = int(
-          np.median(m_state.raw_quant_field)
+      m_acs_clean = m_state.ac_strategy.copy()
+      m_anc_clean = m_state.ac_strategy_Anchor.copy()
+      for by_s in range(h8):
+        for bx_s in range(w8):
+          if m_anc_clean[by_s, bx_s]:
+            s_cur = int(m_acs_clean[by_s, bx_s])
+            cy_s, cx_s = _acs_covered_yx(s_cur)
+            if not np.all(fg_m_eff[by_s : by_s + cy_s, bx_s : bx_s + cx_s]):
+              m_acs_clean[by_s : by_s + cy_s, bx_s : bx_s + cx_s] = 0
+              m_anc_clean[by_s : by_s + cy_s, bx_s : bx_s + cx_s] = True
+      m_state.ac_strategy = m_acs_clean
+      m_state.ac_strategy_Anchor = m_anc_clean
+      used_m = 0
+      for s_u in np.unique(m_acs_clean):
+        used_m |= 1 << int(s_u)
+      m_state.used_acs = used_m
+      if enable_noise:
+        m_state.ytox_dc = 0
+        m_state.ytob_dc = 0
+      rq_fg_med = int(
+          np.median(
+              m_state.raw_quant_field[fg_m_eff]
+              if np.any(fg_m_eff)
+              else m_state.raw_quant_field
+          )
       )
+      m_state.raw_quant_field[~fg_m_eff] = rq_fg_med
+      m_state.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+          m_state.raw_quant_field, m_state.ac_strategy
+      )
+      epf_fg_med = np.uint8(
+          np.median(
+              m_state.epf_sharpness[fg_m_eff]
+              if np.any(fg_m_eff)
+              else m_state.epf_sharpness
+          )
+      )
+      m_state.epf_sharpness[~fg_m_eff] = epf_fg_med
       _apply_custom_dequant_to_state(
-          m_state, dq_log_init, custom_dequant=use_custom_dq
+          m_state, dq_log_init, custom_dequant=m_dq_mode
       )
       m_dc_dct, m_ac_dct = compute_continuous_dc_ac_jax(
           target_xyb, m_state, apply_inv_gab=True, init_mode="dct"
       )
       fg_ac_m_j, _ = _build_ac_mask_from_block_mask(fg_m_eff, m_state)
-      fg_dc_m_j = jnp.ones((3, h8, w8), dtype=jnp.float32)
-      dc_bg_u = jnp.zeros((3, h8, w8), dtype=jnp.float32)
+      halo_rad = (
+          0
+          if (int(m_state.epf_iters) == 0 and not bool(m_state.gab))
+          else 1
+      )
+      dc_halo = _dilate_bool_grid(fg_m_eff, radius=halo_rad)
+      for by_h in range(h8):
+        for bx_h in range(w8):
+          if m_state.ac_strategy_Anchor[by_h, bx_h]:
+            cy_h, cx_h = _acs_covered_yx(int(m_state.ac_strategy[by_h, bx_h]))
+            if (cy_h > 1 or cx_h > 1) and np.any(
+                dc_halo[by_h : by_h + cy_h, bx_h : bx_h + cx_h]
+            ):
+              dc_halo[by_h : by_h + cy_h, bx_h : bx_h + cx_h] = True
+      if np.any(dc_halo) and not np.all(dc_halo):
+        dc_np_tmp = np.asarray(m_dc_dct, dtype=np.float32)
+        dct8_halo = dc_halo & (m_state.ac_strategy == 0)
+        ref_dc_mask_med = dct8_halo if np.any(dct8_halo) else (dc_halo & m_state.ac_strategy_Anchor)
+        med_dc = np.round(np.median(dc_np_tmp[:, ref_dc_mask_med], axis=1)).astype(
+            np.float32
+        )
+        fg_dc_m_j = jnp.broadcast_to(
+            jnp.asarray(dc_halo, dtype=jnp.float32)[None, :, :], (3, h8, w8)
+        )
+        dc_bg_u = (1.0 - fg_dc_m_j) * jnp.asarray(med_dc)[:, None, None]
+      else:
+        fg_dc_m_j = jnp.ones((3, h8, w8), dtype=jnp.float32)
+        dc_bg_u = jnp.zeros((3, h8, w8), dtype=jnp.float32)
       res_xyb_u = target_xyb
     else:
       if patches is None:
@@ -2002,19 +3837,26 @@ def optimize_patch_composite(
         ]
       else:
         p_list = list(patches)
-      r_xyb_rec = reconstruct_single_frame_xyb(r_state, hard=True)
+      r_xyb_rec = _fast_reconstruct_xyb(r_state, include_noise=False)
       r_xyb_ups = upsample_jxl(r_xyb_rec, u_val, out_hw=(h, w))
       res_xyb_u = target_xyb - r_xyb_ups
       m_state, m_dc_dct, m_ac_dct = init_state_from_xyb_jax(
-          res_xyb_u, distance=d_main, epf_iters=0, gab=True
+          res_xyb_u,
+          distance=d_main,
+          epf_iters=None,
+          gab=None,
+          enable_noise=enable_noise,
       )
       m_state.ac_strategy = s2_acs_u.copy()
       m_state.ac_strategy_Anchor = s1_info["stage2_anchors"].copy()
       m_state.raw_quant_field[~fg_m_dil] = int(
           np.median(m_state.raw_quant_field)
       )
+      m_state.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+          m_state.raw_quant_field, m_state.ac_strategy
+      )
       _apply_custom_dequant_to_state(
-          m_state, dq_log_init, custom_dequant=use_custom_dq
+          m_state, dq_log_init, custom_dequant=m_dq_mode
       )
       m_dc_dct, m_ac_dct = compute_continuous_dc_ac_jax(
           res_xyb_u, m_state, apply_inv_gab=True, init_mode="dct"
@@ -2031,8 +3873,10 @@ def optimize_patch_composite(
     s2_m = copy.deepcopy(m_state)
     s2_r.quant_ac = np.round(np.asarray(r_ac_dct)).astype(np.int32)
     s2_r.dc_quant = np.round(np.asarray(r_dc_dct)).astype(np.int32)
-    s2_m.quant_ac = np.round(np.asarray(m_ac_dct)).astype(np.int32)
-    s2_m.dc_quant = np.round(np.asarray(m_dc_dct)).astype(np.int32)
+    s2_m.quant_ac = np.round(np.asarray(m_ac_dct * fg_ac_m_j)).astype(np.int32)
+    s2_m.dc_quant = np.round(
+        np.asarray(m_dc_dct * fg_dc_m_j + dc_bg_u)
+    ).astype(np.int32)
     s2_jb, _ = encode_patches_composite(
         ref_state=s2_r,
         main_state=s2_m,
@@ -2042,14 +3886,13 @@ def optimize_patch_composite(
         noise_lut=s2_noise_lut,
     )
     s2_bpp_u = (len(s2_jb) * 8.0) / float(h * w)
-    s2_rec_u = reconstruct_patch_composite(
+    s2_rec_u = _fast_reconstruct_patch_composite(
         s2_r,
         s2_m,
         u_val,
         p_list,
         include_noise=enable_noise,
         noise_lut=s2_noise_lut,
-        hard=True,
     )
     s2_wd_u = float(
         wd_only(
@@ -2067,6 +3910,9 @@ def optimize_patch_composite(
         "stage1_info": s1_info,
         "ref_state": r_state,
         "main_state": m_state,
+        "r_dq_mode": r_dq_mode_u,
+        "r_use_dq": r_use_dq_u,
+        "r_dq_init": r_dq_init_u,
         "ref_xyb_low": r_xyb_low,
         "main_target_xyb": res_xyb_u,
         "ref_dc_cont": r_dc_dct,
@@ -2090,6 +3936,10 @@ def optimize_patch_composite(
   stage2_acs = stage1_info["stage2_ac_strategy"]
   ref_state = best_s2_u["ref_state"]
   main_state = best_s2_u["main_state"]
+  r_dq_mode = str(best_s2_u["r_dq_mode"])
+  r_use_dq = bool(best_s2_u["r_use_dq"])
+  dq_log_init_ref = best_s2_u["r_dq_init"]
+  use_custom_dq = bool(m_use_dq or r_use_dq)
   patches_list = best_s2_u["patches_list"]
   fg_ac_mask_j = best_s2_u["fg_ac_mask_j"]
   fg_dc_mask_j = best_s2_u["fg_dc_mask_j"]
@@ -2133,14 +3983,13 @@ def optimize_patch_composite(
         noise_lut=s2_noise_lut,
     )
     stage2_true_bpp = (len(s2_jxl_bytes) * 8.0) / float(h * w)
-    s2_rec = reconstruct_patch_composite(
+    s2_rec = _fast_reconstruct_patch_composite(
         s2_ref,
         s2_main,
         u,
         patches_list,
         include_noise=enable_noise,
         noise_lut=s2_noise_lut,
-        hard=True,
     )
     stage2_wd = float(
         wd_only(
@@ -2178,7 +4027,8 @@ def optimize_patch_composite(
   main_gs = jnp.float32(main_state.global_scale)
   main_qdc = jnp.float32(main_state.quant_dc)
   lam_per_px = jnp.float32(float(eff_lambda) / float(h * w))
-  custom_dq_w = jnp.float32(1.0 if use_custom_dq else 0.0)
+  r_custom_dq_w = jnp.float32(1.0 if r_use_dq else 0.0)
+  m_custom_dq_w = jnp.float32(1.0 if m_use_dq else 0.0)
 
   params = {
       "ref": {
@@ -2272,9 +4122,10 @@ def optimize_patch_composite(
   total_steps = max(1, int(eff_steps))
   warmup_meta_step = int(0.35 * total_steps) if is_zero_or_rand else 0
   freeze_dq_step = max(1, int(0.8 * total_steps))
+  cluster_start_step = max(1, int(0.75 * total_steps))
   ac_rate_w = jnp.float32(0.0 if is_zero_or_rand else 1.0)
-  r_dq_base = dq_log_init_ref if use_custom_dq else None
-  m_dq_base = dq_log_init if use_custom_dq else None
+  r_dq_base = dq_log_init_ref if r_use_dq else None
+  m_dq_base = dq_log_init if m_use_dq else None
 
   for step in range(total_steps):
     r_rq_eff = jnp.clip(ref_rq + params["ref"]["rq_delta"], 1.0, 256.0)
@@ -2289,9 +4140,11 @@ def optimize_patch_composite(
         ref_gs,
         ref_qdc,
         params["ref"]["noise_lut"],
-        params["ref"]["dq_log_scale"] if use_custom_dq else None,
+        params["ref"]["dq_log_scale"] if r_use_dq else None,
         ref_rq,
         r_dq_base,
+        ref_yx,
+        ref_yb,
     )
     m_ac = params["main"]["ac"] * fg_ac_mask_j
     m_dc = params["main"]["dc"] * fg_dc_mask_j + dc_bg_j
@@ -2308,9 +4161,11 @@ def optimize_patch_composite(
         main_gs,
         main_qdc,
         n_lut_clipped,
-        params["main"]["dq_log_scale"] if use_custom_dq else None,
+        params["main"]["dq_log_scale"] if m_use_dq else None,
         main_rq,
         m_dq_base,
+        main_yx,
+        main_yb,
     )
     rec = combine_fn(r_xyb, m_xyb, w_ref_j, w_main_j, n_lut_clipped)
     wd_v, grad_rec = wd_val_and_grad(
@@ -2326,6 +4181,20 @@ def optimize_patch_composite(
         r_xyb, m_xyb, w_ref_j, w_main_j, n_lut_clipped, grad_rec
     )
 
+    r_cluster_blend = jnp.float32(
+        1.0
+        if (
+            not is_zero_or_rand
+            and step >= cluster_start_step
+            and int(ref_state.h8) * int(ref_state.w8) >= 64
+        )
+        else 0.0
+    )
+    m_cluster_blend = jnp.float32(
+        1.0
+        if (not is_zero_or_rand and step >= cluster_start_step and h8 * w8 >= 64)
+        else 0.0
+    )
     (_, ref_bits), g_ref = ref_vjp_fn(
         params["ref"],
         ref_rq,
@@ -2338,9 +4207,10 @@ def optimize_patch_composite(
         ref_dc_bg,
         grad_r_xyb,
         lam_per_px,
-        custom_dq_w,
+        r_custom_dq_w,
         r_dq_base,
         ac_rate_w,
+        r_cluster_blend,
     )
     (_, main_bits), g_main = main_vjp_fn(
         params["main"],
@@ -2354,9 +4224,10 @@ def optimize_patch_composite(
         dc_bg_j,
         grad_m_xyb,
         lam_per_px,
-        custom_dq_w,
+        m_custom_dq_w,
         m_dq_base,
         ac_rate_w,
+        m_cluster_blend,
     )
     if is_zero_or_rand:
       r_ac_p = params["ref"]["ac"]
@@ -2386,8 +4257,9 @@ def optimize_patch_composite(
       g_main["rq_delta"] = jnp.zeros_like(g_main["rq_delta"])
       g_main["yx_delta"] = jnp.zeros_like(g_main["yx_delta"])
       g_main["yb_delta"] = jnp.zeros_like(g_main["yb_delta"])
-    if not use_custom_dq or step < warmup_meta_step or step >= freeze_dq_step:
+    if not r_use_dq or step < warmup_meta_step or step >= freeze_dq_step:
       g_ref["dq_log_scale"] = jnp.zeros_like(g_ref["dq_log_scale"])
+    if not m_use_dq or step < warmup_meta_step or step >= freeze_dq_step:
       g_main["dq_log_scale"] = jnp.zeros_like(g_main["dq_log_scale"])
     if enable_noise:
       g_main["noise_lut"] = grad_n_lut
@@ -2446,16 +4318,23 @@ def optimize_patch_composite(
 
   # Evaluate true-bitstream candidates (best_params, final params, and deadzone shrinkage)
   # to strictly guarantee stage3_true_j < stage2_true_j.
-  def _eval_patch_candidate(cand_p: dict[str, Any], deadzone: float = 0.0):
+  def _prep_patch_candidate(
+      cand_p: dict[str, Any],
+      deadzone: float = 0.0,
+      rq_mul_ref: float = 1.0,
+      rq_mul_main: float = 1.0,
+  ):
     c_ref = copy.deepcopy(ref_state)
     c_main = copy.deepcopy(main_state)
-    c_ref.raw_quant_field = np.clip(
-        np.round(
-            np.asarray(ref_rq + cand_p["ref"]["rq_delta"], dtype=np.float32)
-        ),
-        1,
-        256,
-    ).astype(np.int32)
+    r_rq_cont = np.clip(
+        np.asarray(ref_rq + cand_p["ref"]["rq_delta"], dtype=np.float32)
+        * float(rq_mul_ref),
+        1.0,
+        256.0,
+    )
+    c_ref.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+        np.round(r_rq_cont).astype(np.int32), c_ref.ac_strategy
+    )
     c_ref.ytox_map = np.clip(
         np.round(
             np.asarray(ref_yx + cand_p["ref"]["yx_delta"], dtype=np.float32)
@@ -2471,13 +4350,15 @@ def optimize_patch_composite(
         127,
     ).astype(np.int32)
 
-    c_main.raw_quant_field = np.clip(
-        np.round(
-            np.asarray(main_rq + cand_p["main"]["rq_delta"], dtype=np.float32)
-        ),
-        1,
-        256,
-    ).astype(np.int32)
+    m_rq_cont = np.clip(
+        np.asarray(main_rq + cand_p["main"]["rq_delta"], dtype=np.float32)
+        * float(rq_mul_main),
+        1.0,
+        256.0,
+    )
+    c_main.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+        np.round(m_rq_cont).astype(np.int32), c_main.ac_strategy
+    )
     c_main.ytox_map = np.clip(
         np.round(
             np.asarray(main_yx + cand_p["main"]["yx_delta"], dtype=np.float32)
@@ -2495,11 +4376,11 @@ def optimize_patch_composite(
     _apply_custom_dequant_to_state(
         c_ref,
         cand_p["ref"]["dq_log_scale"],
-        custom_dequant=use_custom_dq,
+        custom_dequant=r_dq_mode,
         force_ac_non_default=False,
     )
     _apply_custom_dequant_to_state(
-        c_main, cand_p["main"]["dq_log_scale"], custom_dequant=use_custom_dq
+        c_main, cand_p["main"]["dq_log_scale"], custom_dequant=m_dq_mode
     )
 
     r_ac_raw = np.asarray(cand_p["ref"]["ac"], dtype=np.float32)
@@ -2517,7 +4398,10 @@ def optimize_patch_composite(
         ref_state,
         cand_p["ref"]["dq_log_scale"],
         dq_log_init_ref,
-        use_custom_dq,
+        r_use_dq,
+        rq_cont=(
+            c_ref.raw_quant_field if rq_mul_ref != 1.0 else r_rq_cont
+        ),
     )
     m_ac_np, m_dc_np = _couple_candidate_ac_dc_np(
         m_ac_raw,
@@ -2526,7 +4410,10 @@ def optimize_patch_composite(
         main_state,
         cand_p["main"]["dq_log_scale"],
         dq_log_init,
-        use_custom_dq,
+        m_use_dq,
+        rq_cont=(
+            c_main.raw_quant_field if rq_mul_main != 1.0 else m_rq_cont
+        ),
     )
     if deadzone > 0.0:
       r_ac_np = np.sign(r_ac_np) * np.maximum(np.abs(r_ac_np) - deadzone, 0.0)
@@ -2544,23 +4431,23 @@ def optimize_patch_composite(
         if enable_noise
         else None
     )
-    jb, st_dict = encode_patches_composite(
-        ref_state=c_ref,
-        main_state=c_main,
-        upsampling=u,
-        patches=patches_list,
-        effort=effort,
-        noise_lut=c_lut,
-    )
+    return (c_ref, c_main, c_lut)
+
+  def _score_patch_candidate(
+      prepped: tuple[JxlVarDCTState, JxlVarDCTState, Any],
+      enc_res: tuple[bytes, dict[str, Any]],
+  ):
+    c_ref, c_main, c_lut = prepped
+    jb, st_dict = enc_res
     t_bpp = (len(jb) * 8.0) / float(h * w)
-    r_hard = reconstruct_patch_composite(
+    r_hard = _fast_reconstruct_patch_composite(
         c_ref,
         c_main,
         u,
         patches_list,
         include_noise=enable_noise,
         noise_lut=c_lut,
-        hard=True,
+        w_ref_main_override=(w_ref_j, w_main_j),
     )
     t_wd = float(
         wd_only(
@@ -2575,22 +4462,80 @@ def optimize_patch_composite(
     t_j = t_wd + float(eff_lambda) * t_bpp
     return (t_j, t_bpp, t_wd, jb, st_dict, c_ref, c_main, c_lut, r_hard)
 
+  def _eval_patch_candidate(
+      cand_p: dict[str, Any],
+      deadzone: float = 0.0,
+      rq_mul_ref: float = 1.0,
+      rq_mul_main: float = 1.0,
+  ):
+    prepped = _prep_patch_candidate(
+        cand_p,
+        deadzone=deadzone,
+        rq_mul_ref=rq_mul_ref,
+        rq_mul_main=rq_mul_main,
+    )
+    enc_res = encode_patches_composite(
+        ref_state=prepped[0],
+        main_state=prepped[1],
+        upsampling=u,
+        patches=patches_list,
+        effort=effort,
+        noise_lut=prepped[2],
+    )
+    return _score_patch_candidate(prepped, enc_res)
+
+  patch_preps = [
+      _prep_patch_candidate(best_params, deadzone=0.0),
+      _prep_patch_candidate(best_params, deadzone=0.06),
+      _prep_patch_candidate(best_params, deadzone=0.16),
+      _prep_patch_candidate(
+          best_params, deadzone=0.0, rq_mul_ref=1.0, rq_mul_main=0.45
+      ),
+      _prep_patch_candidate(
+          best_params, deadzone=0.0, rq_mul_ref=1.0, rq_mul_main=0.30
+      ),
+      _prep_patch_candidate(params, deadzone=0.0),
+      _prep_patch_candidate(step0_params, deadzone=0.0),
+  ]
+  patch_enc_list = list(
+      _CPP_ENCODE_POOL.map(
+          lambda pr: encode_patches_composite(
+              ref_state=pr[0],
+              main_state=pr[1],
+              upsampling=u,
+              patches=patches_list,
+              effort=effort,
+              noise_lut=pr[2],
+          ),
+          patch_preps,
+      )
+  )
   cand_evals = [
-      _eval_patch_candidate(best_params, deadzone=0.0),
-      _eval_patch_candidate(best_params, deadzone=0.10),
-      _eval_patch_candidate(best_params, deadzone=0.22),
-      _eval_patch_candidate(params, deadzone=0.0),
-      _eval_patch_candidate(step0_params, deadzone=0.0),
+      _score_patch_candidate(pr, enc_r)
+      for pr, enc_r in zip(patch_preps, patch_enc_list)
   ]
   best_eval = min(cand_evals, key=lambda x: x[0])
   if best_eval[0] >= stage2_true_j:
-    for dz in (0.12, 0.25, 0.45):
+    for dz in (0.02, 0.05, 0.12, 0.25, 0.42):
       ev = _eval_patch_candidate(best_params, deadzone=dz)
       if ev[0] < best_eval[0]:
         best_eval = ev
       ev0 = _eval_patch_candidate(step0_params, deadzone=dz)
       if ev0[0] < best_eval[0]:
         best_eval = ev0
+    if best_eval[0] >= stage2_true_j:
+      for rq_r_m, rq_m_m in (
+          (1.0, 0.85),
+          (1.0, 0.65),
+          (1.12, 1.0),
+          (0.90, 1.0),
+          (1.0, 1.12),
+      ):
+        ev_rq = _eval_patch_candidate(
+            best_params, deadzone=0.0, rq_mul_ref=rq_r_m, rq_mul_main=rq_m_m
+        )
+        if ev_rq[0] < best_eval[0]:
+          best_eval = ev_rq
 
   (
       true_rd,
@@ -2603,6 +4548,10 @@ def optimize_patch_composite(
       opt_noise_lut,
       rec_hard,
   ) = best_eval
+
+  stats = dict(stats)
+  stats["dequant_mode"] = m_dq_mode
+  stats["ref_dequant_mode"] = r_dq_mode
 
   # Ensure history shows monotone improvement at final step
   if len(history) >= 2 and history[-1]["rd_loss"] > history[0]["rd_loss"]:
@@ -2665,7 +4614,7 @@ def optimize_alpha_composite(
     dim_shift: int | str = 0,
     distance: float = 1.0,
     ref_distance: float | None = None,
-    lambda_rd: float = 0.08,
+    lambda_rd: float | None = None,
     rd_lambda: float | None = None,
     steps: int | None = None,
     num_steps: int | None = None,
@@ -2678,13 +4627,13 @@ def optimize_alpha_composite(
     alpha_blend_mode: int | str = PATCH_BLEND_ALPHA_BELOW,
     blend_mode: int | str | None = None,
     patches: Sequence[PatchEntry] | None = None,
-    custom_dequant: bool | None = None,
-    enable_custom_dequant: bool | None = None,
-    optimize_dequant_matrices: bool | None = None,
-    use_custom_dequant: bool | None = None,
+    custom_dequant: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
     verify_decoders: bool = True,
     vgg_params: Any | None = None,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     effort: int = 7,
     candidate_upsamplings: Sequence[int] = (2, 4, 8),
     candidate_dim_shifts: Sequence[int] = (0, 1, 2, 3),
@@ -2700,7 +4649,15 @@ def optimize_alpha_composite(
     raise ValueError("Either rgb_u8 or srgb_hwc must be provided.")
   init_mode_norm = _normalize_init_mode(init_mode)
   default_steps = 60 if init_mode_norm in ("zero", "random") else 24
-  eff_lambda = float(rd_lambda if rd_lambda is not None else lambda_rd)
+  eff_lambda = float(
+      rd_lambda
+      if rd_lambda is not None
+      else (
+          lambda_rd
+          if lambda_rd is not None
+          else calibrate_rd_lambda(distance)
+      )
+  )
   eff_steps = int(
       num_steps
       if num_steps is not None
@@ -2709,12 +4666,11 @@ def optimize_alpha_composite(
   a_bm = _parse_alpha_blend_mode(
       blend_mode if blend_mode is not None else alpha_blend_mode
   )
-  use_custom_dq = _resolve_custom_dequant_flag(
+  dq_spec = _resolve_custom_dequant_spec(
       custom_dequant=custom_dequant,
       enable_custom_dequant=enable_custom_dequant,
       optimize_dequant_matrices=optimize_dequant_matrices,
       use_custom_dequant=use_custom_dequant,
-      default=True,
   )
 
   arr = _normalize_srgb_hwc(img_in)
@@ -2760,27 +4716,12 @@ def optimize_alpha_composite(
 
   dilate = 1 if (h >= 128 and w >= 128) else 0
   d_main = float(distance)
-  d_ref = (
-      float(ref_distance)
-      if ref_distance is not None
-      else max(0.35, d_main * 1.35)
+  d_ref = _calibrate_ref_distance(d_main, eff_lambda, ref_distance)
+  m_dq_mode = select_dequant_mode_for_frame(
+      h, w, d_main, dq_spec, is_reference=False
   )
-  dq_log_init_ref = (
-      jnp.array(
-          [0.0, 0.0, 0.0, -0.02, -0.03, -0.01, 0.0, 0.0, 0.0],
-          dtype=jnp.float32,
-      )
-      if use_custom_dq
-      else jnp.zeros((9,), dtype=jnp.float32)
-  )
-  dq_log_init = (
-      jnp.array(
-          [-0.03, -0.05, -0.02, -0.02, -0.03, -0.01, 0.0, 0.0, 0.0],
-          dtype=jnp.float32,
-      )
-      if use_custom_dq
-      else jnp.zeros((9,), dtype=jnp.float32)
-  )
+  m_use_dq = m_dq_mode != "none"
+  dq_log_init = _init_dq_log_vec(m_dq_mode, is_reference=False)
   noise_lut_init = (
       estimate_noise_lut_jax(target_xyb)
       if enable_noise
@@ -2828,13 +4769,27 @@ def optimize_alpha_composite(
     s2_acs_u = s1_info["stage2_ac_strategy"]
 
     r_rgb = s1_info["rgb_low_smooth"]
-    r_state = init_state_from_rgb_jax(
-        r_rgb, distance=d_ref, epf_iters=0, gab=True
+    r_state = _init_ref_state_with_stage2_acs(
+        r_rgb,
+        d_ref=d_ref,
+        eff_lambda=eff_lambda,
+        enable_noise=enable_noise,
+        vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
     )
+    r_dq_mode_u = select_dequant_mode_for_frame(
+        int(r_state.height),
+        int(r_state.width),
+        d_ref,
+        dq_spec,
+        is_reference=True,
+    )
+    r_use_dq_u = r_dq_mode_u != "none"
+    r_dq_init_u = _init_dq_log_vec(r_dq_mode_u, is_reference=True)
     _apply_custom_dequant_to_state(
         r_state,
-        dq_log_init_ref,
-        custom_dequant=use_custom_dq,
+        r_dq_init_u,
+        custom_dequant=r_dq_mode_u,
         force_ac_non_default=False,
     )
     r_xyb_low = srgb_to_xyb(jnp.moveaxis(jnp.asarray(r_rgb), -1, 0))
@@ -2843,19 +4798,26 @@ def optimize_alpha_composite(
     )
 
     if a_bm in (PATCH_BLEND_MUL_ADD_ABOVE, PATCH_BLEND_MUL_ADD_BELOW):
-      r_xyb_rec = reconstruct_single_frame_xyb(r_state, hard=True)
+      r_xyb_rec = _fast_reconstruct_xyb(r_state, include_noise=False)
       r_xyb_ups = upsample_jxl(r_xyb_rec, u_val, out_hw=(h, w))
       res_xyb_u = target_xyb - r_xyb_ups
       m_state, m_dc_dct, m_ac_dct = init_state_from_xyb_jax(
-          res_xyb_u, distance=d_main, epf_iters=0, gab=True
+          res_xyb_u,
+          distance=d_main,
+          epf_iters=None,
+          gab=None,
+          enable_noise=enable_noise,
       )
       m_state.ac_strategy = s2_acs_u.copy()
       m_state.ac_strategy_Anchor = s1_info["stage2_anchors"].copy()
       m_state.raw_quant_field[~fg_m_dil] = int(
           np.median(m_state.raw_quant_field)
       )
+      m_state.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+          m_state.raw_quant_field, m_state.ac_strategy
+      )
       _apply_custom_dequant_to_state(
-          m_state, dq_log_init, custom_dequant=use_custom_dq
+          m_state, dq_log_init, custom_dequant=m_dq_mode
       )
       m_dc_dct, m_ac_dct = compute_continuous_dc_ac_jax(
           res_xyb_u, m_state, apply_inv_gab=True, init_mode="dct"
@@ -2863,11 +4825,47 @@ def optimize_alpha_composite(
     else:
       res_xyb_u = target_xyb
       m_state = copy.deepcopy(s1_info["main_state"])
-      m_state.raw_quant_field[~fg_m_dil] = int(
-          np.median(m_state.raw_quant_field)
+      if a_bm == PATCH_BLEND_ALPHA_BELOW:
+        m_acs_clean_a = m_state.ac_strategy.copy()
+        m_anc_clean_a = m_state.ac_strategy_Anchor.copy()
+        for by_s in range(h8):
+          for bx_s in range(w8):
+            if m_anc_clean_a[by_s, bx_s]:
+              s_cur = int(m_acs_clean_a[by_s, bx_s])
+              cy_s, cx_s = _acs_covered_yx(s_cur)
+              if not np.all(fg_m_dil[by_s : by_s + cy_s, bx_s : bx_s + cx_s]):
+                m_acs_clean_a[by_s : by_s + cy_s, bx_s : bx_s + cx_s] = 0
+                m_anc_clean_a[by_s : by_s + cy_s, bx_s : bx_s + cx_s] = True
+        m_state.ac_strategy = m_acs_clean_a
+        m_state.ac_strategy_Anchor = m_anc_clean_a
+        used_m_a = 0
+        for s_u in np.unique(m_acs_clean_a):
+          used_m_a |= 1 << int(s_u)
+        m_state.used_acs = used_m_a
+      if enable_noise:
+        m_state.ytox_dc = 0
+        m_state.ytob_dc = 0
+      rq_fg_med_a = int(
+          np.median(
+              m_state.raw_quant_field[fg_m_dil]
+              if np.any(fg_m_dil)
+              else m_state.raw_quant_field
+          )
       )
+      m_state.raw_quant_field[~fg_m_dil] = rq_fg_med_a
+      m_state.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+          m_state.raw_quant_field, m_state.ac_strategy
+      )
+      epf_fg_med_a = np.uint8(
+          np.median(
+              m_state.epf_sharpness[fg_m_dil]
+              if np.any(fg_m_dil)
+              else m_state.epf_sharpness
+          )
+      )
+      m_state.epf_sharpness[~fg_m_dil] = epf_fg_med_a
       _apply_custom_dequant_to_state(
-          m_state, dq_log_init, custom_dequant=use_custom_dq
+          m_state, dq_log_init, custom_dequant=m_dq_mode
       )
       m_dc_dct, m_ac_dct = compute_continuous_dc_ac_jax(
           target_xyb, m_state, apply_inv_gab=True, init_mode="dct"
@@ -2880,18 +4878,75 @@ def optimize_alpha_composite(
       fg_px_full = np.ones((h, w), dtype=np.float32)
 
     fg_ac_m_j, _ = _build_ac_mask_from_block_mask(fg_m_dil, m_state)
-    fg_dc_m_j = jnp.ones((3, h8, w8), dtype=jnp.float32)
-    dc_bg_u = jnp.zeros((3, h8, w8), dtype=jnp.float32)
+    def _compute_alpha_dc_mask_and_bg(st_a_cur: int) -> tuple[jax.Array, jax.Array]:
+      if a_bm != PATCH_BLEND_ALPHA_BELOW:
+        return (
+            jnp.ones((3, h8, w8), dtype=jnp.float32),
+            jnp.zeros((3, h8, w8), dtype=jnp.float32),
+        )
+      rad_ups = (st_a_cur * 2 + 6) // 8 if st_a_cur > 1 else 0
+      rad_flt = 1 if (int(m_state.epf_iters) > 0 or bool(m_state.gab)) else 0
+      halo_rad_a = max(rad_ups, rad_flt)
+      dc_halo_a = _dilate_bool_grid(fg_m_dil, radius=halo_rad_a)
+      for by_h in range(h8):
+        for bx_h in range(w8):
+          if m_state.ac_strategy_Anchor[by_h, bx_h]:
+            cy_h, cx_h = _acs_covered_yx(int(m_state.ac_strategy[by_h, bx_h]))
+            if (cy_h > 1 or cx_h > 1) and np.any(
+                dc_halo_a[by_h : by_h + cy_h, bx_h : bx_h + cx_h]
+            ):
+              dc_halo_a[by_h : by_h + cy_h, bx_h : bx_h + cx_h] = True
+      if np.any(dc_halo_a) and not np.all(dc_halo_a):
+        dc_np_a = np.asarray(m_dc_dct, dtype=np.float32)
+        dct8_halo_a = dc_halo_a & (m_state.ac_strategy == 0)
+        ref_dc_mask_a = (
+            dct8_halo_a
+            if np.any(dct8_halo_a)
+            else (dc_halo_a & m_state.ac_strategy_Anchor)
+        )
+        med_dc_a = np.round(np.median(dc_np_a[:, ref_dc_mask_a], axis=1)).astype(
+            np.float32
+        )
+        fg_dc_cur = jnp.broadcast_to(
+            jnp.asarray(dc_halo_a, dtype=jnp.float32)[None, :, :], (3, h8, w8)
+        )
+        dc_bg_cur = (1.0 - fg_dc_cur) * jnp.asarray(med_dc_a)[:, None, None]
+        return fg_dc_cur, dc_bg_cur
+      return (
+          jnp.ones((3, h8, w8), dtype=jnp.float32),
+          jnp.zeros((3, h8, w8), dtype=jnp.float32),
+      )
 
+    fg_dc_m_j, dc_bg_u = _compute_alpha_dc_mask_and_bg(1)
     s2_r = copy.deepcopy(r_state)
     s2_m = copy.deepcopy(m_state)
     s2_r.quant_ac = np.round(np.asarray(r_ac_dct)).astype(np.int32)
     s2_r.dc_quant = np.round(np.asarray(r_dc_dct)).astype(np.int32)
-    s2_m.quant_ac = np.round(np.asarray(m_ac_dct)).astype(np.int32)
-    s2_m.dc_quant = np.round(np.asarray(m_dc_dct)).astype(np.int32)
+    s2_m.quant_ac = np.round(np.asarray(m_ac_dct * fg_ac_m_j)).astype(np.int32)
+    s2_m.dc_quant = np.round(
+        np.asarray(m_dc_dct * fg_dc_m_j + dc_bg_u)
+    ).astype(np.int32)
+    s2_r_xyb = _fast_reconstruct_xyb(s2_r, include_noise=False)
+    s2_m_xyb = _fast_reconstruct_xyb(s2_m, include_noise=False)
+    s2_r_ups = upsample_jxl(s2_r_xyb, u_val, out_hw=(h, w))
 
+    ds_preps: list[
+        tuple[
+            int,
+            jax.Array,
+            np.ndarray,
+            JxlVarDCTState,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ]
+    ] = []
     for ds_val in ds_cands:
       st_a = 1 << int(ds_val)
+      fg_dc_ds, dc_bg_ds = _compute_alpha_dc_mask_and_bg(st_a)
       ha_cur = (h + st_a - 1) // st_a
       wa_cur = (w + st_a - 1) // st_a
       if st_a > 1:
@@ -2906,29 +4961,94 @@ def optimize_alpha_composite(
       )
       s2_a01 = np.asarray(jax.nn.sigmoid(a_logit_init), dtype=np.float32)
       s2_au8 = np.round(s2_a01 * 255.0).astype(np.uint8)
-      s2_jb, _ = encode_alpha_composite(
+      if (
+          st_a > 1
+          and a_bm == PATCH_BLEND_ALPHA_BELOW
+          and np.any(fg_m_dil)
+          and not np.all(fg_m_dil)
+      ):
+        a_up_ds = upsample_jxl(
+            jnp.asarray(s2_au8, dtype=jnp.float32)[None] / 255.0,
+            st_a,
+            out_hw=(h, w),
+        )
+        res_xyb_ds = jnp.where(
+            jnp.asarray(fg_px_full[None] > 0.5),
+            s2_r_ups + (target_xyb - s2_r_ups) / jnp.maximum(a_up_ds, 0.72),
+            target_xyb,
+        )
+        m_dc_ds, m_ac_ds = compute_continuous_dc_ac_jax(
+            res_xyb_ds, m_state, apply_inv_gab=True, init_mode="dct"
+        )
+        s2_m_ds = copy.deepcopy(m_state)
+        s2_m_ds.quant_ac = np.round(np.asarray(m_ac_ds * fg_ac_m_j)).astype(
+            np.int32
+        )
+        s2_m_ds.dc_quant = np.round(
+            np.asarray(m_dc_ds * fg_dc_ds + dc_bg_ds)
+        ).astype(np.int32)
+        s2_m_xyb_ds = _fast_reconstruct_xyb(s2_m_ds, include_noise=False)
+      else:
+        res_xyb_ds = res_xyb_u
+        m_dc_ds = m_dc_dct
+        m_ac_ds = m_ac_dct
+        s2_m_ds = s2_m
+        s2_m_xyb_ds = s2_m_xyb
+      ds_preps.append(
+          (
+              int(ds_val),
+              a_logit_init,
+              s2_au8,
+              s2_m_ds,
+              s2_m_xyb_ds,
+              res_xyb_ds,
+              m_dc_ds,
+              m_ac_ds,
+              fg_dc_ds,
+              dc_bg_ds,
+          )
+      )
+
+    def _enc_ds(item):
+      ds_v, _, au8_v, s2_m_cur, _, _, _, _, _, _ = item
+      return encode_alpha_composite(
           ref_state=s2_r,
-          main_state=s2_m,
+          main_state=s2_m_cur,
           upsampling=u_val,
-          dim_shift=ds_val,
-          alpha_u8=s2_au8,
+          dim_shift=ds_v,
+          alpha_u8=au8_v,
           effort=effort,
           noise_lut=s2_noise_lut,
           alpha_blend_mode=a_bm,
           patches=patches_list,
       )
+
+    enc_ds_results = list(_CPP_ENCODE_POOL.map(_enc_ds, ds_preps))
+    for (
+        ds_val,
+        a_logit_init,
+        s2_au8,
+        s2_m_ds,
+        s2_m_xyb_ds,
+        res_xyb_ds,
+        m_dc_ds,
+        m_ac_ds,
+        fg_dc_ds,
+        dc_bg_ds,
+    ), (s2_jb, _) in zip(ds_preps, enc_ds_results):
       s2_bpp_cur = (len(s2_jb) * 8.0) / float(h * w)
-      s2_rec_cur = reconstruct_alpha_composite(
+      s2_rec_cur = _fast_reconstruct_alpha_composite(
           s2_r,
-          s2_m,
+          s2_m_ds,
           u_val,
           ds_val,
           jnp.asarray(s2_au8, dtype=jnp.float32) / 255.0,
           include_noise=enable_noise,
           noise_lut=s2_noise_lut,
-          hard=True,
           alpha_blend_mode=a_bm,
           patches=patches_list,
+          ref_xyb_override=s2_r_xyb,
+          main_xyb_override=s2_m_xyb_ds,
       )
       s2_wd_cur = float(
           wd_only(
@@ -2947,16 +5067,19 @@ def optimize_alpha_composite(
           "stage1_info": s1_info,
           "ref_state": r_state,
           "main_state": m_state,
+          "r_dq_mode": r_dq_mode_u,
+          "r_use_dq": r_use_dq_u,
+          "r_dq_init": r_dq_init_u,
           "ref_xyb_low": r_xyb_low,
-          "main_target_xyb": res_xyb_u,
+          "main_target_xyb": res_xyb_ds,
           "ref_dc_cont": r_dc_dct,
           "ref_ac_cont": r_ac_dct,
-          "main_dc_cont": m_dc_dct,
-          "main_ac_cont": m_ac_dct,
+          "main_dc_cont": m_dc_ds,
+          "main_ac_cont": m_ac_ds,
           "alpha_logit_init": a_logit_init,
           "fg_ac_mask_j": fg_ac_m_j,
-          "fg_dc_mask_j": fg_dc_m_j,
-          "dc_bg_j": dc_bg_u,
+          "fg_dc_mask_j": fg_dc_ds,
+          "dc_bg_j": dc_bg_ds,
           "stage2_true_bpp": s2_bpp_cur,
           "stage2_wd": s2_wd_cur,
           "stage2_true_j": s2_j_cur,
@@ -2970,6 +5093,10 @@ def optimize_alpha_composite(
   stage2_acs = stage1_info["stage2_ac_strategy"]
   ref_state = best_s2_a["ref_state"]
   main_state = best_s2_a["main_state"]
+  r_dq_mode = str(best_s2_a["r_dq_mode"])
+  r_use_dq = bool(best_s2_a["r_use_dq"])
+  dq_log_init_ref = best_s2_a["r_dq_init"]
+  use_custom_dq = bool(m_use_dq or r_use_dq)
   alpha_logit_init = best_s2_a["alpha_logit_init"]
   fg_ac_mask_j = best_s2_a["fg_ac_mask_j"]
   fg_dc_mask_j = best_s2_a["fg_dc_mask_j"]
@@ -3003,7 +5130,7 @@ def optimize_alpha_composite(
     if has_multiblk:
       stage2_acs = main_state.ac_strategy.copy()
       _apply_custom_dequant_to_state(
-          main_state, dq_log_init, custom_dequant=use_custom_dq
+          main_state, dq_log_init, custom_dequant=m_dq_mode
       )
     fg_ac_mask_j = jnp.ones_like(fg_ac_mask_j)
     alpha_logit_init = jnp.zeros_like(alpha_logit_init)
@@ -3048,7 +5175,7 @@ def optimize_alpha_composite(
         patches=patches_list,
     )
     stage2_true_bpp = (len(s2_jxl_bytes) * 8.0) / float(h * w)
-    s2_rec = reconstruct_alpha_composite(
+    s2_rec = _fast_reconstruct_alpha_composite(
         s2_ref,
         s2_main,
         u,
@@ -3056,7 +5183,6 @@ def optimize_alpha_composite(
         jnp.asarray(s2_alpha_u8, dtype=jnp.float32) / 255.0,
         include_noise=enable_noise,
         noise_lut=s2_noise_lut,
-        hard=True,
         alpha_blend_mode=a_bm,
         patches=patches_list,
     )
@@ -3094,7 +5220,8 @@ def optimize_alpha_composite(
   main_gs = jnp.float32(main_state.global_scale)
   main_qdc = jnp.float32(main_state.quant_dc)
   lam_per_px = jnp.float32(float(eff_lambda) / float(h * w))
-  custom_dq_w = jnp.float32(1.0 if use_custom_dq else 0.0)
+  r_custom_dq_w = jnp.float32(1.0 if r_use_dq else 0.0)
+  m_custom_dq_w = jnp.float32(1.0 if m_use_dq else 0.0)
   patch_dict_bits = float(soft_patch_dictionary_bits(patches_list, upsampling=u))
 
   params = {
@@ -3192,9 +5319,10 @@ def optimize_alpha_composite(
   total_steps = max(1, int(eff_steps))
   warmup_meta_step = int(0.35 * total_steps) if is_zero_or_rand else 0
   freeze_dq_step = max(1, int(0.8 * total_steps))
+  cluster_start_step = max(1, int(0.75 * total_steps))
   ac_rate_w = jnp.float32(0.0 if is_zero_or_rand else 1.0)
-  r_dq_base = dq_log_init_ref if use_custom_dq else None
-  m_dq_base = dq_log_init if use_custom_dq else None
+  r_dq_base = dq_log_init_ref if r_use_dq else None
+  m_dq_base = dq_log_init if m_use_dq else None
 
   for step in range(total_steps):
     r_rq_eff = jnp.clip(ref_rq + params["ref"]["rq_delta"], 1.0, 256.0)
@@ -3209,9 +5337,11 @@ def optimize_alpha_composite(
         ref_gs,
         ref_qdc,
         params["ref"]["noise_lut"],
-        params["ref"]["dq_log_scale"] if use_custom_dq else None,
+        params["ref"]["dq_log_scale"] if r_use_dq else None,
         ref_rq,
         r_dq_base,
+        ref_yx,
+        ref_yb,
     )
     m_ac = params["main"]["ac"] * fg_ac_mask_j
     m_dc = params["main"]["dc"] * fg_dc_mask_j + dc_bg_j
@@ -3228,9 +5358,11 @@ def optimize_alpha_composite(
         main_gs,
         main_qdc,
         n_lut_clipped,
-        params["main"]["dq_log_scale"] if use_custom_dq else None,
+        params["main"]["dq_log_scale"] if m_use_dq else None,
         main_rq,
         m_dq_base,
+        main_yx,
+        main_yb,
     )
     rec = combine_fn(
         r_xyb, m_xyb, params["alpha_logit"], n_lut_clipped
@@ -3255,6 +5387,20 @@ def optimize_alpha_composite(
         )
     )
 
+    r_cluster_blend = jnp.float32(
+        1.0
+        if (
+            not is_zero_or_rand
+            and step >= cluster_start_step
+            and int(ref_state.h8) * int(ref_state.w8) >= 64
+        )
+        else 0.0
+    )
+    m_cluster_blend = jnp.float32(
+        1.0
+        if (not is_zero_or_rand and step >= cluster_start_step and h8 * w8 >= 64)
+        else 0.0
+    )
     (_, ref_bits), g_ref = ref_vjp_fn(
         params["ref"],
         ref_rq,
@@ -3267,9 +5413,10 @@ def optimize_alpha_composite(
         ref_dc_bg,
         grad_r_xyb,
         lam_per_px,
-        custom_dq_w,
+        r_custom_dq_w,
         r_dq_base,
         ac_rate_w,
+        r_cluster_blend,
     )
     (_, main_bits), g_main = main_vjp_fn(
         params["main"],
@@ -3283,9 +5430,10 @@ def optimize_alpha_composite(
         dc_bg_j,
         grad_m_xyb,
         lam_per_px,
-        custom_dq_w,
+        m_custom_dq_w,
         m_dq_base,
         ac_rate_w,
+        m_cluster_blend,
     )
     if learn_decomp:
       a01_cur = jax.nn.sigmoid(params["alpha_logit"])
@@ -3387,8 +5535,9 @@ def optimize_alpha_composite(
       g_main["rq_delta"] = jnp.zeros_like(g_main["rq_delta"])
       g_main["yx_delta"] = jnp.zeros_like(g_main["yx_delta"])
       g_main["yb_delta"] = jnp.zeros_like(g_main["yb_delta"])
-    if not use_custom_dq or step < warmup_meta_step or step >= freeze_dq_step:
+    if not r_use_dq or step < warmup_meta_step or step >= freeze_dq_step:
       g_ref["dq_log_scale"] = jnp.zeros_like(g_ref["dq_log_scale"])
+    if not m_use_dq or step < warmup_meta_step or step >= freeze_dq_step:
       g_main["dq_log_scale"] = jnp.zeros_like(g_main["dq_log_scale"])
     if enable_noise:
       g_main["noise_lut"] = grad_n_lut
@@ -3456,16 +5605,23 @@ def optimize_alpha_composite(
     if a_bm in (PATCH_BLEND_ALPHA_ABOVE, PATCH_BLEND_MUL_ADD_ABOVE):
       params["alpha_logit"] = jnp.maximum(params["alpha_logit"], 6.0)
 
-  def _eval_alpha_candidate(cand_p: dict[str, Any], deadzone: float = 0.0):
+  def _prep_alpha_candidate(
+      cand_p: dict[str, Any],
+      deadzone: float = 0.0,
+      rq_mul_ref: float = 1.0,
+      rq_mul_main: float = 1.0,
+  ):
     c_ref = copy.deepcopy(ref_state)
     c_main = copy.deepcopy(main_state)
-    c_ref.raw_quant_field = np.clip(
-        np.round(
-            np.asarray(ref_rq + cand_p["ref"]["rq_delta"], dtype=np.float32)
-        ),
-        1,
-        256,
-    ).astype(np.int32)
+    r_rq_cont = np.clip(
+        np.asarray(ref_rq + cand_p["ref"]["rq_delta"], dtype=np.float32)
+        * float(rq_mul_ref),
+        1.0,
+        256.0,
+    )
+    c_ref.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+        np.round(r_rq_cont).astype(np.int32), c_ref.ac_strategy
+    )
     c_ref.ytox_map = np.clip(
         np.round(
             np.asarray(ref_yx + cand_p["ref"]["yx_delta"], dtype=np.float32)
@@ -3481,13 +5637,15 @@ def optimize_alpha_composite(
         127,
     ).astype(np.int32)
 
-    c_main.raw_quant_field = np.clip(
-        np.round(
-            np.asarray(main_rq + cand_p["main"]["rq_delta"], dtype=np.float32)
-        ),
-        1,
-        256,
-    ).astype(np.int32)
+    m_rq_cont = np.clip(
+        np.asarray(main_rq + cand_p["main"]["rq_delta"], dtype=np.float32)
+        * float(rq_mul_main),
+        1.0,
+        256.0,
+    )
+    c_main.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+        np.round(m_rq_cont).astype(np.int32), c_main.ac_strategy
+    )
     c_main.ytox_map = np.clip(
         np.round(
             np.asarray(main_yx + cand_p["main"]["yx_delta"], dtype=np.float32)
@@ -3505,11 +5663,11 @@ def optimize_alpha_composite(
     _apply_custom_dequant_to_state(
         c_ref,
         cand_p["ref"]["dq_log_scale"],
-        custom_dequant=use_custom_dq,
+        custom_dequant=r_dq_mode,
         force_ac_non_default=False,
     )
     _apply_custom_dequant_to_state(
-        c_main, cand_p["main"]["dq_log_scale"], custom_dequant=use_custom_dq
+        c_main, cand_p["main"]["dq_log_scale"], custom_dequant=m_dq_mode
     )
 
     r_ac_raw = np.asarray(cand_p["ref"]["ac"], dtype=np.float32)
@@ -3527,7 +5685,10 @@ def optimize_alpha_composite(
         ref_state,
         cand_p["ref"]["dq_log_scale"],
         dq_log_init_ref,
-        use_custom_dq,
+        r_use_dq,
+        rq_cont=(
+            c_ref.raw_quant_field if rq_mul_ref != 1.0 else r_rq_cont
+        ),
     )
     m_ac_np, m_dc_np = _couple_candidate_ac_dc_np(
         m_ac_raw,
@@ -3536,7 +5697,10 @@ def optimize_alpha_composite(
         main_state,
         cand_p["main"]["dq_log_scale"],
         dq_log_init,
-        use_custom_dq,
+        m_use_dq,
+        rq_cont=(
+            c_main.raw_quant_field if rq_mul_main != 1.0 else m_rq_cont
+        ),
     )
     c_a01 = np.asarray(
         jax.nn.sigmoid(cand_p["alpha_logit"]), dtype=np.float32
@@ -3576,19 +5740,16 @@ def optimize_alpha_composite(
         if enable_noise
         else None
     )
-    jb, st_dict = encode_alpha_composite(
-        ref_state=c_ref,
-        main_state=c_main,
-        upsampling=u,
-        dim_shift=d_shift,
-        alpha_u8=c_au8,
-        effort=effort,
-        noise_lut=c_lut,
-        alpha_blend_mode=a_bm,
-        patches=patches_list,
-    )
+    return (c_ref, c_main, c_a01, c_au8, c_lut)
+
+  def _score_alpha_candidate(
+      prepped: tuple[JxlVarDCTState, JxlVarDCTState, np.ndarray, np.ndarray, Any],
+      enc_res: tuple[bytes, dict[str, Any]],
+  ):
+    c_ref, c_main, c_a01, c_au8, c_lut = prepped
+    jb, st_dict = enc_res
     t_bpp = (len(jb) * 8.0) / float(h * w)
-    r_hard = reconstruct_alpha_composite(
+    r_hard = _fast_reconstruct_alpha_composite(
         c_ref,
         c_main,
         u,
@@ -3596,7 +5757,6 @@ def optimize_alpha_composite(
         jnp.asarray(c_au8, dtype=jnp.float32) / 255.0,
         include_noise=enable_noise,
         noise_lut=c_lut,
-        hard=True,
         alpha_blend_mode=a_bm,
         patches=patches_list,
     )
@@ -3625,22 +5785,86 @@ def optimize_alpha_composite(
         r_hard,
     )
 
+  def _eval_alpha_candidate(
+      cand_p: dict[str, Any],
+      deadzone: float = 0.0,
+      rq_mul_ref: float = 1.0,
+      rq_mul_main: float = 1.0,
+  ):
+    prepped = _prep_alpha_candidate(
+        cand_p,
+        deadzone=deadzone,
+        rq_mul_ref=rq_mul_ref,
+        rq_mul_main=rq_mul_main,
+    )
+    enc_res = encode_alpha_composite(
+        ref_state=prepped[0],
+        main_state=prepped[1],
+        upsampling=u,
+        dim_shift=d_shift,
+        alpha_u8=prepped[3],
+        effort=effort,
+        noise_lut=prepped[4],
+        alpha_blend_mode=a_bm,
+        patches=patches_list,
+    )
+    return _score_alpha_candidate(prepped, enc_res)
+
+  alpha_preps = [
+      _prep_alpha_candidate(best_params, deadzone=0.0),
+      _prep_alpha_candidate(best_params, deadzone=0.06),
+      _prep_alpha_candidate(best_params, deadzone=0.16),
+      _prep_alpha_candidate(
+          best_params, deadzone=0.0, rq_mul_ref=1.0, rq_mul_main=0.45
+      ),
+      _prep_alpha_candidate(
+          best_params, deadzone=0.0, rq_mul_ref=1.0, rq_mul_main=0.30
+      ),
+      _prep_alpha_candidate(params, deadzone=0.0),
+      _prep_alpha_candidate(step0_params, deadzone=0.0),
+  ]
+  alpha_enc_list = list(
+      _CPP_ENCODE_POOL.map(
+          lambda pr: encode_alpha_composite(
+              ref_state=pr[0],
+              main_state=pr[1],
+              upsampling=u,
+              dim_shift=d_shift,
+              alpha_u8=pr[3],
+              effort=effort,
+              noise_lut=pr[4],
+              alpha_blend_mode=a_bm,
+              patches=patches_list,
+          ),
+          alpha_preps,
+      )
+  )
   cand_evals = [
-      _eval_alpha_candidate(best_params, deadzone=0.0),
-      _eval_alpha_candidate(best_params, deadzone=0.10),
-      _eval_alpha_candidate(best_params, deadzone=0.22),
-      _eval_alpha_candidate(params, deadzone=0.0),
-      _eval_alpha_candidate(step0_params, deadzone=0.0),
+      _score_alpha_candidate(pr, enc_r)
+      for pr, enc_r in zip(alpha_preps, alpha_enc_list)
   ]
   best_eval = min(cand_evals, key=lambda x: x[0])
   if best_eval[0] >= stage2_true_j:
-    for dz in (0.12, 0.25, 0.45):
+    for dz in (0.02, 0.05, 0.12, 0.25, 0.42):
       ev = _eval_alpha_candidate(best_params, deadzone=dz)
       if ev[0] < best_eval[0]:
         best_eval = ev
       ev0 = _eval_alpha_candidate(step0_params, deadzone=dz)
       if ev0[0] < best_eval[0]:
         best_eval = ev0
+    if best_eval[0] >= stage2_true_j:
+      for rq_r_m, rq_m_m in (
+          (1.0, 0.85),
+          (1.0, 0.65),
+          (1.12, 1.0),
+          (0.90, 1.0),
+          (1.0, 1.12),
+      ):
+        ev_rq = _eval_alpha_candidate(
+            best_params, deadzone=0.0, rq_mul_ref=rq_r_m, rq_mul_main=rq_m_m
+        )
+        if ev_rq[0] < best_eval[0]:
+          best_eval = ev_rq
 
   (
       true_rd,
@@ -3655,6 +5879,10 @@ def optimize_alpha_composite(
       opt_noise_lut,
       rec_hard,
   ) = best_eval
+
+  stats = dict(stats)
+  stats["dequant_mode"] = m_dq_mode
+  stats["ref_dequant_mode"] = r_dq_mode
 
   if len(history) >= 2 and history[-1]["rd_loss"] > history[0]["rd_loss"]:
     history[-1]["rd_loss"] = min(history[-1]["rd_loss"], best_j)
@@ -3715,7 +5943,7 @@ def optimize_alpha_composite(
 def optimize_single_frame_baseline(
     rgb_u8: np.ndarray | jax.Array | None = None,
     distance: float = 1.0,
-    lambda_rd: float = 0.08,
+    lambda_rd: float | None = None,
     rd_lambda: float | None = None,
     steps: int | None = None,
     num_steps: int | None = None,
@@ -3724,13 +5952,13 @@ def optimize_single_frame_baseline(
     lr_noise: float = 0.005,
     lr_dequant: float = 0.008,
     enable_noise: bool = False,
-    custom_dequant: bool | None = None,
-    enable_custom_dequant: bool | None = None,
-    optimize_dequant_matrices: bool | None = None,
-    use_custom_dequant: bool | None = None,
+    custom_dequant: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
     verify_decoders: bool = True,
     vgg_params: Any | None = None,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     effort: int = 7,
     init_mode: str = "dct",
     seed: int = 0,
@@ -3743,18 +5971,25 @@ def optimize_single_frame_baseline(
     raise ValueError("Either rgb_u8 or srgb_hwc must be provided.")
   init_mode_norm = _normalize_init_mode(init_mode)
   default_steps = 60 if init_mode_norm in ("zero", "random") else 24
-  eff_lambda = float(rd_lambda if rd_lambda is not None else lambda_rd)
+  eff_lambda = float(
+      rd_lambda
+      if rd_lambda is not None
+      else (
+          lambda_rd
+          if lambda_rd is not None
+          else calibrate_rd_lambda(distance)
+      )
+  )
   eff_steps = int(
       num_steps
       if num_steps is not None
       else (steps if steps is not None else default_steps)
   )
-  use_custom_dq = _resolve_custom_dequant_flag(
+  dq_spec = _resolve_custom_dequant_spec(
       custom_dequant=custom_dequant,
       enable_custom_dequant=enable_custom_dequant,
       optimize_dequant_matrices=optimize_dequant_matrices,
       use_custom_dequant=use_custom_dequant,
-      default=True,
   )
 
   arr = _normalize_srgb_hwc(img_in)
@@ -3782,19 +6017,25 @@ def optimize_single_frame_baseline(
       )
   )
   state = copy.deepcopy(stage1_candidates[0]["state"])
+  if enable_noise:
+    state.ytox_dc = 0
+    state.ytob_dc = 0
   state.ac_strategy = stage2_acs
   state.ac_strategy_Anchor = stage2_anchors
+  if np.any(stage2_acs != 0):
+    rq_s2, epf_s_s2, _ = select_quant_and_epf_jax(
+        arr, distance=float(distance), ac_strategy=stage2_acs
+    )
+    state.raw_quant_field = np.asarray(rq_s2, dtype=np.int32)
+    state.epf_sharpness = np.asarray(epf_s_s2, dtype=np.uint8)
 
-  dq_log_init = (
-      jnp.array(
-          [-0.03, -0.05, -0.02, -0.02, -0.03, -0.01, 0.0, 0.0, 0.0],
-          dtype=jnp.float32,
-      )
-      if use_custom_dq
-      else jnp.zeros((9,), dtype=jnp.float32)
+  dq_mode = select_dequant_mode_for_frame(
+      h, w, float(distance), dq_spec, is_reference=False
   )
+  use_custom_dq = dq_mode != "none"
+  dq_log_init = _init_dq_log_vec(dq_mode, is_reference=False)
   _apply_custom_dequant_to_state(
-      state, dq_log_init, custom_dequant=use_custom_dq
+      state, dq_log_init, custom_dequant=dq_mode
   )
   dc_cont, ac_cont = compute_continuous_dc_ac_jax(
       target_xyb,
@@ -3809,11 +6050,9 @@ def optimize_single_frame_baseline(
       else jnp.zeros((8,), dtype=jnp.float32)
   )
 
-  # Stage 2 Materialization (unrefined discrete assembly at step 0, with high-frequency AC un-shrunk)
+  # Stage 2 Materialization (unrefined discrete assembly at step 0, exact round-to-nearest)
   s2_state = copy.deepcopy(state)
-  # Add slight pre-refinement rounding perturbation on high-frequency AC in Stage 2
-  # so Stage 3 continuous refinement + deadzone shrinkage strictly reduces true J.
-  s2_ac_np = np.round(np.asarray(ac_cont) * 1.06).astype(np.int32)
+  s2_ac_np = np.round(np.asarray(ac_cont)).astype(np.int32)
   s2_state.quant_ac = s2_ac_np
   s2_state.dc_quant = np.round(np.asarray(dc_cont)).astype(np.int32)
   s2_noise_lut = (
@@ -3827,8 +6066,8 @@ def optimize_single_frame_baseline(
       s2_state, effort=effort, noise_lut=s2_noise_lut
   )
   stage2_true_bpp = (len(s2_jxl_bytes) * 8.0) / float(h * w)
-  s2_rec = reconstruct_single_frame(
-      s2_state, include_noise=enable_noise, noise_lut=s2_noise_lut, hard=True
+  s2_rec = _fast_reconstruct_single_frame(
+      s2_state, include_noise=enable_noise, noise_lut=s2_noise_lut
   )
   stage2_wd = float(
       wd_only(
@@ -3844,16 +6083,8 @@ def optimize_single_frame_baseline(
 
   # Stage 3: Joint continuous Rate-WD refinement
   fwd_fn, vjp_fn = _get_frame_kernels(state, enable_noise=enable_noise)
-  topo = StaticVarDCTTopology(state)
-  inv_mat, biases = topo.opsin_inv_matrix, topo.opsin_biases
-
-  @jax.jit
-  def _xyb_to_srgb_hwc(xyb):
-    return jnp.moveaxis(opsin_to_srgb(xyb, inv_mat, biases, clamp=True), 0, -1)
-
-  grad_srgb = jax.jit(
-      jax.grad(lambda xyb, cot: jnp.sum(_xyb_to_srgb_hwc(xyb) * cot))
-  )
+  _xyb_to_srgb_hwc, grad_srgb = _get_xyb_to_srgb_kernels()
+  topo = StaticVarDCTTopology(state) if (init_mode_norm in ("zero", "random")) else None
 
   rq = jnp.asarray(state.raw_quant_field, dtype=jnp.float32)
   yx = jnp.asarray(state.ytox_map, dtype=jnp.float32)
@@ -3877,10 +6108,22 @@ def optimize_single_frame_baseline(
   }
   is_zero_or_rand = init_mode_norm in ("zero", "random")
   eff_lr_ac = (
-      0.055 if (is_zero_or_rand and lr_ac == 0.03) else float(lr_ac)
+      0.055
+      if (is_zero_or_rand and lr_ac == 0.03)
+      else (
+          float(lr_ac) * min(1.0, 0.45 + 0.85 * float(distance))
+          if (not is_zero_or_rand and lr_ac == 0.03 and float(distance) < 0.65)
+          else float(lr_ac)
+      )
   )
   eff_lr_dc = (
-      0.055 if (is_zero_or_rand and lr_dc == 0.01) else float(lr_dc)
+      0.055
+      if (is_zero_or_rand and lr_dc == 0.01)
+      else (
+          float(lr_dc) * (1.0 + 6.0 * float(np.clip(1.0 - float(distance), 0.0, 1.0)))
+          if (not is_zero_or_rand and lr_dc == 0.01 and float(distance) < 1.0)
+          else float(lr_dc)
+      )
   )
   if is_zero_or_rand:
     scale_dc, scale_ac = _compute_state_precond_scales_jax(state, topo)
@@ -3922,6 +6165,7 @@ def optimize_single_frame_baseline(
   total_steps = max(1, int(eff_steps))
   warmup_meta_step = int(0.35 * total_steps) if is_zero_or_rand else 0
   freeze_dq_step = max(1, int(0.8 * total_steps))
+  cluster_start_step = max(1, int(0.75 * total_steps))
   ac_rate_w = jnp.float32(0.0 if is_zero_or_rand else 1.0)
   dq_base = dq_log_init if use_custom_dq else None
 
@@ -3941,6 +6185,8 @@ def optimize_single_frame_baseline(
         params["dq_log_scale"] if use_custom_dq else None,
         rq,
         dq_base,
+        yx,
+        yb,
     )
     rec = _xyb_to_srgb_hwc(xyb)
     wd_v, grad_rec = wd_val_and_grad(
@@ -3952,7 +6198,26 @@ def optimize_single_frame_baseline(
       )
       g_f0 = (2.0 / float(h * w)) * (rec - target_j) * 15.0
       grad_rec = 0.5 * grad_rec + 0.5 * grad_rec_0 + g_f0
+    elif not enable_noise and total_steps >= 4 and float(distance) < 0.85:
+      hq_w = 80.0 * ((0.85 - float(distance)) ** 2)
+      grad_rec = grad_rec + (2.0 * hq_w / float(3 * h * w)) * (rec - target_j)
     grad_xyb = grad_srgb(xyb, grad_rec)
+    if (
+        not is_zero_or_rand
+        and not enable_noise
+        and total_steps >= 4
+        and float(distance) < 0.85
+    ):
+      hq_xyb_w = jnp.asarray([12.0, 1.5, 0.5], dtype=jnp.float32)[:, None, None]
+      hq_t2 = jnp.float32(25.0 * ((0.85 - float(distance)) ** 2) / float(h * w))
+      grad_xyb = grad_xyb.at[:, :h, :w].add(
+          2.0 * hq_t2 * hq_xyb_w * (xyb[:, :h, :w] - target_xyb[:, :h, :w])
+      )
+    cluster_blend = jnp.float32(
+        1.0
+        if (not is_zero_or_rand and step >= cluster_start_step and h8 * w8 >= 64)
+        else 0.0
+    )
     (_, bits), grads = vjp_fn(
         params,
         rq,
@@ -3968,6 +6233,7 @@ def optimize_single_frame_baseline(
         custom_dq_w,
         dq_base,
         ac_rate_w,
+        cluster_blend,
     )
     if is_zero_or_rand:
       ac_p = params["ac"]
@@ -4010,11 +6276,18 @@ def optimize_single_frame_baseline(
       params["dc"] = params["dc"].at[1].set(jnp.maximum(params["dc"][1], 0.0))
     params["noise_lut"] = jnp.clip(params["noise_lut"], min_noise_val, 0.5)
 
-  def _eval_single_candidate(cand_p: dict[str, Any], deadzone: float = 0.0):
+  def _prep_single_candidate(
+      cand_p: dict[str, Any], deadzone: float = 0.0, rq_shift: float = 0.0
+  ):
     c_st = copy.deepcopy(state)
-    c_st.raw_quant_field = np.clip(
-        np.round(np.asarray(rq + cand_p["rq_delta"], dtype=np.float32)), 1, 256
-    ).astype(np.int32)
+    rq_cont = np.clip(
+        np.asarray(rq + cand_p["rq_delta"] + rq_shift, dtype=np.float32),
+        1.0,
+        256.0,
+    )
+    c_st.raw_quant_field = broadcast_quant_field_to_ac_strategy(
+        np.round(rq_cont).astype(np.int32), c_st.ac_strategy
+    )
     c_st.ytox_map = np.clip(
         np.round(np.asarray(yx + cand_p["yx_delta"], dtype=np.float32)),
         -128,
@@ -4026,7 +6299,7 @@ def optimize_single_frame_baseline(
         127,
     ).astype(np.int32)
     _apply_custom_dequant_to_state(
-        c_st, cand_p["dq_log_scale"], custom_dequant=use_custom_dq
+        c_st, cand_p["dq_log_scale"], custom_dequant=dq_mode
     )
     ac_raw = np.asarray(cand_p["ac"], dtype=np.float32)
     dc_raw = np.asarray(cand_p["dc"], dtype=np.float32)
@@ -4038,6 +6311,7 @@ def optimize_single_frame_baseline(
         cand_p["dq_log_scale"],
         dq_log_init,
         use_custom_dq,
+        rq_cont=rq_cont,
     )
     if deadzone > 0.0:
       ac_np = np.sign(ac_np) * np.maximum(np.abs(ac_np) - deadzone, 0.0)
@@ -4052,10 +6326,17 @@ def optimize_single_frame_baseline(
         if enable_noise
         else None
     )
-    jb, st_dict = encode_single_frame(c_st, effort=effort, noise_lut=c_lut)
+    return (c_st, c_lut)
+
+  def _score_single_candidate(
+      prepped: tuple[JxlVarDCTState, Any],
+      enc_res: tuple[bytes, dict[str, Any]],
+  ):
+    c_st, c_lut = prepped
+    jb, st_dict = enc_res
     t_bpp = (len(jb) * 8.0) / float(h * w)
-    r_hard = reconstruct_single_frame(
-        c_st, include_noise=enable_noise, noise_lut=c_lut, hard=True
+    r_hard = _fast_reconstruct_single_frame(
+        c_st, include_noise=enable_noise, noise_lut=c_lut
     )
     t_wd = float(
         wd_only(
@@ -4070,20 +6351,53 @@ def optimize_single_frame_baseline(
     t_j = t_wd + float(eff_lambda) * t_bpp
     return (t_j, t_bpp, t_wd, jb, st_dict, c_st, c_lut, r_hard)
 
+  def _eval_single_candidate(
+      cand_p: dict[str, Any], deadzone: float = 0.0, rq_shift: float = 0.0
+  ):
+    prepped = _prep_single_candidate(
+        cand_p, deadzone=deadzone, rq_shift=rq_shift
+    )
+    enc_res = encode_single_frame(prepped[0], effort=effort, noise_lut=prepped[1])
+    return _score_single_candidate(prepped, enc_res)
+
+  if float(distance) < 0.65:
+    single_preps = [
+        _prep_single_candidate(best_params, deadzone=0.0),
+        _prep_single_candidate(params, deadzone=0.0),
+        _prep_single_candidate(step0_params, deadzone=0.0),
+    ]
+  else:
+    single_preps = [
+        _prep_single_candidate(best_params, deadzone=0.0),
+        _prep_single_candidate(best_params, deadzone=0.04),
+        _prep_single_candidate(best_params, deadzone=0.09),
+        _prep_single_candidate(params, deadzone=0.0),
+        _prep_single_candidate(step0_params, deadzone=0.0),
+    ]
+  single_enc_list = list(
+      _CPP_ENCODE_POOL.map(
+          lambda pr: encode_single_frame(pr[0], effort=effort, noise_lut=pr[1]),
+          single_preps,
+      )
+  )
   cand_evals = [
-      _eval_single_candidate(best_params, deadzone=0.0),
-      _eval_single_candidate(params, deadzone=0.0),
-      _eval_single_candidate(step0_params, deadzone=0.0),
+      _score_single_candidate(pr, enc_r)
+      for pr, enc_r in zip(single_preps, single_enc_list)
   ]
   best_eval = min(cand_evals, key=lambda x: x[0])
   if best_eval[0] >= stage2_true_j:
-    for dz in (0.12, 0.25, 0.45):
+    for dz in (0.02, 0.06, 0.12, 0.18, 0.25, 0.35, 0.45):
       ev = _eval_single_candidate(best_params, deadzone=dz)
       if ev[0] < best_eval[0]:
         best_eval = ev
       ev0 = _eval_single_candidate(step0_params, deadzone=dz)
       if ev0[0] < best_eval[0]:
         best_eval = ev0
+    if best_eval[0] >= stage2_true_j:
+      for rqs in (-0.6, 0.6):
+        ev_rq = _eval_single_candidate(best_params, deadzone=0.0, rq_shift=rqs)
+        if ev_rq[0] < best_eval[0]:
+          best_eval = ev_rq
 
   (
       true_rd,
@@ -4095,6 +6409,8 @@ def optimize_single_frame_baseline(
       opt_noise_lut,
       rec_hard,
   ) = best_eval
+  stats = dict(stats)
+  stats["dequant_mode"] = dq_mode
 
   if len(history) >= 2 and history[-1]["rd_loss"] > history[0]["rd_loss"]:
     history[-1]["rd_loss"] = min(history[-1]["rd_loss"], best_j)
@@ -4137,7 +6453,7 @@ def optimize_single_frame_baseline(
 def select_best_mode(
     rgb_u8: np.ndarray | jax.Array | None = None,
     distance: float = 0.35,
-    lambda_rd: float = 0.18,
+    lambda_rd: float | None = None,
     rd_lambda: float | None = None,
     steps: int | None = None,
     num_steps: int | None = None,
@@ -4150,16 +6466,18 @@ def select_best_mode(
     blend_mode_candidates: Sequence[int | str] | None = None,
     alpha_blend_mode: int | str = PATCH_BLEND_ALPHA_BELOW,
     enable_noise: bool = False,
-    custom_dequant: bool | None = None,
-    enable_custom_dequant: bool | None = None,
-    optimize_dequant_matrices: bool | None = None,
-    use_custom_dequant: bool | None = None,
+    custom_dequant: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
     verify_decoders: bool = True,
     vgg_params: Any | None = None,
+    log2_sigma: float = 1.0,
     effort: int = 7,
     single_frame_fn: Callable[..., Any] | None = None,
     init_mode: str = "dct",
     seed: int = 0,
+    target_bpp: float | None = None,
     *,
     srgb_hwc: np.ndarray | jax.Array | None = None,
 ) -> EncodeResult:
@@ -4170,24 +6488,46 @@ def select_best_mode(
   arr = _normalize_srgb_hwc(img_in)
   init_mode_norm = _normalize_init_mode(init_mode)
   default_steps = 40 if init_mode_norm in ("zero", "random") else 6
-  eff_lambda = float(rd_lambda if rd_lambda is not None else lambda_rd)
+  caller_overrode_lambda = (rd_lambda is not None) or (lambda_rd is not None)
+  eff_lambda = float(
+      rd_lambda
+      if rd_lambda is not None
+      else (
+          lambda_rd
+          if lambda_rd is not None
+          else calibrate_rd_lambda(distance)
+      )
+  )
   eff_steps = int(
       num_steps
       if num_steps is not None
       else (steps if steps is not None else default_steps)
   )
-  use_custom_dq = _resolve_custom_dequant_flag(
+  dq_spec = _resolve_custom_dequant_spec(
       custom_dequant=custom_dequant,
       enable_custom_dequant=enable_custom_dequant,
       optimize_dequant_matrices=optimize_dequant_matrices,
       use_custom_dequant=use_custom_dequant,
-      default=True,
+  )
+  use_custom_dq_flag = (
+      select_dequant_mode_for_frame(
+          arr.shape[0], arr.shape[1], float(distance), dq_spec, is_reference=False
+      )
+      != "none"
   )
   u_cands = (
       list(upsampling_candidates)
       if upsampling_candidates is not None
       else list(candidate_upsamplings)
   )
+  if (
+      upsampling_candidates is None
+      and tuple(u_cands) == (2, 4, 8)
+      and float(distance) < 1.0
+      and not caller_overrode_lambda
+      and target_bpp is None
+  ):
+    u_cands = [2]
   ds_cands = (
       list(dim_shift_candidates)
       if dim_shift_candidates is not None
@@ -4198,7 +6538,7 @@ def select_best_mode(
   else:
     parsed_pbm = _parse_blend_mode(patch_blend_mode)
     bm_cands = (
-        [PATCH_BLEND_REPLACE] if parsed_pbm == "auto" else [int(parsed_pbm)]
+        ["auto"] if parsed_pbm == "auto" else [int(parsed_pbm)]
     )
 
   if vgg_params is None:
@@ -4253,7 +6593,7 @@ def select_best_mode(
               history=getattr(res_s, "history", []),
               last_grads=None,
               verify_decoders=False,
-              custom_dequant_enabled=use_custom_dq,
+              custom_dequant_enabled=use_custom_dq_flag,
           )
       else:
         res_s = optimize_single_frame_baseline(
@@ -4262,57 +6602,85 @@ def select_best_mode(
             lambda_rd=eff_lambda,
             steps=eff_steps,
             enable_noise=enable_noise,
-            custom_dequant=use_custom_dq,
+            custom_dequant=dq_spec,
             verify_decoders=False,
             vgg_params=vgg_params,
+            log2_sigma=log2_sigma,
             effort=effort,
             init_mode=init_mode_norm,
             seed=seed,
         )
       candidates.append(res_s)
     elif m_low == "patches":
-      for u in u_cands:
-        for bm in bm_cands:
-          res_p = optimize_patch_composite(
-              rgb_u8=arr,
-              upsampling=u,
-              blend_mode=bm,
-              distance=distance,
-              lambda_rd=eff_lambda,
-              steps=eff_steps,
-              enable_noise=enable_noise,
-              custom_dequant=use_custom_dq,
-              verify_decoders=False,
-              vgg_params=vgg_params,
-              effort=effort,
-              init_mode=init_mode_norm,
-              seed=seed,
-          )
-          candidates.append(res_p)
+      u_arg: int | str = "auto" if len(u_cands) > 1 else int(u_cands[0])
+      for bm in bm_cands:
+        res_p = optimize_patch_composite(
+            rgb_u8=arr,
+            upsampling=u_arg,
+            candidate_upsamplings=u_cands,
+            blend_mode=bm,
+            distance=distance,
+            lambda_rd=eff_lambda,
+            steps=eff_steps,
+            enable_noise=enable_noise,
+            custom_dequant=dq_spec,
+            verify_decoders=False,
+            vgg_params=vgg_params,
+            log2_sigma=log2_sigma,
+            effort=effort,
+            init_mode=init_mode_norm,
+            seed=seed,
+        )
+        candidates.append(res_p)
     elif m_low == "alpha":
-      for u in u_cands:
-        for ds in ds_cands:
-          res_a = optimize_alpha_composite(
-              rgb_u8=arr,
-              upsampling=u,
-              dim_shift=ds,
-              distance=distance,
-              lambda_rd=eff_lambda,
-              steps=eff_steps,
-              enable_noise=enable_noise,
-              alpha_blend_mode=alpha_blend_mode,
-              custom_dequant=use_custom_dq,
-              verify_decoders=False,
-              vgg_params=vgg_params,
-              effort=effort,
-              init_mode=init_mode_norm,
-              seed=seed,
-          )
-          candidates.append(res_a)
+      u_arg_a: int | str = "auto" if len(u_cands) > 1 else int(u_cands[0])
+      ds_arg_a: int | str = "auto" if len(ds_cands) > 1 else int(ds_cands[0])
+      res_a = optimize_alpha_composite(
+          rgb_u8=arr,
+          upsampling=u_arg_a,
+          dim_shift=ds_arg_a,
+          candidate_upsamplings=u_cands,
+          candidate_dim_shifts=ds_cands,
+          distance=distance,
+          lambda_rd=eff_lambda,
+          steps=eff_steps,
+          enable_noise=enable_noise,
+          alpha_blend_mode=alpha_blend_mode,
+          custom_dequant=dq_spec,
+          verify_decoders=False,
+          vgg_params=vgg_params,
+          log2_sigma=log2_sigma,
+          effort=effort,
+          init_mode=init_mode_norm,
+          seed=seed,
+      )
+      candidates.append(res_a)
     else:
       raise ValueError(f"Unknown candidate mode: {m}")
 
-  best = min(candidates, key=lambda c: c.rd_cost)
+  # High-quality (d < 1.0) fold-back guard: prevent downsampled reference frames
+  # from trading sharp full-res detail for 2x/4x/8x upsampling blur unless
+  # multi-res strictly beats single-frame distortion (or single exceeds target_bpp).
+  eligible_candidates = candidates
+  single_cands = [c for c in candidates if c.mode == "single"]
+  if float(distance) < 1.0 and single_cands and not caller_overrode_lambda:
+    s_cand = min(single_cands, key=lambda c: c.rd_cost)
+    est_bpp = estimate_frame_bits(
+        arr.shape[0], arr.shape[1], float(distance)
+    ) / float(max(arr.shape[0] * arr.shape[1], 1))
+    hq_bpp_cap = (
+        float(target_bpp)
+        if target_bpp is not None
+        else float(est_bpp * 2.5 + 1.5)
+    )
+    if s_cand.bpp <= hq_bpp_cap:
+      filtered = [
+          c for c in candidates if c.mode == "single" or c.wd < s_cand.wd
+      ]
+      if filtered:
+        eligible_candidates = filtered
+
+  best = min(eligible_candidates, key=lambda c: c.rd_cost)
   if verify_decoders:
     ver = verify_jxl_codestream(best.jxl_bytes, min_cross_decoder_psnr=45.0)
     djxl_rgb = ver["rgb_djxl"].astype(np.float32) / 255.0
@@ -4342,6 +6710,9 @@ def select_best_mode(
       }
       for c in candidates
   ]
+  _STAGE1_AC_CANDIDATE_CACHE.clear()
+  _STAGE1_MAIN_DP_CACHE.clear()
+  _STAGE1_MULTIRES_CACHE.clear()
   return best
 
 
@@ -4358,19 +6729,21 @@ def encode_image_to_jxl(
     patch_blend_mode: int | str = "auto",
     alpha_blend_mode: int | str = PATCH_BLEND_ALPHA_BELOW,
     enable_noise: bool = False,
-    custom_dequant: bool | None = None,
-    enable_custom_dequant: bool | None = None,
-    optimize_dequant_matrices: bool | None = None,
-    use_custom_dequant: bool | None = None,
+    custom_dequant: bool | str | None = None,
+    enable_custom_dequant: bool | str | None = None,
+    optimize_dequant_matrices: bool | str | None = None,
+    use_custom_dequant: bool | str | None = None,
     num_steps: int | None = None,
     steps: int | None = None,
     verify_decoders: bool = True,
     init_mode: str = "dct",
     seed: int = 0,
+    target_bpp: float | None = None,
     *,
     srgb_hwc: np.ndarray | jax.Array | None = None,
     blend_mode: int | str | None = None,
     lambda_rd: float | None = None,
+    log2_sigma: float = 1.0,
     vgg_params: Any | None = None,
     effort: int = 7,
 ) -> EncodeResult:
@@ -4381,32 +6754,33 @@ def encode_image_to_jxl(
   arr = _normalize_srgb_hwc(img_in)
   init_mode_norm = _normalize_init_mode(init_mode)
   default_steps = 40 if init_mode_norm in ("zero", "random") else 8
-  eff_lambda = float(
-      rd_lambda
-      if rd_lambda is not None
-      else (lambda_rd if lambda_rd is not None else 0.12)
-  )
   eff_steps = int(
       steps
       if steps is not None
       else (num_steps if num_steps is not None else default_steps)
   )
   eff_bm = blend_mode if blend_mode is not None else patch_blend_mode
-  use_custom_dq = _resolve_custom_dequant_flag(
+  dq_spec = _resolve_custom_dequant_spec(
       custom_dequant=custom_dequant,
       enable_custom_dequant=enable_custom_dequant,
       optimize_dequant_matrices=optimize_dequant_matrices,
       use_custom_dequant=use_custom_dequant,
-      default=True,
   )
   m_low = mode.strip().lower()
 
   if m_low == "auto":
-    u_cands = (
-        (2, 4, 8)
-        if (isinstance(upsampling, str) and upsampling.lower() == "auto")
-        else (int(upsampling),)
-    )
+    if isinstance(upsampling, str) and upsampling.lower() == "auto":
+      if (
+          float(distance) < 1.0
+          and rd_lambda is None
+          and lambda_rd is None
+          and target_bpp is None
+      ):
+        u_cands = (2,)
+      else:
+        u_cands = (2, 4, 8)
+    else:
+      u_cands = (int(upsampling),)
     ds_cands = (
         (0, 1, 2, 3)
         if (isinstance(dim_shift, str) and dim_shift.lower() == "auto")
@@ -4415,7 +6789,8 @@ def encode_image_to_jxl(
     return select_best_mode(
         rgb_u8=arr,
         distance=distance,
-        lambda_rd=eff_lambda,
+        lambda_rd=lambda_rd,
+        rd_lambda=rd_lambda,
         steps=eff_steps,
         candidate_modes=("single", "patches", "alpha"),
         candidate_upsamplings=u_cands,
@@ -4423,13 +6798,25 @@ def encode_image_to_jxl(
         patch_blend_mode=eff_bm,
         alpha_blend_mode=alpha_blend_mode,
         enable_noise=enable_noise,
-        custom_dequant=use_custom_dq,
+        custom_dequant=dq_spec,
         verify_decoders=verify_decoders,
         vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
         effort=effort,
         init_mode=init_mode_norm,
         seed=seed,
+        target_bpp=target_bpp,
     )
+
+  eff_lambda = float(
+      rd_lambda
+      if rd_lambda is not None
+      else (
+          lambda_rd
+          if lambda_rd is not None
+          else calibrate_rd_lambda(distance)
+      )
+  )
 
   if m_low == "single":
     eff_dist = (
@@ -4443,9 +6830,10 @@ def encode_image_to_jxl(
         lambda_rd=eff_lambda,
         steps=eff_steps,
         enable_noise=enable_noise,
-        custom_dequant=use_custom_dq,
+        custom_dequant=dq_spec,
         verify_decoders=verify_decoders,
         vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
         effort=effort,
         init_mode=init_mode_norm,
         seed=seed,
@@ -4460,9 +6848,10 @@ def encode_image_to_jxl(
         lambda_rd=eff_lambda,
         steps=eff_steps,
         enable_noise=enable_noise,
-        custom_dequant=use_custom_dq,
+        custom_dequant=dq_spec,
         verify_decoders=verify_decoders,
         vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
         effort=effort,
         init_mode=init_mode_norm,
         seed=seed,
@@ -4481,9 +6870,10 @@ def encode_image_to_jxl(
         steps=eff_steps,
         enable_noise=enable_noise,
         alpha_blend_mode=eff_alpha_bm,
-        custom_dequant=use_custom_dq,
+        custom_dequant=dq_spec,
         verify_decoders=verify_decoders,
         vgg_params=vgg_params,
+        log2_sigma=log2_sigma,
         effort=effort,
         init_mode=init_mode_norm,
         seed=seed,
@@ -4501,6 +6891,10 @@ __all__ = [
     "EncodeResult",
     "CompositeOptimizationResult",
     "CompositeOptimizeResult",
+    "DEQUANT_MODE_DOF",
+    "calibrate_rd_lambda",
+    "estimate_frame_bits",
+    "select_dequant_mode_for_frame",
     "downsample_rgb_jax",
     "compute_detail_mask_jax",
     "extract_patch_rectangles",

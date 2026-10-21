@@ -94,6 +94,11 @@
 #include "tools/thread_pool_internal.h"
 
 namespace jxl {
+
+void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
+                               const AcStrategyImage& ac_strategy,
+                               BlockCtxMap* block_ctx_map);
+
 namespace {
 
 #pragma pack(push, 1)
@@ -1063,7 +1068,19 @@ bool BuildCustomQuantEncodings(const LoadedState& state,
   const QuantEncoding* library = DequantMatrices::Library();
   bool any_custom = false;
 
+  uint32_t active_qt_mask = 0;
+  for (uint8_t s_raw : state.ac_strategy) {
+    if (s_raw < AcStrategy::kNumValidStrategies) {
+      active_qt_mask |=
+          (1u << static_cast<uint32_t>(kAcStrategyToQuantTableMap[s_raw]));
+    }
+  }
+  if (active_qt_mask == 0) {
+    active_qt_mask = 1u;
+  }
+
   for (size_t qt_idx = 0; qt_idx < kNumQuantTables; ++qt_idx) {
+    if ((active_qt_mask & (1u << qt_idx)) == 0) continue;
     int match_s = -1;
     for (size_t s = 0; s < AcStrategy::kNumValidStrategies; ++s) {
       if (static_cast<size_t>(kAcStrategyToQuantTableMap[s]) == qt_idx &&
@@ -1161,13 +1178,13 @@ bool BuildCustomQuantEncodings(const LoadedState& state,
     if (dct_err <= 0.05f) {
       (*out_encodings)[qt_idx] = QuantEncoding::DCT(dct_params);
     } else {
-      // Fallback to kQuantModeRAW with exact power-of-2 F16 denominator.
-      const float qtable_den = 1.0f / 65536.0f;  // 2^-16, exact F16 subnormal
+      // Fallback to kQuantModeRAW with exact normal F16 denominator and i16 clamp.
+      const float qtable_den = 1.0f / 16384.0f;  // 2^-14, exact normal F16
       std::vector<int> qtable(3 * plane_size, 1);
       for (size_t i = 0; i < 3 * plane_size; ++i) {
         int q = static_cast<int>(
             std::lround(std::max(1e-7f, custom_mat[i]) / qtable_den));
-        qtable[i] = std::max(1, std::min(65535, q));
+        qtable[i] = std::max(1, std::min(32767, q));
       }
       QuantEncoding raw_enc = QuantEncoding::RAW(std::move(qtable), 0);
       raw_enc.qraw.qtable_den = qtable_den;
@@ -1235,6 +1252,7 @@ Status PopulateEncoderStateFromLoaded(
                        ImageI::Create(memory_manager, w8, h8));
   JXL_ASSIGN_OR_RETURN(shared.epf_sharpness,
                        ImageB::Create(memory_manager, w8, h8));
+  double rqf_sum = 0.0;
   for (size_t by = 0; by < h8; ++by) {
     int32_t* q_row = shared.raw_quant_field.Row(by);
     uint8_t* s_row = shared.epf_sharpness.Row(by);
@@ -1242,8 +1260,17 @@ Status PopulateEncoderStateFromLoaded(
       q_row[bx] = std::max<int32_t>(
           1, std::min<int32_t>(256, state.raw_quant_field[by * w8 + bx]));
       s_row[bx] = std::min<uint8_t>(7, state.epf_sharpness[by * w8 + bx]);
+      rqf_sum += static_cast<double>(q_row[bx]);
     }
   }
+  const float mean_rqf = static_cast<float>(
+      rqf_sum / std::max<size_t>(1, h8 * w8));
+  const float est_distance = std::max(
+      0.1f,
+      std::min(15.0f, (0.79f * 65536.0f) /
+                          std::max(1.0f, static_cast<float>(state.hdr.global_scale) *
+                                             mean_rqf)));
+  enc_state->cparams.butteraugli_distance = est_distance;
 
   JXL_ASSIGN_OR_RETURN(shared.cmap,
                        ColorCorrelationMap::Create(
@@ -1433,6 +1460,15 @@ Status PopulateEncoderStateFromLoaded(
     JXL_RETURN_IF_ERROR(enc_modular->AddVarDCTDC(
         frame_header, dc, r, group_index, /*nl_dc=*/false, enc_state,
         /*jpeg_transcode=*/false));
+  }
+
+  {
+    CompressParams ctx_cparams = enc_state->cparams;
+    if (ctx_cparams.speed_tier >= SpeedTier::kFalcon) {
+      ctx_cparams.speed_tier = SpeedTier::kSquirrel;
+    }
+    FindBestBlockEntropyModel(ctx_cparams, shared.raw_quant_field,
+                              shared.ac_strategy, &shared.block_ctx_map);
   }
 
   JXL_RETURN_IF_ERROR(ComputeACMetadata(pool, enc_state, enc_modular));
@@ -2558,6 +2594,8 @@ Status RunInspect(const std::string& input_jxl_path,
     int32_t ytob_dc = 0;
     uint32_t epf_iters = 0;
     bool gab = false;
+    uint32_t num_block_ctxs = 0;
+    uint32_t num_qf_thresholds = 0;
     bool dequant_all_default = true;
     bool dc_quant_all_default = true;
     bool all_default = true;
@@ -2639,6 +2677,10 @@ Status RunInspect(const std::string& input_jxl_path,
     info.ytob_dc = dec_state->shared->cmap.base().GetYToBDC();
     info.epf_iters = fh.loop_filter.epf_iters;
     info.gab = fh.loop_filter.gab;
+    info.num_block_ctxs =
+        static_cast<uint32_t>(dec_state->shared->block_ctx_map.num_ctxs);
+    info.num_qf_thresholds = static_cast<uint32_t>(
+        dec_state->shared->block_ctx_map.qf_thresholds.size());
 
     const auto& encodings = dec_state->shared->matrices.encodings();
     info.dequant_all_default = true;
@@ -2720,6 +2762,8 @@ Status RunInspect(const std::string& input_jxl_path,
   oss << "  \"ytob_dc\": " << last.ytob_dc << ",\n";
   oss << "  \"epf_iters\": " << last.epf_iters << ",\n";
   oss << "  \"gab\": " << (last.gab ? "true" : "false") << ",\n";
+  oss << "  \"num_block_ctxs\": " << last.num_block_ctxs << ",\n";
+  oss << "  \"num_qf_thresholds\": " << last.num_qf_thresholds << ",\n";
   oss << "  \"has_noise\": " << (last.has_noise ? "true" : "false") << ",\n";
   oss << "  \"noise_lut\": [";
   for (size_t i = 0; i < 8; ++i) {
@@ -2835,7 +2879,9 @@ Status RunInspect(const std::string& input_jxl_path,
     oss << "      \"ytox_dc\": " << fr.ytox_dc << ",\n";
     oss << "      \"ytob_dc\": " << fr.ytob_dc << ",\n";
     oss << "      \"epf_iters\": " << fr.epf_iters << ",\n";
-    oss << "      \"gab\": " << (fr.gab ? "true" : "false") << "\n";
+    oss << "      \"gab\": " << (fr.gab ? "true" : "false") << ",\n";
+    oss << "      \"num_block_ctxs\": " << fr.num_block_ctxs << ",\n";
+    oss << "      \"num_qf_thresholds\": " << fr.num_qf_thresholds << "\n";
     oss << "    }" << (f + 1 < frames.size() ? ",\n" : "\n");
   }
   oss << "  ]\n";

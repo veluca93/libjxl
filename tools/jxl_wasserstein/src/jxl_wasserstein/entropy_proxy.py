@@ -183,45 +183,77 @@ class _LightweightAcStrategyTopology:
   def __init__(self, ac_strategy: np.ndarray) -> None:
     acs_np = np.asarray(ac_strategy, dtype=np.int32)
     self.h8, self.w8 = acs_np.shape
-    covered = np.zeros((self.h8, self.w8), dtype=bool)
-    blocks_1x1: list[tuple[int, int]] = []
+    is_1x1_np = (acs_np <= 3) | ((acs_np >= 12) & (acs_np <= 17))
+    mask_1x1_np = is_1x1_np.astype(np.float32)
+    first_block_mask_np = mask_1x1_np.copy()
     blocks_multi: dict[int, list[tuple[int, int]]] = {}
 
-    for by in range(self.h8):
-      for bx in range(self.w8):
-        if covered[by, bx]:
+    if np.any(~is_1x1_np):
+      covered_m = np.zeros((self.h8, self.w8), dtype=bool)
+      m_bys, m_bxs = np.nonzero(~is_1x1_np)
+      for by, bx in zip(m_bys.tolist(), m_bxs.tolist()):
+        if covered_m[by, bx]:
           continue
         s = int(acs_np[by, bx])
         cx = ACS_COVERED_BLOCKS_X[s] if 0 <= s < len(ACS_COVERED_BLOCKS_X) else 1
         cy = ACS_COVERED_BLOCKS_Y[s] if 0 <= s < len(ACS_COVERED_BLOCKS_Y) else 1
-        covered[by : by + cy, bx : bx + cx] = True
-        if cy == 1 and cx == 1:
-          blocks_1x1.append((by, bx))
-        else:
-          blocks_multi.setdefault(s, []).append((by, bx))
+        covered_m[by : by + cy, bx : bx + cx] = True
+        first_block_mask_np[by, bx] = 1.0
+        blocks_multi.setdefault(s, []).append((by, bx))
 
-    self.has_1x1 = len(blocks_1x1) > 0
-    if self.has_1x1:
-      self.by_1x1 = np.array([b[0] for b in blocks_1x1], dtype=np.int32)
-      self.bx_1x1 = np.array([b[1] for b in blocks_1x1], dtype=np.int32)
-    else:
-      self.by_1x1 = np.zeros((0,), dtype=np.int32)
-      self.bx_1x1 = np.zeros((0,), dtype=np.int32)
+    self.mask_1x1 = mask_1x1_np
+    self.first_block_mask = first_block_mask_np
+    by_1x1, bx_1x1 = np.nonzero(is_1x1_np)
+    self.has_1x1 = bool(by_1x1.size > 0)
+    self.by_1x1 = by_1x1.astype(np.int32)
+    self.bx_1x1 = bx_1x1.astype(np.int32)
 
     self.multi_groups: list[dict[str, Any]] = []
     for s, coords in sorted(blocks_multi.items()):
       cx = ACS_COVERED_BLOCKS_X[s]
       cy = ACS_COVERED_BLOCKS_Y[s]
       cy_l, cx_l = min(cy, cx), max(cy, cx)
+      by_np = np.array([c[0] for c in coords], dtype=np.int32)
+      bx_np = np.array([c[1] for c in coords], dtype=np.int32)
+      nh_cell = self.h8 // cy
+      nw_cell = self.w8 // cx
+      grid_aligned = bool(
+          nh_cell > 0
+          and nw_cell > 0
+          and np.all((by_np % cy) == 0)
+          and np.all((bx_np % cx) == 0)
+          and np.all((by_np // cy) < nh_cell)
+          and np.all((bx_np // cx) < nw_cell)
+      )
+      if grid_aligned:
+        cell_mask_np = np.zeros((nh_cell, nw_cell), dtype=bool)
+        cell_mask_np[by_np // cy, bx_np // cx] = True
+        blk_mask_np = np.repeat(np.repeat(cell_mask_np, cy, axis=0), cx, axis=1)
+        cell_mask_f = cell_mask_np.astype(np.float32)
+      else:
+        cell_mask_np = None
+        blk_mask_np = None
+        cell_mask_f = None
       self.multi_groups.append({
           "s": s,
           "cy": cy,
           "cx": cx,
           "cy_l": cy_l,
           "cx_l": cx_l,
-          "by": np.array([c[0] for c in coords], dtype=np.int32),
-          "bx": np.array([c[1] for c in coords], dtype=np.int32),
+          "by": by_np,
+          "bx": bx_np,
+          "grid_aligned": grid_aligned,
+          "nh_cell": nh_cell,
+          "nw_cell": nw_cell,
+          "h_lim": nh_cell * cy,
+          "w_lim": nw_cell * cx,
+          "cell_mask": cell_mask_np,
+          "cell_mask_f": cell_mask_f,
+          "blk_mask": blk_mask_np,
       })
+    self.all_grid_aligned = all(
+        bool(g.get("grid_aligned", False)) for g in self.multi_groups
+    )
 
 
 _ACS_TOPO_CACHE: dict[tuple[tuple[int, int], bytes], _LightweightAcStrategyTopology] = {}
@@ -557,6 +589,138 @@ def _compute_nzeros_rate_bits(
   return jnp.sum(blk_bits)
 
 
+NUM_CLUSTER_STRAT_GROUPS: int = 3
+NUM_CLUSTER_QF_BUCKETS: int = 2
+NUM_CLUSTER_NZ_BUCKETS: int = 2
+NUM_BLOCK_CLUSTERS: int = (
+    NUM_CLUSTER_STRAT_GROUPS * NUM_CLUSTER_QF_BUCKETS * NUM_CLUSTER_NZ_BUCKETS
+)
+
+
+def _compute_multi_cluster_ac_token_bits(
+    cluster_groups: list[
+        tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ]
+    ],
+    eps: float = 1e-3,
+) -> jax.Array:
+  """Computes multi-cluster plug-in histogram AC entropy + ANS cluster header bits.
+
+  Partitions blocks across `12 = 3 * 2 * 2` `(strategy_group, qf_bucket,
+  nzeros_activity_bucket)` context clusters matching `FindBestBlockEntropyModel`
+  and `NonZeroContext` in `libjxl`.
+  """
+  if not cluster_groups:
+    return jnp.asarray(0.0, dtype=jnp.float32)
+
+  rqf_all = jnp.concatenate([g[5] for g in cluster_groups], axis=0)
+  nz_all = jnp.concatenate([g[6] for g in cluster_groups], axis=0)
+  val_all = jnp.concatenate([g[7] for g in cluster_groups], axis=0)
+
+  val_sum = jnp.maximum(jnp.sum(val_all), 1.0)
+  qf_mean = jnp.sum(rqf_all * val_all) / val_sum
+  nz_mean = jnp.sum(nz_all * val_all) / val_sum
+
+  rqf_valid = jnp.where(val_all > 0.5, rqf_all, qf_mean)
+  nz_valid = jnp.where(val_all > 0.5, nz_all, nz_mean)
+
+  qf_var = jnp.sum(((rqf_valid - qf_mean) ** 2) * val_all) / val_sum
+  nz_var = jnp.sum(((nz_valid - nz_mean) ** 2) * val_all) / val_sum
+  qf_std = jnp.sqrt(qf_var + 1e-6)
+  nz_std = jnp.sqrt(nz_var + 1e-6)
+
+  has_qf_var = (jnp.max(rqf_valid) - jnp.min(rqf_valid)) > 0.5
+  has_nz_var = (jnp.max(nz_valid) - jnp.min(nz_valid)) > 1.0
+
+  c_hist_zero = jnp.zeros((NUM_BLOCK_CLUSTERS, 3, NUM_FREQ_BANDS8), dtype=jnp.float32)
+  c_hist_cats = jnp.zeros(
+      (NUM_BLOCK_CLUSTERS, 3, NUM_FREQ_BANDS8, MAX_AC_CATEGORY),
+      dtype=jnp.float32,
+  )
+  c_hist_cdfs = jnp.zeros(
+      (NUM_BLOCK_CLUSTERS, 3, NUM_FREQ_BANDS8, MAX_AC_CATEGORY),
+      dtype=jnp.float32,
+  )
+
+  for (
+      int_z,
+      cat_w,
+      cdf,
+      one_hot_b,
+      strat_w,
+      rqf_m,
+      nz_m,
+      valid_m,
+  ) in cluster_groups:
+    w_qf_hi = jnp.where(
+        has_qf_var,
+        jax.nn.sigmoid((rqf_m - qf_mean) / jnp.maximum(0.5 * qf_std, 0.5)),
+        0.0,
+    )
+    w_qf = jnp.stack([1.0 - w_qf_hi, w_qf_hi], axis=-1)
+    w_nz_hi = jnp.where(
+        has_nz_var,
+        jax.nn.sigmoid((nz_m - nz_mean) / jnp.maximum(0.5 * nz_std, 0.75)),
+        0.0,
+    )
+    w_nz = jnp.stack([1.0 - w_nz_hi, w_nz_hi], axis=-1)
+    w_clust = jax.lax.stop_gradient(
+        (
+            strat_w[:, :, None, None]
+            * w_qf[:, None, :, None]
+            * w_nz[:, None, None, :]
+        ).reshape(-1, NUM_BLOCK_CLUSTERS)
+        * valid_m[:, None]
+    )
+    z_band = jnp.einsum("mck,kb->mcb", int_z, one_hot_b)
+    cat_band = jnp.einsum("mcks,kb->mcbs", cat_w, one_hot_b)
+    cdf_band = jnp.einsum("mcks,kb->mcbs", cdf, one_hot_b)
+    c_hist_zero = c_hist_zero + jnp.einsum("mg,mcb->gcb", w_clust, z_band)
+    c_hist_cats = c_hist_cats + jnp.einsum("mg,mcbs->gcbs", w_clust, cat_band)
+    c_hist_cdfs = c_hist_cdfs + jnp.einsum("mg,mcbs->gcbs", w_clust, cdf_band)
+
+  eps_c = float(eps) / float(NUM_BLOCK_CLUSTERS)
+  s_idx = jnp.arange(1, MAX_AC_CATEGORY + 1, dtype=jnp.float32)[
+      None, None, None, :
+  ]
+  prior_cats = eps_c * jnp.power(0.5, s_idx - 1.0)
+  counts_zero = c_hist_zero[..., None] + eps_c
+  counts_cats = c_hist_cats + prior_cats
+  counts_all = jnp.concatenate([counts_zero, counts_cats], axis=-1)
+  totals = jnp.sum(counts_all, axis=-1, keepdims=True)
+
+  ac_token_entropy_bits = -jnp.sum(counts_all * jnp.log2(counts_all / totals))
+  ac_extra_bits = jnp.sum(c_hist_cats * s_idx)
+  forward_ac_bits = ac_token_entropy_bits + ac_extra_bits
+
+  counts_prev = jnp.concatenate([counts_zero, counts_cats[..., :-1]], axis=-1)
+  raw_step_cost = 1.0 + jnp.log2(
+      jax.lax.stop_gradient(counts_prev / counts_cats)
+  )
+  min_step_deficit = jnp.maximum(0.0, 0.25 - raw_step_cost)
+  monotonic_correction = jnp.sum(c_hist_cdfs * min_step_deficit)
+  ac_bits = forward_ac_bits + (
+      monotonic_correction - jax.lax.stop_gradient(monotonic_correction)
+  )
+
+  # ANS context map + per-active-cluster histogram table header overhead.
+  tot_gc = jnp.sum(c_hist_zero, axis=-1) + jnp.sum(c_hist_cats, axis=(-2, -1))
+  active_gc = tot_gc / (tot_gc + 24.0)
+  extra_active_clusters = (
+      jax.nn.softplus((jnp.sum(active_gc) - 3.0) * 4.0) / 4.0
+  )
+  cluster_header_bits = 24.0 * extra_active_clusters
+  return ac_bits + cluster_header_bits
+
+
 def soft_ac_rate_bits(
     quant_ac: jax.Array,
     topology: StaticVarDCTTopology | JxlVarDCTState | None = None,
@@ -567,6 +731,8 @@ def soft_ac_rate_bits(
     raw_quant_field: jax.Array | None = None,
     llf_mask: jax.Array | None = None,
     eps: float = 1e-3,
+    multi_cluster: bool = False,
+    cluster_blend: float | jax.Array | None = None,
 ) -> jax.Array:
   """Differentiable VarDCT AC token & context bit-rate proxy for JPEG XL.
 
@@ -580,12 +746,230 @@ def soft_ac_rate_bits(
      while interior zeros (`z_k * (1 - S_k)`) emit symbol `0`.
   4. Per-(channel, frequency-band) Shannon entropy over interior zeros and
      dyadic magnitude categories `s in 1..11`, plus `s` sign/extra bits per
-     category `s`, with a zero-value stop-gradient monotonic step barrier so
-     `dR/d|q| > 0` holds everywhere.
+     category `s`, with optional multi-cluster block context partitioning
+     `(strategy_group, qf_bucket, nzeros_activity_bucket)` + ANS cluster table
+     header overhead when `multi_cluster=True` or `cluster_blend` is set.
   """
-  del raw_quant_field, llf_mask
+  del llf_mask
   eff_temp = float(temp) if temp is not None else float(tau)
+  use_clusters = bool(multi_cluster) or (cluster_blend is not None)
+  blend_w = (
+      jnp.clip(jnp.asarray(cluster_blend, dtype=jnp.float32), 0.0, 1.0)
+      if cluster_blend is not None
+      else jnp.asarray(1.0 if multi_cluster else 0.0, dtype=jnp.float32)
+  )
   resolved_topo = _resolve_topology(topology, ac_strategy)
+
+  if (
+      resolved_topo is not None
+      and len(resolved_topo.multi_groups) > 0
+      and getattr(resolved_topo, "all_grid_aligned", False)
+  ):
+    q_f = jnp.asarray(quant_ac, dtype=jnp.float32)
+    if q_f.ndim == 3:
+      c_dim, h_px, w_px = q_f.shape
+      h8, w8 = h_px // 8, w_px // 8
+      q_ac_blocks = jnp.transpose(
+          q_f.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4)
+      )
+    elif q_f.ndim == 5:
+      if q_f.shape[0] == 3 and q_f.shape[2] != 3:
+        q_ac_blocks = jnp.transpose(q_f, (1, 2, 0, 3, 4))
+      else:
+        q_ac_blocks = q_f
+      h8, w8 = q_ac_blocks.shape[0], q_ac_blocks.shape[1]
+    else:
+      raise ValueError(
+          f"Expected quant_ac to have 3 or 5 dims, got shape {q_f.shape}"
+      )
+
+    ac_idx_1x1, _, freq_band8_1x1 = get_canonical_ac_scan_tables(1, 1)
+    one_hot_1x1 = jax.nn.one_hot(
+        freq_band8_1x1, NUM_FREQ_BANDS8, dtype=jnp.float32
+    )
+    hist_zero = jnp.zeros((3, NUM_FREQ_BANDS8), dtype=jnp.float32)
+    hist_cats = jnp.zeros(
+        (3, NUM_FREQ_BANDS8, MAX_AC_CATEGORY), dtype=jnp.float32
+    )
+    hist_cdfs = jnp.zeros(
+        (3, NUM_FREQ_BANDS8, MAX_AC_CATEGORY), dtype=jnp.float32
+    )
+    nzeros_norm_grid = jnp.zeros((3, h8, w8), dtype=jnp.float32)
+    acs_traced = (
+        jnp.asarray(ac_strategy, dtype=jnp.int32)
+        if isinstance(ac_strategy, jax.core.Tracer)
+        else None
+    )
+    if acs_traced is not None:
+      mask_1x1 = (
+          (acs_traced <= 3) | ((acs_traced >= 12) & (acs_traced <= 17))
+      ).astype(jnp.float32)
+      first_block_mask = mask_1x1
+    else:
+      with jax.ensure_compile_time_eval():
+        mask_1x1 = jnp.asarray(resolved_topo.mask_1x1, dtype=jnp.float32)
+        first_block_mask = jnp.asarray(
+            resolved_topo.first_block_mask, dtype=jnp.float32
+        )
+
+    cluster_groups: list[Any] = []
+    if use_clusters:
+      if ac_strategy is not None:
+        acs_grid_int = jnp.asarray(ac_strategy, dtype=jnp.int32)
+      elif hasattr(resolved_topo, "ac_strategy"):
+        with jax.ensure_compile_time_eval():
+          acs_grid_int = jnp.asarray(
+              getattr(resolved_topo, "ac_strategy"), dtype=jnp.int32
+          )
+      elif isinstance(topology, JxlVarDCTState):
+        with jax.ensure_compile_time_eval():
+          acs_grid_int = jnp.asarray(topology.ac_strategy, dtype=jnp.int32)
+      else:
+        acs_grid_int = jnp.zeros((h8, w8), dtype=jnp.int32)
+      if raw_quant_field is not None:
+        rqf_grid = jax.lax.stop_gradient(
+            jnp.asarray(raw_quant_field, dtype=jnp.float32)
+        )
+      elif isinstance(topology, JxlVarDCTState):
+        with jax.ensure_compile_time_eval():
+          rqf_grid = jnp.asarray(topology.raw_quant_field, dtype=jnp.float32)
+      else:
+        rqf_grid = jnp.full((h8, w8), 16.0, dtype=jnp.float32)
+
+    if resolved_topo.has_1x1:
+      q_1x1 = (q_ac_blocks * mask_1x1[:, :, None, None, None]).reshape(
+          h8 * w8, 3, 64
+      )[:, :, ac_idx_1x1]
+      int_z_1x1, cat_w_1x1, cdf_1x1, blk_nz_1x1 = (
+          _compute_scan_eob_and_categories(q_1x1, temp=eff_temp)
+      )
+      hist_zero = hist_zero + jnp.einsum(
+          "ck,kb->cb", jnp.sum(int_z_1x1, axis=0), one_hot_1x1
+      )
+      hist_cats = hist_cats + jnp.einsum(
+          "cks,kb->cbs", jnp.sum(cat_w_1x1, axis=0), one_hot_1x1
+      )
+      hist_cdfs = hist_cdfs + jnp.einsum(
+          "cks,kb->cbs", jnp.sum(cdf_1x1, axis=0), one_hot_1x1
+      )
+      nzeros_norm_grid = jnp.transpose(blk_nz_1x1, (1, 0)).reshape(3, h8, w8)
+      if use_clusters:
+        acs_1x1_flat = acs_grid_int.reshape(h8 * w8)
+        is_s0 = (acs_1x1_flat == 0).astype(jnp.float32)
+        strat_w_1x1 = jnp.stack(
+            [is_s0, 1.0 - is_s0, jnp.zeros_like(is_s0)], axis=-1
+        )
+        cluster_groups.append((
+            int_z_1x1,
+            cat_w_1x1,
+            cdf_1x1,
+            one_hot_1x1,
+            strat_w_1x1,
+            rqf_grid.reshape(h8 * w8),
+            jax.lax.stop_gradient(jnp.mean(blk_nz_1x1, axis=-1)),
+            mask_1x1.reshape(h8 * w8),
+        ))
+
+    for grp in resolved_topo.multi_groups:
+      cy_m, cx_m = grp["cy"], grp["cx"]
+      cy_l, cx_l = grp["cy_l"], grp["cx_l"]
+      b_m = cy_m * cx_m
+      nh_cell, nw_cell = grp["nh_cell"], grp["nw_cell"]
+      h_lim, w_lim = grp["h_lim"], grp["w_lim"]
+      if acs_traced is not None:
+        cell_mask_f = (
+            acs_traced[:h_lim:cy_m, :w_lim:cx_m] == int(grp["s"])
+        ).astype(jnp.float32)
+        first_block_mask = first_block_mask.at[:h_lim:cy_m, :w_lim:cx_m].add(
+            cell_mask_f
+        )
+      else:
+        with jax.ensure_compile_time_eval():
+          cell_mask_f = jnp.asarray(grp["cell_mask_f"], dtype=jnp.float32)
+      sub_q = (
+          q_ac_blocks[:h_lim, :w_lim].reshape(
+              nh_cell, cy_m, nw_cell, cx_m, 3, 8, 8
+          )
+          * cell_mask_f[:, None, :, None, None, None, None]
+      )
+      q_canon = jnp.transpose(sub_q, (0, 2, 4, 1, 5, 3, 6)).reshape(
+          nh_cell * nw_cell, 3, 64 * b_m
+      )
+      ac_idx_m, _, freq_band8_m = get_canonical_ac_scan_tables(cy_l, cx_l)
+      ac_coeffs_m = q_canon[:, :, ac_idx_m]
+      int_z_m, cat_w_m, cdf_m, blk_nz_m = _compute_scan_eob_and_categories(
+          ac_coeffs_m, temp=eff_temp
+      )
+      one_hot_m = jax.nn.one_hot(
+          freq_band8_m, NUM_FREQ_BANDS8, dtype=jnp.float32
+      )
+      hist_zero = hist_zero + jnp.einsum(
+          "ck,kb->cb", jnp.sum(int_z_m, axis=0), one_hot_m
+      )
+      hist_cats = hist_cats + jnp.einsum(
+          "cks,kb->cbs", jnp.sum(cat_w_m, axis=0), one_hot_m
+      )
+      hist_cdfs = hist_cdfs + jnp.einsum(
+          "cks,kb->cbs", jnp.sum(cdf_m, axis=0), one_hot_m
+      )
+      nz_cell = jnp.transpose(blk_nz_m / float(b_m), (1, 0)).reshape(
+          3, nh_cell, 1, nw_cell, 1
+      )
+      nz_bcast = jnp.broadcast_to(
+          nz_cell, (3, nh_cell, cy_m, nw_cell, cx_m)
+      ).reshape(3, h_lim, w_lim)
+      if h_lim == h8 and w_lim == w8:
+        nzeros_norm_grid = nzeros_norm_grid + nz_bcast
+      else:
+        nzeros_norm_grid = nzeros_norm_grid.at[:, :h_lim, :w_lim].add(nz_bcast)
+      if use_clusters:
+        m_cells = nh_cell * nw_cell
+        rqf_sub = rqf_grid[:h_lim, :w_lim].reshape(nh_cell, cy_m, nw_cell, cx_m)
+        rqf_cell = jnp.mean(rqf_sub, axis=(1, 3)).reshape(m_cells)
+        strat_w_m = jnp.broadcast_to(
+            jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32), (m_cells, 3)
+        )
+        cluster_groups.append((
+            int_z_m,
+            cat_w_m,
+            cdf_m,
+            one_hot_m,
+            strat_w_m,
+            rqf_cell,
+            jax.lax.stop_gradient(jnp.mean(blk_nz_m, axis=-1) / float(b_m)),
+            cell_mask_f.reshape(m_cells),
+        ))
+
+    s_idx = jnp.arange(1, MAX_AC_CATEGORY + 1, dtype=jnp.float32)[None, None, :]
+    prior_cats = eps * jnp.power(0.5, s_idx - 1.0)
+    counts_zero = hist_zero[..., None] + eps
+    counts_cats = hist_cats + prior_cats
+    counts_all = jnp.concatenate([counts_zero, counts_cats], axis=-1)
+    totals = jnp.sum(counts_all, axis=-1, keepdims=True)
+
+    ac_token_entropy_bits = -jnp.sum(counts_all * jnp.log2(counts_all / totals))
+    ac_extra_bits = jnp.sum(hist_cats * s_idx)
+    forward_ac_bits = ac_token_entropy_bits + ac_extra_bits
+
+    counts_prev = jnp.concatenate([counts_zero, counts_cats[..., :-1]], axis=-1)
+    raw_step_cost = 1.0 + jnp.log2(
+        jax.lax.stop_gradient(counts_prev / counts_cats)
+    )
+    min_step_deficit = jnp.maximum(0.0, 0.25 - raw_step_cost)
+    monotonic_correction = jnp.sum(hist_cdfs * min_step_deficit)
+    ac_bits = forward_ac_bits + (
+        monotonic_correction - jax.lax.stop_gradient(monotonic_correction)
+    )
+    if use_clusters:
+      clustered_ac_bits = _compute_multi_cluster_ac_token_bits(
+          cluster_groups, eps=eps
+      )
+      ac_bits = (1.0 - blend_w) * ac_bits + blend_w * clustered_ac_bits
+    nzeros_bits = _compute_nzeros_rate_bits(
+        nzeros_norm_grid,
+        first_block_mask=first_block_mask,
+    )
+    return ac_bits + nzeros_bits
 
   ac_1x1, multi_ac_list, coords_1x1, (h8, w8) = _extract_ac_tokens_from_blocks(
       quant_ac, topology=resolved_topo
@@ -606,6 +990,29 @@ def soft_ac_rate_bits(
 
   nzeros_norm_grid = jnp.zeros((3, h8, w8), dtype=jnp.float32)
   first_block_mask = jnp.ones((h8, w8), dtype=jnp.float32)
+  cluster_groups_gen: list[Any] = []
+  if use_clusters:
+    if ac_strategy is not None:
+      acs_grid_gen = jnp.asarray(ac_strategy, dtype=jnp.int32)
+    elif resolved_topo is not None and hasattr(resolved_topo, "ac_strategy"):
+      with jax.ensure_compile_time_eval():
+        acs_grid_gen = jnp.asarray(
+            getattr(resolved_topo, "ac_strategy"), dtype=jnp.int32
+        )
+    elif isinstance(topology, JxlVarDCTState):
+      with jax.ensure_compile_time_eval():
+        acs_grid_gen = jnp.asarray(topology.ac_strategy, dtype=jnp.int32)
+    else:
+      acs_grid_gen = jnp.zeros((h8, w8), dtype=jnp.int32)
+    if raw_quant_field is not None:
+      rqf_grid_gen = jax.lax.stop_gradient(
+          jnp.asarray(raw_quant_field, dtype=jnp.float32)
+      )
+    elif isinstance(topology, JxlVarDCTState):
+      with jax.ensure_compile_time_eval():
+        rqf_grid_gen = jnp.asarray(topology.raw_quant_field, dtype=jnp.float32)
+    else:
+      rqf_grid_gen = jnp.full((h8, w8), 16.0, dtype=jnp.float32)
 
   if ac_1x1.shape[0] > 0:
     int_z_1x1, cat_w_1x1, cdf_1x1, blk_nz_1x1 = _compute_scan_eob_and_categories(
@@ -622,11 +1029,32 @@ def soft_ac_rate_bits(
 
     if coords_1x1 is None:
       nzeros_norm_grid = jnp.transpose(blk_nz_1x1, (1, 0)).reshape(3, h8, w8)
+      if use_clusters:
+        acs_1x1_f = acs_grid_gen.reshape(h8 * w8)
+        rqf_1x1_f = rqf_grid_gen.reshape(h8 * w8)
     else:
       by_1x1, bx_1x1 = coords_1x1
       nzeros_norm_grid = nzeros_norm_grid.at[:, by_1x1, bx_1x1].set(
           jnp.transpose(blk_nz_1x1, (1, 0))
       )
+      if use_clusters:
+        acs_1x1_f = acs_grid_gen[by_1x1, bx_1x1]
+        rqf_1x1_f = rqf_grid_gen[by_1x1, bx_1x1]
+    if use_clusters:
+      is_s0_g = (acs_1x1_f == 0).astype(jnp.float32)
+      strat_w_1x1_g = jnp.stack(
+          [is_s0_g, 1.0 - is_s0_g, jnp.zeros_like(is_s0_g)], axis=-1
+      )
+      cluster_groups_gen.append((
+          int_z_1x1,
+          cat_w_1x1,
+          cdf_1x1,
+          one_hot_1x1,
+          strat_w_1x1_g,
+          rqf_1x1_f,
+          jax.lax.stop_gradient(jnp.mean(blk_nz_1x1, axis=-1)),
+          jnp.ones((ac_1x1.shape[0],), dtype=jnp.float32),
+      ))
 
   if len(multi_ac_list) > 0:
     first_block_mask = jnp.zeros((h8, w8), dtype=jnp.float32)
@@ -666,6 +1094,25 @@ def soft_ac_rate_bits(
           :, by_m[:, None, None] + dy, bx_m[:, None, None] + dx
       ].set(nz_norm_m[:, :, None, None])
       first_block_mask = first_block_mask.at[by_m, bx_m].set(1.0)
+      if use_clusters:
+        m_cnt = ac_coeffs_m.shape[0]
+        rqf_sub_m = rqf_grid_gen[
+            by_m[:, None, None] + dy, bx_m[:, None, None] + dx
+        ]
+        rqf_m_mean = jnp.mean(rqf_sub_m, axis=(1, 2))
+        strat_w_m_g = jnp.broadcast_to(
+            jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32), (m_cnt, 3)
+        )
+        cluster_groups_gen.append((
+            int_z_m,
+            cat_w_m,
+            cdf_m,
+            one_hot_m,
+            strat_w_m_g,
+            rqf_m_mean,
+            jax.lax.stop_gradient(jnp.mean(blk_nz_m, axis=-1) / float(b_m)),
+            jnp.ones((m_cnt,), dtype=jnp.float32),
+        ))
 
   s_idx = jnp.arange(1, MAX_AC_CATEGORY + 1, dtype=jnp.float32)[None, None, :]
   prior_cats = eps * jnp.power(0.5, s_idx - 1.0)
@@ -687,6 +1134,11 @@ def soft_ac_rate_bits(
   ac_bits = forward_ac_bits + (
       monotonic_correction - jax.lax.stop_gradient(monotonic_correction)
   )
+  if use_clusters:
+    clustered_ac_bits = _compute_multi_cluster_ac_token_bits(
+        cluster_groups_gen, eps=eps
+    )
+    ac_bits = (1.0 - blend_w) * ac_bits + blend_w * clustered_ac_bits
 
   nzeros_bits = _compute_nzeros_rate_bits(
       nzeros_norm_grid,
@@ -1328,7 +1780,10 @@ def soft_dequant_matrices_rate_bits(
 
   default_dq = get_default_dequant_matrices()
   active_strategies: set[int] | None = None
-  if ac_strategy is not None and not isinstance(ac_strategy, jax.core.Tracer):
+  is_traced_acs = ac_strategy is not None and isinstance(
+      ac_strategy, jax.core.Tracer
+  )
+  if ac_strategy is not None and not is_traced_acs:
     acs_np = np.asarray(ac_strategy, dtype=np.int32)
     active_strategies = set(int(x) for x in np.unique(acs_np))
 
@@ -1336,11 +1791,16 @@ def soft_dequant_matrices_rate_bits(
     for s, mat in sorted(dequant_matrices.items()):
       s_int = int(s)
       def_mat = jnp.asarray(default_dq.get(s_int, default_dq[0]), dtype=jnp.float32)
-      w_s = (
-          1.0
-          if (active_strategies is None or s_int in active_strategies)
-          else 0.15
-      )
+      if is_traced_acs:
+        w_s: float | jax.Array = jnp.where(
+            (s_int == 0) | jnp.any(ac_strategy == s_int), 1.0, 0.0
+        )
+      else:
+        w_s = (
+            1.0
+            if (active_strategies is None or s_int in active_strategies)
+            else 0.15
+        )
       total_bits = total_bits + _single_dequant_table_rate_bits(
           jnp.asarray(mat, dtype=jnp.float32), def_mat, weight=w_s
       )
@@ -1687,6 +2147,8 @@ def soft_jxl_rate_proxy(
     quant_ac_override: jax.Array | None = None,
     ac_strategy: jax.Array | np.ndarray | None = None,
     epf_sharpness: jax.Array | None = None,
+    global_scale: int | float | jax.Array | None = None,
+    quant_dc: int | float | jax.Array | None = None,
     topology: StaticVarDCTTopology | None = None,
     patches: Sequence[PatchEntry | Any] | None = None,
     alpha_01: jax.Array | None = None,
@@ -1695,6 +2157,8 @@ def soft_jxl_rate_proxy(
     is_reference_only: bool = False,
     dequant_matrices: dict[int, jax.Array] | jax.Array | None = None,
     dc_quant_weights: jax.Array | Sequence[float] | None = None,
+    multi_cluster: bool = False,
+    cluster_blend: float | jax.Array | None = None,
     params_override: Mapping[str, Any] | None = None,
 ) -> jax.Array | RateBreakdown:
   """Unified differentiable JXL bit-rate proxy in bits."""
@@ -1712,12 +2176,14 @@ def soft_jxl_rate_proxy(
 
   height = int(state.height) if state is not None else bh * 8
   width = int(state.width) if state is not None else bw * 8
-  global_scale = int(
-      p.get("global_scale", state.global_scale if state is not None else 8192)
-  )
-  quant_dc = int(
-      p.get("quant_dc", state.quant_dc if state is not None else 16)
-  )
+  if global_scale is None:
+    global_scale = p.get(
+        "global_scale", int(state.global_scale) if state is not None else 8192
+    )
+  if quant_dc is None:
+    quant_dc = p.get(
+        "quant_dc", int(state.quant_dc) if state is not None else 16
+    )
   epf_iters = int(
       p.get("epf_iters", state.epf_iters if state is not None else 1)
   )
@@ -1819,11 +2285,16 @@ def soft_jxl_rate_proxy(
   tau_ac = float(tau)
   tau_mod = min(float(tau), 0.12)
 
+  eff_multi_cluster = bool(p.get("multi_cluster", multi_cluster))
+  eff_cluster_blend = p.get("cluster_blend", cluster_blend)
   ac_bits_val = soft_ac_rate_bits(
       ac_5d,
       topology=topology,
       ac_strategy=acs_source,
       tau=tau_ac,
+      raw_quant_field=raw_quant_field,
+      multi_cluster=eff_multi_cluster,
+      cluster_blend=eff_cluster_blend,
   )
   dc_bits_val = soft_dc_rate_bits(
       dc_quant,
@@ -2039,9 +2510,6 @@ def compute_spatial_rate_map_bits(
 
   # 1. Per-block AC rate map (distributed across (cy, cx) covered blocks)
   resolved_topo = _resolve_topology(topology, acs_source)
-  ac_1x1, multi_ac_list, coords_1x1, _ = _extract_ac_tokens_from_blocks(
-      ac_5d, topology=resolved_topo
-  )
   _, _, freq_band8_1x1 = get_canonical_ac_scan_tables(1, 1)
   one_hot_1x1 = jax.nn.one_hot(
       freq_band8_1x1, NUM_FREQ_BANDS8, dtype=jnp.float32
@@ -2053,50 +2521,146 @@ def compute_spatial_rate_map_bits(
   )
   nzeros_norm_grid = jnp.zeros((3, h8, w8), dtype=jnp.float32)
 
+  use_grid_aligned = (
+      resolved_topo is not None
+      and len(resolved_topo.multi_groups) > 0
+      and getattr(resolved_topo, "all_grid_aligned", False)
+  )
+
   int_z_1x1 = cat_w_1x1 = cdf_1x1 = blk_nz_1x1 = None
-  if ac_1x1.shape[0] > 0:
-    int_z_1x1, cat_w_1x1, cdf_1x1, blk_nz_1x1 = _compute_scan_eob_and_categories(
-        ac_1x1, temp=eff_tau
+  coords_1x1 = None
+  multi_scan_stats = []
+  multi_scan_grid_stats = []
+
+  if use_grid_aligned:
+    assert resolved_topo is not None
+    acs_traced = (
+        jnp.asarray(acs_source, dtype=jnp.int32)
+        if isinstance(acs_source, jax.core.Tracer)
+        else None
     )
-    z_sum_1x1 = jnp.sum(int_z_1x1, axis=0)
-    hist_zero = hist_zero + jnp.einsum("ck,kb->cb", z_sum_1x1, one_hot_1x1)
-    cat_sum_1x1 = jnp.sum(cat_w_1x1, axis=0)
-    hist_cats = hist_cats + jnp.einsum("cks,kb->cbs", cat_sum_1x1, one_hot_1x1)
-    if coords_1x1 is None:
+    q_ac_blocks = jnp.transpose(jnp.asarray(ac_5d, dtype=jnp.float32), (1, 2, 0, 3, 4))
+    if resolved_topo.has_1x1:
+      if acs_traced is not None:
+        mask_1x1 = (
+            (acs_traced <= 3) | ((acs_traced >= 12) & (acs_traced <= 17))
+        ).astype(jnp.float32)
+      else:
+        with jax.ensure_compile_time_eval():
+          mask_1x1 = jnp.asarray(resolved_topo.mask_1x1, dtype=jnp.float32)
+      q_1x1 = (q_ac_blocks * mask_1x1[:, :, None, None, None]).reshape(
+          h8 * w8, 3, 64
+      )
+      ac_idx_1x1, _, _ = get_canonical_ac_scan_tables(1, 1)
+      ac_1x1 = q_1x1[:, :, ac_idx_1x1]
+      int_z_1x1, cat_w_1x1, cdf_1x1, blk_nz_1x1 = _compute_scan_eob_and_categories(
+          ac_1x1, temp=eff_tau
+      )
+      hist_zero = hist_zero + jnp.einsum(
+          "ck,kb->cb", jnp.sum(int_z_1x1, axis=0), one_hot_1x1
+      )
+      hist_cats = hist_cats + jnp.einsum(
+          "cks,kb->cbs", jnp.sum(cat_w_1x1, axis=0), one_hot_1x1
+      )
       nzeros_norm_grid = jnp.transpose(blk_nz_1x1, (1, 0)).reshape(3, h8, w8)
     else:
-      nzeros_norm_grid = nzeros_norm_grid.at[:, coords_1x1[0], coords_1x1[1]].set(
-          jnp.transpose(blk_nz_1x1, (1, 0))
+      ac_1x1 = jnp.zeros((0, 3, 63), dtype=jnp.float32)
+
+    for grp in resolved_topo.multi_groups:
+      cy_m, cx_m = grp["cy"], grp["cx"]
+      cy_l, cx_l = grp["cy_l"], grp["cx_l"]
+      b_m = cy_m * cx_m
+      nh_cell, nw_cell = grp["nh_cell"], grp["nw_cell"]
+      h_lim, w_lim = grp["h_lim"], grp["w_lim"]
+      if acs_traced is not None:
+        cell_mask_f = (
+            acs_traced[:h_lim:cy_m, :w_lim:cx_m] == int(grp["s"])
+        ).astype(jnp.float32)
+      else:
+        with jax.ensure_compile_time_eval():
+          cell_mask_f = jnp.asarray(grp["cell_mask_f"], dtype=jnp.float32)
+      sub_q = (
+          q_ac_blocks[:h_lim, :w_lim].reshape(
+              nh_cell, cy_m, nw_cell, cx_m, 3, 8, 8
+          )
+          * cell_mask_f[:, None, :, None, None, None, None]
       )
-
-  multi_scan_stats = []
-  for (
-      ac_coeffs_m,
-      freq_band8_m,
-      b_m,
-      by_m,
-      bx_m,
-      cy_m,
-      cx_m,
-  ) in multi_ac_list:
-    int_z_m, cat_w_m, cdf_m, blk_nz_m = _compute_scan_eob_and_categories(
-        ac_coeffs_m, temp=eff_tau
+      q_canon = jnp.transpose(sub_q, (0, 2, 4, 1, 5, 3, 6)).reshape(
+          nh_cell * nw_cell, 3, 64 * b_m
+      )
+      ac_idx_m, _, freq_band8_m = get_canonical_ac_scan_tables(cy_l, cx_l)
+      ac_coeffs_m = q_canon[:, :, ac_idx_m]
+      int_z_m, cat_w_m, cdf_m, blk_nz_m = _compute_scan_eob_and_categories(
+          ac_coeffs_m, temp=eff_tau
+      )
+      one_hot_m = jax.nn.one_hot(
+          freq_band8_m, NUM_FREQ_BANDS8, dtype=jnp.float32
+      )
+      hist_zero = hist_zero + jnp.einsum(
+          "ck,kb->cb", jnp.sum(int_z_m, axis=0), one_hot_m
+      )
+      hist_cats = hist_cats + jnp.einsum(
+          "cks,kb->cbs", jnp.sum(cat_w_m, axis=0), one_hot_m
+      )
+      nz_cell = jnp.transpose(blk_nz_m / float(b_m), (1, 0)).reshape(
+          3, nh_cell, 1, nw_cell, 1
+      )
+      nz_bcast = jnp.broadcast_to(
+          nz_cell, (3, nh_cell, cy_m, nw_cell, cx_m)
+      ).reshape(3, h_lim, w_lim)
+      if h_lim == h8 and w_lim == w8:
+        nzeros_norm_grid = nzeros_norm_grid + nz_bcast
+      else:
+        nzeros_norm_grid = nzeros_norm_grid.at[:, :h_lim, :w_lim].add(nz_bcast)
+      multi_scan_grid_stats.append(
+          (int_z_m, cat_w_m, cdf_m, one_hot_m, b_m, grp, cell_mask_f)
+      )
+  else:
+    ac_1x1, multi_ac_list, coords_1x1, _ = _extract_ac_tokens_from_blocks(
+        ac_5d, topology=resolved_topo
     )
-    one_hot_m = jax.nn.one_hot(freq_band8_m, NUM_FREQ_BANDS8, dtype=jnp.float32)
-    z_sum_m = jnp.sum(int_z_m, axis=0)
-    hist_zero = hist_zero + jnp.einsum("ck,kb->cb", z_sum_m, one_hot_m)
-    cat_sum_m = jnp.sum(cat_w_m, axis=0)
-    hist_cats = hist_cats + jnp.einsum("cks,kb->cbs", cat_sum_m, one_hot_m)
+    if ac_1x1.shape[0] > 0:
+      int_z_1x1, cat_w_1x1, cdf_1x1, blk_nz_1x1 = _compute_scan_eob_and_categories(
+          ac_1x1, temp=eff_tau
+      )
+      z_sum_1x1 = jnp.sum(int_z_1x1, axis=0)
+      hist_zero = hist_zero + jnp.einsum("ck,kb->cb", z_sum_1x1, one_hot_1x1)
+      cat_sum_1x1 = jnp.sum(cat_w_1x1, axis=0)
+      hist_cats = hist_cats + jnp.einsum("cks,kb->cbs", cat_sum_1x1, one_hot_1x1)
+      if coords_1x1 is None:
+        nzeros_norm_grid = jnp.transpose(blk_nz_1x1, (1, 0)).reshape(3, h8, w8)
+      else:
+        nzeros_norm_grid = nzeros_norm_grid.at[:, coords_1x1[0], coords_1x1[1]].set(
+            jnp.transpose(blk_nz_1x1, (1, 0))
+        )
 
-    nz_norm_m = jnp.transpose(blk_nz_m / float(b_m), (1, 0))
-    dy = jnp.arange(cy_m)[None, :, None]
-    dx = jnp.arange(cx_m)[None, None, :]
-    nzeros_norm_grid = nzeros_norm_grid.at[
-        :, by_m[:, None, None] + dy, bx_m[:, None, None] + dx
-    ].set(nz_norm_m[:, :, None, None])
-    multi_scan_stats.append(
-        (int_z_m, cat_w_m, cdf_m, one_hot_m, b_m, by_m, bx_m, cy_m, cx_m)
-    )
+    for (
+        ac_coeffs_m,
+        freq_band8_m,
+        b_m,
+        by_m,
+        bx_m,
+        cy_m,
+        cx_m,
+    ) in multi_ac_list:
+      int_z_m, cat_w_m, cdf_m, blk_nz_m = _compute_scan_eob_and_categories(
+          ac_coeffs_m, temp=eff_tau
+      )
+      one_hot_m = jax.nn.one_hot(freq_band8_m, NUM_FREQ_BANDS8, dtype=jnp.float32)
+      z_sum_m = jnp.sum(int_z_m, axis=0)
+      hist_zero = hist_zero + jnp.einsum("ck,kb->cb", z_sum_m, one_hot_m)
+      cat_sum_m = jnp.sum(cat_w_m, axis=0)
+      hist_cats = hist_cats + jnp.einsum("cks,kb->cbs", cat_sum_m, one_hot_m)
+
+      nz_norm_m = jnp.transpose(blk_nz_m / float(b_m), (1, 0))
+      dy = jnp.arange(cy_m)[None, :, None]
+      dx = jnp.arange(cx_m)[None, None, :]
+      nzeros_norm_grid = nzeros_norm_grid.at[
+          :, by_m[:, None, None] + dy, bx_m[:, None, None] + dx
+      ].set(nz_norm_m[:, :, None, None])
+      multi_scan_stats.append(
+          (int_z_m, cat_w_m, cdf_m, one_hot_m, b_m, by_m, bx_m, cy_m, cx_m)
+      )
 
   eps = 1e-3
   s_idx = jnp.arange(1, MAX_AC_CATEGORY + 1, dtype=jnp.float32)[None, None, :]
@@ -2133,34 +2697,68 @@ def compute_spatial_rate_map_bits(
     else:
       ac_tok_map = ac_tok_map.at[coords_1x1[0], coords_1x1[1]].set(blk_ac_1x1)
 
-  for (
-      int_z_m,
-      cat_w_m,
-      cdf_m,
-      one_hot_m,
-      b_m,
-      by_m,
-      bx_m,
-      cy_m,
-      cx_m,
-  ) in multi_scan_stats:
-    bz_m = jnp.einsum("mck,kb->mcb", int_z_m, one_hot_m)
-    bc_m = jnp.einsum("mcks,kb->mcbs", cat_w_m, one_hot_m)
-    bcdf_m = jnp.einsum("mcks,kb->mcbs", cdf_m, one_hot_m)
-    blk_fwd_m = jnp.sum(bz_m * codelen_zero[None, :, :], axis=(1, 2)) + jnp.sum(
-        bc_m * codelen_cats[None, :, :, :], axis=(1, 2, 3)
-    )
-    blk_mono_m = jnp.sum(
-        bcdf_m * min_step_deficit[None, :, :, :], axis=(1, 2, 3)
-    )
-    blk_ac_m_cell = (
-        blk_fwd_m + (blk_mono_m - jax.lax.stop_gradient(blk_mono_m))
-    ) / float(b_m)
-    dy = jnp.arange(cy_m)[None, :, None]
-    dx = jnp.arange(cx_m)[None, None, :]
-    ac_tok_map = ac_tok_map.at[
-        by_m[:, None, None] + dy, bx_m[:, None, None] + dx
-    ].set(blk_ac_m_cell[:, None, None])
+  if use_grid_aligned:
+    for (
+        int_z_m,
+        cat_w_m,
+        cdf_m,
+        one_hot_m,
+        b_m,
+        grp,
+        cell_mask_f,
+    ) in multi_scan_grid_stats:
+      cy_m, cx_m = grp["cy"], grp["cx"]
+      nh_cell, nw_cell = grp["nh_cell"], grp["nw_cell"]
+      h_lim, w_lim = grp["h_lim"], grp["w_lim"]
+      bz_m = jnp.einsum("mck,kb->mcb", int_z_m, one_hot_m)
+      bc_m = jnp.einsum("mcks,kb->mcbs", cat_w_m, one_hot_m)
+      bcdf_m = jnp.einsum("mcks,kb->mcbs", cdf_m, one_hot_m)
+      blk_fwd_m = jnp.sum(bz_m * codelen_zero[None, :, :], axis=(1, 2)) + jnp.sum(
+          bc_m * codelen_cats[None, :, :, :], axis=(1, 2, 3)
+      )
+      blk_mono_m = jnp.sum(
+          bcdf_m * min_step_deficit[None, :, :, :], axis=(1, 2, 3)
+      )
+      blk_ac_m_cell = (
+          (blk_fwd_m + (blk_mono_m - jax.lax.stop_gradient(blk_mono_m)))
+          / float(b_m)
+      ).reshape(nh_cell, nw_cell) * cell_mask_f
+      tok_bcast = jnp.broadcast_to(
+          blk_ac_m_cell[:, None, :, None], (nh_cell, cy_m, nw_cell, cx_m)
+      ).reshape(h_lim, w_lim)
+      if h_lim == h8 and w_lim == w8:
+        ac_tok_map = ac_tok_map + tok_bcast
+      else:
+        ac_tok_map = ac_tok_map.at[:h_lim, :w_lim].add(tok_bcast)
+  else:
+    for (
+        int_z_m,
+        cat_w_m,
+        cdf_m,
+        one_hot_m,
+        b_m,
+        by_m,
+        bx_m,
+        cy_m,
+        cx_m,
+    ) in multi_scan_stats:
+      bz_m = jnp.einsum("mck,kb->mcb", int_z_m, one_hot_m)
+      bc_m = jnp.einsum("mcks,kb->mcbs", cat_w_m, one_hot_m)
+      bcdf_m = jnp.einsum("mcks,kb->mcbs", cdf_m, one_hot_m)
+      blk_fwd_m = jnp.sum(bz_m * codelen_zero[None, :, :], axis=(1, 2)) + jnp.sum(
+          bc_m * codelen_cats[None, :, :, :], axis=(1, 2, 3)
+      )
+      blk_mono_m = jnp.sum(
+          bcdf_m * min_step_deficit[None, :, :, :], axis=(1, 2, 3)
+      )
+      blk_ac_m_cell = (
+          blk_fwd_m + (blk_mono_m - jax.lax.stop_gradient(blk_mono_m))
+      ) / float(b_m)
+      dy = jnp.arange(cy_m)[None, :, None]
+      dx = jnp.arange(cx_m)[None, None, :]
+      ac_tok_map = ac_tok_map.at[
+          by_m[:, None, None] + dy, bx_m[:, None, None] + dx
+      ].set(blk_ac_m_cell[:, None, None])
 
   # Per-block nzeros bit map (distributed over covered blocks for multi-block transforms)
   nz_sg = jax.lax.stop_gradient(nzeros_norm_grid)
@@ -2185,13 +2783,23 @@ def compute_spatial_rate_map_bits(
       + 0.35 * jnp.log2(1.0 + excess_over_pred),
       axis=0,
   )
-  for _, _, _, _, b_m, by_m, bx_m, cy_m, cx_m in multi_scan_stats:
-    top_left_nz = nz_blk_2d[by_m, bx_m] / float(b_m)
-    dy = jnp.arange(cy_m)[None, :, None]
-    dx = jnp.arange(cx_m)[None, None, :]
-    nz_blk_2d = nz_blk_2d.at[
-        by_m[:, None, None] + dy, bx_m[:, None, None] + dx
-    ].set(top_left_nz[:, None, None])
+  if use_grid_aligned:
+    for _, _, _, _, b_m, grp, cell_mask_f in multi_scan_grid_stats:
+      cy_m, cx_m = grp["cy"], grp["cx"]
+      nh_cell, nw_cell = grp["nh_cell"], grp["nw_cell"]
+      h_lim, w_lim = grp["h_lim"], grp["w_lim"]
+      sub_nz = nz_blk_2d[:h_lim, :w_lim].reshape(nh_cell, cy_m, nw_cell, cx_m)
+      tl_nz = (sub_nz[:, 0, :, 0] / float(b_m))[:, None, :, None]
+      sub_nz_new = jnp.where(cell_mask_f[:, None, :, None] > 0.5, tl_nz, sub_nz)
+      nz_blk_2d = nz_blk_2d.at[:h_lim, :w_lim].set(sub_nz_new.reshape(h_lim, w_lim))
+  else:
+    for _, _, _, _, b_m, by_m, bx_m, cy_m, cx_m in multi_scan_stats:
+      top_left_nz = nz_blk_2d[by_m, bx_m] / float(b_m)
+      dy = jnp.arange(cy_m)[None, :, None]
+      dx = jnp.arange(cx_m)[None, None, :]
+      nz_blk_2d = nz_blk_2d.at[
+          by_m[:, None, None] + dy, bx_m[:, None, None] + dx
+      ].set(top_left_nz[:, None, None])
 
   def _match_sum_exact_f32(arr_2d: jax.Array, target_sum: jax.Array) -> jax.Array:
     out = arr_2d
@@ -2292,14 +2900,28 @@ def compute_spatial_rate_map_bits(
   qf_act_2d = w_qf_2d * (
       eb_qf_2d + 0.1 * jnp.log2(1.0 + jnp.abs(res_qf_2d))
   )
-  for _, _, _, _, b_m, by_m, bx_m, cy_m, cx_m in multi_scan_stats:
-    dy = jnp.arange(cy_m)[None, :, None]
-    dx = jnp.arange(cx_m)[None, None, :]
-    sub_qf_act = qf_act_2d[by_m[:, None, None] + dy, bx_m[:, None, None] + dx]
-    mean_qf_act = jnp.mean(sub_qf_act, axis=(1, 2), keepdims=True)
-    qf_act_2d = qf_act_2d.at[
-        by_m[:, None, None] + dy, bx_m[:, None, None] + dx
-    ].set(mean_qf_act)
+  if use_grid_aligned:
+    for _, _, _, _, b_m, grp, cell_mask_f in multi_scan_grid_stats:
+      cy_m, cx_m = grp["cy"], grp["cx"]
+      nh_cell, nw_cell = grp["nh_cell"], grp["nw_cell"]
+      h_lim, w_lim = grp["h_lim"], grp["w_lim"]
+      sub_qf_act = qf_act_2d[:h_lim, :w_lim].reshape(nh_cell, cy_m, nw_cell, cx_m)
+      mean_qf_act = jnp.mean(sub_qf_act, axis=(1, 3), keepdims=True)
+      sub_qf_new = jnp.where(
+          cell_mask_f[:, None, :, None] > 0.5, mean_qf_act, sub_qf_act
+      )
+      qf_act_2d = qf_act_2d.at[:h_lim, :w_lim].set(
+          sub_qf_new.reshape(h_lim, w_lim)
+      )
+  else:
+    for _, _, _, _, b_m, by_m, bx_m, cy_m, cx_m in multi_scan_stats:
+      dy = jnp.arange(cy_m)[None, :, None]
+      dx = jnp.arange(cx_m)[None, None, :]
+      sub_qf_act = qf_act_2d[by_m[:, None, None] + dy, bx_m[:, None, None] + dx]
+      mean_qf_act = jnp.mean(sub_qf_act, axis=(1, 2), keepdims=True)
+      qf_act_2d = qf_act_2d.at[
+          by_m[:, None, None] + dy, bx_m[:, None, None] + dx
+      ].set(mean_qf_act)
 
   meta_raw_map = w_first_2d + 0.20 * qf_act_2d
   meta_block_bits = _match_sum_exact_f32(
@@ -2350,8 +2972,16 @@ def soft_patch_composite_rate_proxy(
     return_breakdown: bool = False,
     ref_dequant_matrices: dict[int, jax.Array] | jax.Array | None = None,
     main_dequant_matrices: dict[int, jax.Array] | jax.Array | None = None,
+    multi_cluster: bool = False,
+    cluster_blend: float | jax.Array | None = None,
+    ref_cluster_blend: float | jax.Array | None = None,
+    main_cluster_blend: float | jax.Array | None = None,
 ) -> jax.Array | RateBreakdown:
   """Differentiable total bit-rate proxy for 2-frame XYB `PatchDictionary` compositing."""
+  eff_ref_cb = ref_cluster_blend if ref_cluster_blend is not None else cluster_blend
+  eff_main_cb = (
+      main_cluster_blend if main_cluster_blend is not None else cluster_blend
+  )
   ref_bd = soft_jxl_rate_proxy(
       ref_state,
       quant_ac=ref_quant_ac,
@@ -2364,6 +2994,8 @@ def soft_patch_composite_rate_proxy(
       upsampling=upsampling,
       is_reference_only=True,
       dequant_matrices=ref_dequant_matrices,
+      multi_cluster=multi_cluster,
+      cluster_blend=eff_ref_cb,
       return_breakdown=True,
   )
   main_bd = soft_jxl_rate_proxy(
@@ -2380,6 +3012,8 @@ def soft_patch_composite_rate_proxy(
       upsampling=1,
       is_reference_only=False,
       dequant_matrices=main_dequant_matrices,
+      multi_cluster=multi_cluster,
+      cluster_blend=eff_main_cb,
       return_breakdown=True,
   )
   assert isinstance(ref_bd, RateBreakdown)
@@ -2424,8 +3058,16 @@ def soft_alpha_composite_rate_proxy(
     return_breakdown: bool = False,
     ref_dequant_matrices: dict[int, jax.Array] | jax.Array | None = None,
     main_dequant_matrices: dict[int, jax.Array] | jax.Array | None = None,
+    multi_cluster: bool = False,
+    cluster_blend: float | jax.Array | None = None,
+    ref_cluster_blend: float | jax.Array | None = None,
+    main_cluster_blend: float | jax.Array | None = None,
 ) -> jax.Array | RateBreakdown:
   """Differentiable total bit-rate proxy for 2-frame Modular `ExtraChannel::kAlpha` blending."""
+  eff_ref_cb = ref_cluster_blend if ref_cluster_blend is not None else cluster_blend
+  eff_main_cb = (
+      main_cluster_blend if main_cluster_blend is not None else cluster_blend
+  )
   ref_bd = soft_jxl_rate_proxy(
       ref_state,
       quant_ac=ref_quant_ac,
@@ -2438,6 +3080,8 @@ def soft_alpha_composite_rate_proxy(
       upsampling=upsampling,
       is_reference_only=True,
       dequant_matrices=ref_dequant_matrices,
+      multi_cluster=multi_cluster,
+      cluster_blend=eff_ref_cb,
       return_breakdown=True,
   )
   main_bd = soft_jxl_rate_proxy(
@@ -2455,6 +3099,8 @@ def soft_alpha_composite_rate_proxy(
       upsampling=1,
       is_reference_only=False,
       dequant_matrices=main_dequant_matrices,
+      multi_cluster=multi_cluster,
+      cluster_blend=eff_main_cb,
       return_breakdown=True,
   )
   assert isinstance(ref_bd, RateBreakdown)

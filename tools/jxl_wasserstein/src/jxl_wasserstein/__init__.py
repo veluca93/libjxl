@@ -13,6 +13,7 @@ if "--xla_gpu_deterministic_ops=true" not in os.environ.get("XLA_FLAGS", ""):
 
 from jxl_wasserstein.benchmark import (
     DEFAULT_BENCHMARK_DISTANCES,
+    DEFAULT_CORPUS_ROOT,
     DEFAULT_KODAK_DIR,
     DEFAULT_KODAK_SUBSET,
     ImageRDResult,
@@ -20,10 +21,12 @@ from jxl_wasserstein.benchmark import (
     RDPoint,
     bd_rate,
     compute_bd_rate,
+    discover_sdr_corpus,
     encode_cjxl_baseline,
     evaluate_image_rd_curve,
     format_benchmark_table,
     init_pure_jax_wd_state,
+    is_pure_8bit_sdr_image,
     load_benchmark_image,
     optimize_rate_wd_point,
     run_benchmark,
@@ -340,6 +343,7 @@ __all__ = [
     "rd_lambda_to_distance",
     "optimize_single_frame",
     # benchmark & cli
+    "DEFAULT_CORPUS_ROOT",
     "DEFAULT_KODAK_DIR",
     "DEFAULT_BENCHMARK_DISTANCES",
     "DEFAULT_KODAK_SUBSET",
@@ -349,6 +353,8 @@ __all__ = [
     "compute_bd_rate",
     "bd_rate",
     "encode_cjxl_baseline",
+    "is_pure_8bit_sdr_image",
+    "discover_sdr_corpus",
     "load_benchmark_image",
     "init_pure_jax_wd_state",
     "optimize_rate_wd_point",

@@ -246,7 +246,7 @@ def test_scenario5_entropy_proxy_spearman_correlation_and_4pt_lambda_sweep(
     cached_lambda_sweep_4pt: list[Any],
 ) -> None:
   """Scenario 5 (R5): Differentiable entropy proxy Spearman rho >= 0.95 across 0.15-2.0 bpp and monotonic 4-point lambda sweep."""
-  distances = (0.35, 0.55, 0.85, 1.3, 2.0, 3.2, 5.0, 8.5)
+  distances = (0.35, 0.55, 0.85, 1.3, 2.0, 3.2, 5.0, 8.5, 14.0, 38.0)
   proxy_bits, true_bits, bpps = [], [], []
   for d in distances:
     st = init_state_from_rgb_jax(kodim01_crop_64_01, distance=d)

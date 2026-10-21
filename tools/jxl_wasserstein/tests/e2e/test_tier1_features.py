@@ -1169,7 +1169,7 @@ def test_f12_entropy_proxy_correlation_and_lambda_monotonicity(
 ) -> None:
   """Verifies F12 (R5): Spearman rank correlation >= 0.95 across 0.15-2.0 bpp and monotonic 4-point lambda sweep."""
   crop32 = kodim01_crop_64_01[:32, :32]
-  distances = (0.35, 0.55, 0.85, 1.3, 2.0, 3.2, 5.0, 8.5)
+  distances = (0.35, 0.55, 0.85, 1.3, 2.0, 3.2, 5.0, 8.5, 14.0, 38.0)
 
   if check_name == "spearman_rank_correlation_across_0_15_to_2_0_bpp":
     proxy_bits, true_bits, bpps = [], [], []

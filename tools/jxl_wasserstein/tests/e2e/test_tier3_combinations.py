@@ -189,7 +189,7 @@ def test_tier3_alpha_composite_upsampling_dimshift_noise_combo(
   assert len(info["extra_channels"]) == 1
   assert info["extra_channels"][0]["dim_shift"] == dim_shift
   assert info["frames"][0]["upsampling"] == upsampling
-  assert info["frames"][0]["save_before_color_transform"] is False
+  assert info["frames"][0]["save_before_color_transform"] is True
   assert info["frames"][0]["ec_upsampling"][0] == max(1, upsampling >> dim_shift)
   if enable_noise:
     assert info["frames"][1]["has_noise"] is True

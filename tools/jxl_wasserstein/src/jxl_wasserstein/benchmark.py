@@ -50,6 +50,9 @@ from jxl_wasserstein.vgg import (
 )
 from jxl_wasserstein.wasserstein import compute_wd
 
+DEFAULT_CORPUS_ROOT = Path(
+    "/usr/local/google/home/veluca/libjxl/image-corpus"
+)
 DEFAULT_KODAK_DIR = Path(
     "/usr/local/google/home/veluca/libjxl/image-corpus/qoi_benchmark_suite/photo_kodak"
 )
@@ -274,6 +277,84 @@ def encode_cjxl_baseline(
     return jxl_bytes, dec_u8
 
 
+def is_pure_8bit_sdr_image(path: str | Path) -> bool:
+  """Returns True iff `path` is a pure 8-bit SDR image (excluding >8-bit and ClassE/HDR images)."""
+  p = Path(path)
+  if not p.is_file():
+    return False
+  parent_low = p.parent.name.lower()
+  if "16" in parent_low:
+    return False
+  name = p.name
+  name_low = name.lower()
+  if (
+      name.startswith("ClassE_")
+      or name_low.startswith("classe_")
+      or name_low.startswith("hdr.")
+      or "_hdr" in name_low
+      or "_10bit_" in name_low
+      or "_12bit_" in name_low
+      or "_16bit_" in name_low
+      or "_10b_" in name_low
+      or "_12b_" in name_low
+      or "_16b_" in name_low
+  ):
+    return False
+  suffix = p.suffix.lower()
+  if suffix == ".png":
+    try:
+      with p.open("rb") as f:
+        hdr = f.read(29)
+      if len(hdr) < 26 or hdr[:8] != b"\x89PNG\r\n\x1a\n" or hdr[12:16] != b"IHDR":
+        return False
+      bit_depth = int(hdr[24])
+      return bit_depth == 8
+    except OSError:
+      return False
+  if suffix in (".ppm", ".pgm"):
+    try:
+      with p.open("rb") as f:
+        tokens: list[bytes] = []
+        while len(tokens) < 4:
+          line = f.readline()
+          if not line:
+            break
+          line = line.split(b"#", 1)[0].strip()
+          if line:
+            tokens.extend(line.split())
+      if len(tokens) < 4:
+        return False
+      maxval = int(tokens[3])
+      return 0 < maxval <= 255
+    except (OSError, ValueError):
+      return False
+  if suffix in (".jpg", ".jpeg"):
+    return True
+  return False
+
+
+def discover_sdr_corpus(
+    corpus_root: str | Path = DEFAULT_CORPUS_ROOT,
+) -> list[tuple[str, Path]]:
+  """Discovers the 40 pure 8-bit SDR corpus images, filtering out all 16-bit and ClassE_*/HDR images."""
+  root = Path(corpus_root)
+  entries: list[tuple[str, Path]] = []
+
+  info_dir = root / "imagecompression.info.rgb8"
+  if info_dir.is_dir():
+    for p in sorted(info_dir.iterdir()):
+      if is_pure_8bit_sdr_image(p):
+        entries.append((f"info_{p.name}", p))
+
+  jxl_dir = root / "jpeg_xl_png"
+  if jxl_dir.is_dir():
+    for p in sorted(jxl_dir.iterdir()):
+      if is_pure_8bit_sdr_image(p):
+        entries.append((p.name, p))
+
+  return entries
+
+
 def load_benchmark_image(
     path: str | Path, crop_size: int | None = 256
 ) -> np.ndarray:
@@ -411,9 +492,12 @@ def evaluate_image_rd_curve(
           )
       )
     else:
-      from jxl_wasserstein.compositing import encode_image_to_jxl
+      from jxl_wasserstein.compositing import (
+          calibrate_rd_lambda,
+          encode_image_to_jxl,
+      )
 
-      lam_f = float(0.22 * (d_f**1.35))
+      lam_f = calibrate_rd_lambda(d_f)
       t0 = time.time()
       res0 = encode_image_to_jxl(
           rgb,
@@ -695,6 +779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "DEFAULT_CORPUS_ROOT",
     "DEFAULT_KODAK_DIR",
     "DEFAULT_BENCHMARK_DISTANCES",
     "DEFAULT_KODAK_SUBSET",
@@ -704,6 +789,8 @@ __all__ = [
     "compute_bd_rate",
     "bd_rate",
     "encode_cjxl_baseline",
+    "is_pure_8bit_sdr_image",
+    "discover_sdr_corpus",
     "load_benchmark_image",
     "init_pure_jax_wd_state",
     "optimize_rate_wd_point",

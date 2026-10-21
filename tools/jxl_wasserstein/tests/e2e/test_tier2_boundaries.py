@@ -791,8 +791,21 @@ def test_f10_boundary_stage2_discrete_decisions(
       }
       acs = np.asarray(dp_fn(cost_maps))
       assert acs.shape == (34, 34)
-      # No 2x2 or 4x4 anchor at by=31 or bx=31 can cross 32
-      assert acs[31, 31] not in (4, 5, 6, 7)
+      vis = np.zeros_like(acs, dtype=bool)
+      # No multi-block anchor can cross CfL tile (8-block) or group (32-block) boundaries
+      for by in range(acs.shape[0]):
+        for bx in range(acs.shape[1]):
+          if vis[by, bx]:
+            continue
+          s_id = int(acs[by, bx])
+          cy = int(ACS_COVERED_BLOCKS_Y[s_id])
+          cx = int(ACS_COVERED_BLOCKS_X[s_id])
+          assert (by // 8) == ((by + cy - 1) // 8)
+          assert (bx // 8) == ((bx + cx - 1) // 8)
+          assert (by // 32) == ((by + cy - 1) // 32)
+          assert (bx // 32) == ((bx + cx - 1) // 32)
+          assert np.all(acs[by : by + cy, bx : bx + cx] == s_id)
+          vis[by : by + cy, bx : bx + cx] = True
     else:
       img = _make_pattern_image(32, 32, "gradient")
       res = opt_mod.optimize_single_frame(

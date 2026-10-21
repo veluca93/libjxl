@@ -382,6 +382,8 @@ def test_tier3_cli_modes_custom_dequant_verify_and_json_out(
       str(in_png),
       "--output",
       str(out_jxl),
+      "--custom-dequant",
+      "compact",
       "--verify",
       "--json-out",
       str(json_path),

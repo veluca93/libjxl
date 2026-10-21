@@ -77,6 +77,22 @@ def _parse_patch_blend_mode(val: str | int) -> int | str:
   )
 
 
+def _parse_custom_dequant(val: str | bool) -> str | bool:
+  if isinstance(val, bool):
+    return val
+  s = str(val).strip().lower()
+  if s in ("auto", "none", "compact", "full_bands"):
+    return s
+  if s in ("true", "1", "yes", "on"):
+    return True
+  if s in ("false", "0", "no", "off"):
+    return False
+  raise argparse.ArgumentTypeError(
+      "--custom-dequant must be auto, none, compact, full_bands, true, or"
+      f" false (got {val!r})"
+  )
+
+
 def build_parser() -> argparse.ArgumentParser:
   """Builds the argument parser for the `jxl-wasserstein` CLI."""
   parser = argparse.ArgumentParser(
@@ -147,6 +163,29 @@ def build_parser() -> argparse.ArgumentParser:
       action="store_true",
       default=False,
       help="Enable differentiable JXL NoiseParams LUT synthesis.",
+  )
+  parser.add_argument(
+      "--custom-dequant",
+      dest="custom_dequant",
+      type=_parse_custom_dequant,
+      default=None,
+      help=(
+          "Custom DequantMatrices parameterization: auto, none, compact,"
+          " full_bands, true, or false (default: auto)."
+      ),
+  )
+  parser.add_argument(
+      "--no-custom-dequant",
+      dest="custom_dequant",
+      action="store_const",
+      const="none",
+      help="Disable custom DequantMatrices (use 1-bit default weights).",
+  )
+  parser.add_argument(
+      "--log2-sigma",
+      type=float,
+      default=1.0,
+      help="Log2 Gaussian window sigma for Wasserstein Distortion (default: 1.0).",
   )
   parser.add_argument(
       "--init-mode",
@@ -233,13 +272,23 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
   else:
     rgb_u8 = np.asarray(Image.open(in_path).convert("RGB"), dtype=np.uint8)
 
+  from jxl_wasserstein.compositing import (
+      calibrate_rd_lambda,
+      encode_image_to_jxl,
+  )
+
   h, w, _ = rgb_u8.shape
   distance = float(args.distance)
-  lam_rate = (
-      float(args.lambda_rate)
-      if args.lambda_rate is not None
-      else float(0.22 * (distance ** 1.35))
+  explicit_lam = (
+      float(args.lambda_rate) if args.lambda_rate is not None else None
   )
+  lam_rate = (
+      explicit_lam
+      if explicit_lam is not None
+      else calibrate_rd_lambda(distance)
+  )
+  log2_sigma = float(getattr(args, "log2_sigma", 1.0))
+  custom_dequant = getattr(args, "custom_dequant", None)
   mode = str(args.mode).lower()
   upsampling = args.upsampling
   if upsampling == "auto":
@@ -264,7 +313,11 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
   vgg_params = load_vgg16_params()
   ref_01 = jnp.asarray(rgb_u8, dtype=jnp.float32) / 255.0
 
-  if mode == "single" and not args.enable_noise:
+  if (
+      mode == "single"
+      and not args.enable_noise
+      and custom_dequant in (None, True)
+  ):
     pad_h = ((h + 7) // 8) * 8 - h
     pad_w = ((w + 7) // 8) * 8 - w
     ref_pad = (
@@ -314,8 +367,6 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
     ds_selected = 0
     has_noise = False
   else:
-    from jxl_wasserstein.compositing import encode_image_to_jxl
-
     res = encode_image_to_jxl(
         srgb_hwc=rgb_u8,
         mode=mode,
@@ -323,9 +374,11 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
         patch_blend_mode=args.patch_blend_mode,
         dim_shift=ds_val,
         distance=distance,
-        lambda_rd=lam_rate,
+        lambda_rd=explicit_lam,
         num_steps=eff_steps,
         enable_noise=bool(args.enable_noise),
+        custom_dequant=custom_dequant,
+        log2_sigma=log2_sigma,
         vgg_params=vgg_params,
         init_mode=init_mode,
         seed=seed,
@@ -335,7 +388,10 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
     bpp = len(jxl_bytes) * 8.0 / float(h * w)
     wd = float(
         compute_wd(
-            ref_01, jnp.asarray(dec_u8, dtype=jnp.float32) / 255.0, vgg_params
+            ref_01,
+            jnp.asarray(dec_u8, dtype=jnp.float32) / 255.0,
+            vgg_params,
+            log2_sigma=log2_sigma,
         )
     )
     psnr_db = compute_psnr(rgb_u8, dec_u8, peak=255.0)

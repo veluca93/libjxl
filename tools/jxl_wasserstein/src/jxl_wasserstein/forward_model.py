@@ -1512,8 +1512,8 @@ def dequant_and_smooth_dc(
   )
   mul_dc = inv_quant_dc * k_dc
 
-  cfl_x = float(base_correlation_x) + float(ytox_dc) / float(color_factor)
-  cfl_b = float(base_correlation_b) + float(ytob_dc) / float(color_factor)
+  cfl_x = float(base_correlation_x) + jnp.asarray(ytox_dc, dtype=jnp.float32) / float(color_factor)
+  cfl_b = float(base_correlation_b) + jnp.asarray(ytob_dc, dtype=jnp.float32) / float(color_factor)
 
   dc_y = q_dc[1] * mul_dc[1]
   dc_x = q_dc[0] * mul_dc[0] + cfl_x * dc_y
@@ -1575,12 +1575,12 @@ def gaborish_inverse_3x3(
 def compute_epf_inv_sigma_grid(
     raw_quant_tl_grid: jax.Array,
     epf_sharpness: jax.Array,
-    global_scale: int,
+    global_scale: int | float | jax.Array,
     epf_quant_mul: float = K_DEFAULT_EPF_QUANT_MUL,
     epf_sharp_lut: Sequence[float] = K_DEFAULT_EPF_SHARP_LUT,
 ) -> jax.Array:
   """Exact ComputeSigma (lib/jxl/epf.cc:39-132)."""
-  quant_scale = float(global_scale) / K_GLOBAL_SCALE_DENOM
+  quant_scale = jnp.asarray(global_scale, dtype=jnp.float32) / K_GLOBAL_SCALE_DENOM
   sigma_quant = float(epf_quant_mul) / (
       quant_scale * jnp.asarray(raw_quant_tl_grid, dtype=jnp.float32) * K_INV_SIGMA_NUM
   )
@@ -1603,12 +1603,13 @@ def _epf_pixel_inv_sigma(
   """Computes per-pixel effective inv_sigma (stage_epf.cc:98-131, 237-271, 428-462)."""
   y_idx = jnp.arange(h)
   x_idx = jnp.arange(w)
-  by = y_idx // 8
-  bx = x_idx // 8
   ymod = (y_idx % 8)[:, None]
   xmod = (x_idx % 8)[None, :]
 
-  row_sigma_px = inv_sigma_grid[by[:, None], bx[None, :]]
+  h8, w8 = inv_sigma_grid.shape
+  row_sigma_px = jnp.broadcast_to(
+      inv_sigma_grid[:, None, :, None], (h8, 8, w8, 8)
+  ).reshape(h8 * 8, w8 * 8)[:h, :w]
   sm = float(sigma_scale) * 1.65
   bsm = sm * float(border_sad_mul)
   is_border = (ymod == 0) | (ymod == 7) | (xmod == 0) | (xmod == 7)
@@ -1740,7 +1741,11 @@ def epf_stage2(
 class StaticVarDCTTopology:
   """Precomputed static topology from JxlVarDCTState for fast JIT compilation."""
 
-  def __init__(self, state: JxlVarDCTState) -> None:
+  def __init__(
+      self,
+      state: JxlVarDCTState,
+      force_strategies: Sequence[int] | None = None,
+  ) -> None:
     self.state = state
     self.height = int(state.height)
     self.width = int(state.width)
@@ -1773,54 +1778,132 @@ class StaticVarDCTTopology:
     default_dq = get_default_dequant_matrices()
     dq_dict = state.dequant_matrices if state.dequant_matrices else default_dq
 
-    covered = np.zeros((self.h8, self.w8), dtype=bool)
-    tl_by_grid = np.zeros((self.h8, self.w8), dtype=np.int32)
-    tl_bx_grid = np.zeros((self.h8, self.w8), dtype=np.int32)
+    acs_np = np.asarray(state.ac_strategy, dtype=np.int32)
+    tl_by_grid = np.broadcast_to(
+        np.arange(self.h8, dtype=np.int32)[:, None], (self.h8, self.w8)
+    ).copy()
+    tl_bx_grid = np.broadcast_to(
+        np.arange(self.w8, dtype=np.int32)[None, :], (self.h8, self.w8)
+    ).copy()
+    is_1x1_np = (acs_np <= 3) | ((acs_np >= 12) & (acs_np <= 17))
+    mask_1x1_np = is_1x1_np.astype(np.float32)
+    first_block_mask_np = mask_1x1_np.copy()
 
-    blocks_1x1: list[tuple[int, int, int]] = []
     blocks_multi: dict[int, list[tuple[int, int]]] = {}
-
-    for by in range(self.h8):
-      for bx in range(self.w8):
-        if covered[by, bx]:
+    if np.any(~is_1x1_np):
+      covered_m = np.zeros((self.h8, self.w8), dtype=bool)
+      m_bys, m_bxs = np.nonzero(~is_1x1_np)
+      for by, bx in zip(m_bys.tolist(), m_bxs.tolist()):
+        if covered_m[by, bx]:
           continue
-        s = int(state.ac_strategy[by, bx])
+        s = int(acs_np[by, bx])
         cx = ACS_COVERED_BLOCKS_X[s]
         cy = ACS_COVERED_BLOCKS_Y[s]
-        covered[by : by + cy, bx : bx + cx] = True
+        covered_m[by : by + cy, bx : bx + cx] = True
         tl_by_grid[by : by + cy, bx : bx + cx] = by
         tl_bx_grid[by : by + cy, bx : bx + cx] = bx
-        if cy == 1 and cx == 1:
-          blocks_1x1.append((by, bx, s))
-        else:
-          blocks_multi.setdefault(s, []).append((by, bx))
+        first_block_mask_np[by, bx] = 1.0
+        blocks_multi.setdefault(s, []).append((by, bx))
 
+    self.tl_by_grid_np = tl_by_grid
+    self.tl_bx_grid_np = tl_bx_grid
     self.tl_by_grid = jnp.array(tl_by_grid, dtype=jnp.int32)
     self.tl_bx_grid = jnp.array(tl_bx_grid, dtype=jnp.int32)
+    self.mask_1x1 = jnp.array(mask_1x1_np, dtype=jnp.float32)
+    self.first_block_mask = jnp.array(first_block_mask_np, dtype=jnp.float32)
 
-    self.has_1x1 = len(blocks_1x1) > 0
+    by_1x1, bx_1x1 = np.nonzero(is_1x1_np)
+    by_1x1 = by_1x1.astype(np.int32)
+    bx_1x1 = bx_1x1.astype(np.int32)
+    s_1x1 = acs_np[by_1x1, bx_1x1]
+    self.has_1x1 = bool(by_1x1.size > 0)
+    self._dq_dict = dq_dict
+    self._default_dq = default_dq
+    self._dq_1x1_lazy: jax.Array | None = None
+    self._basis_1x1_lazy: jax.Array | None = None
+    self._fwd_basis_1x1_lazy: jax.Array | None = None
+    self.groups_1x1: list[dict[str, Any]] = []
     if self.has_1x1:
-      by_1x1 = np.array([b[0] for b in blocks_1x1], dtype=np.int32)
-      bx_1x1 = np.array([b[1] for b in blocks_1x1], dtype=np.int32)
-      s_1x1 = np.array([b[2] for b in blocks_1x1], dtype=np.int32)
+      self._s_1x1_np = s_1x1
       self.by_1x1 = jnp.array(by_1x1)
       self.bx_1x1 = jnp.array(bx_1x1)
       self.s_1x1 = jnp.array(s_1x1)
-      dq_1x1 = np.stack([dq_dict.get(int(s), default_dq[int(s)]) for s in s_1x1], axis=0)
-      self.dq_1x1 = jnp.array(dq_1x1, dtype=jnp.float32)
-      self.basis_1x1 = jnp.array(BASIS_1X1_INV_TABLE_NP[s_1x1], dtype=jnp.float32)
-      self.fwd_basis_1x1 = jnp.array(BASIS_1X1_FWD_TABLE_NP[s_1x1], dtype=jnp.float32)
+      used_1x1_s = set(int(x) for x in np.unique(s_1x1))
+    else:
+      used_1x1_s = set()
+
+    if force_strategies is not None:
+      for s_f in sorted(set(int(x) for x in force_strategies)):
+        if ACS_COVERED_BLOCKS_X[s_f] == 1 and ACS_COVERED_BLOCKS_Y[s_f] == 1:
+          used_1x1_s.add(s_f)
+        else:
+          blocks_multi.setdefault(s_f, [])
+      self.has_1x1 = len(used_1x1_s) > 0
+
+    if self.has_1x1:
+      for s_v in sorted(used_1x1_s):
+        mask_2d_np = (acs_np == int(s_v)) & is_1x1_np
+        by_s, bx_s = np.nonzero(mask_2d_np)
+        by_s = by_s.astype(np.int32)
+        bx_s = bx_s.astype(np.int32)
+        self.groups_1x1.append({
+            "s": int(s_v),
+            "by": jnp.array(by_s, dtype=jnp.int32),
+            "bx": jnp.array(bx_s, dtype=jnp.int32),
+            "mask_2d": jnp.array(mask_2d_np, dtype=jnp.bool_),
+            "dq_mat": jnp.array(
+                dq_dict.get(int(s_v), default_dq[int(s_v)]), dtype=jnp.float32
+            ),
+            "basis": jnp.array(
+                BASIS_1X1_INV_TABLE_NP[int(s_v)], dtype=jnp.float32
+            ),
+            "fwd_basis": jnp.array(
+                BASIS_1X1_FWD_TABLE_NP[int(s_v)], dtype=jnp.float32
+            ),
+        })
 
     self.multi_groups: list[dict[str, Any]] = []
     for s, coords in sorted(blocks_multi.items()):
       name = ACS_NAMES[s]
       cx = ACS_COVERED_BLOCKS_X[s]
       cy = ACS_COVERED_BLOCKS_Y[s]
+      nh_cell = self.h8 // cy
+      nw_cell = self.w8 // cx
+      if len(coords) == 0 and (nh_cell <= 0 or nw_cell <= 0):
+        continue
       cy_l, cx_l = min(cy, cx), max(cy, cx)
       rows, cols = 8 * cy, 8 * cx
-      by_arr = jnp.array([c[0] for c in coords], dtype=np.int32)
-      bx_arr = jnp.array([c[1] for c in coords], dtype=np.int32)
+      by_np = np.array([c[0] for c in coords], dtype=np.int32)
+      bx_np = np.array([c[1] for c in coords], dtype=np.int32)
+      by_arr = jnp.array(by_np, dtype=jnp.int32)
+      bx_arr = jnp.array(bx_np, dtype=jnp.int32)
       dq_mat = jnp.array(dq_dict.get(int(s), default_dq[int(s)]), dtype=jnp.float32)
+
+      grid_aligned = bool(
+          nh_cell > 0
+          and nw_cell > 0
+          and (
+              by_np.size == 0
+              or (
+                  np.all((by_np % cy) == 0)
+                  and np.all((bx_np % cx) == 0)
+                  and np.all((by_np // cy) < nh_cell)
+                  and np.all((bx_np // cx) < nw_cell)
+              )
+          )
+      )
+      if grid_aligned:
+        cell_mask_np = np.zeros((nh_cell, nw_cell), dtype=bool)
+        if by_np.size > 0:
+          cell_mask_np[by_np // cy, bx_np // cx] = True
+        blk_mask_np = np.repeat(np.repeat(cell_mask_np, cy, axis=0), cx, axis=1)
+        cell_mask_j = jnp.array(cell_mask_np, dtype=jnp.bool_)
+        cell_mask_f = jnp.array(cell_mask_np, dtype=jnp.float32)
+        blk_mask_j = jnp.array(blk_mask_np, dtype=jnp.bool_)
+      else:
+        cell_mask_j = None
+        cell_mask_f = None
+        blk_mask_j = None
 
       self.multi_groups.append({
           "s": s,
@@ -1831,6 +1914,14 @@ class StaticVarDCTTopology:
           "cx_l": cx_l,
           "by": by_arr,
           "bx": bx_arr,
+          "grid_aligned": grid_aligned,
+          "nh_cell": nh_cell,
+          "nw_cell": nw_cell,
+          "h_lim": nh_cell * cy,
+          "w_lim": nw_cell * cx,
+          "cell_mask": cell_mask_j,
+          "cell_mask_f": cell_mask_f,
+          "blk_mask": blk_mask_j,
           "dq_mat": dq_mat,
           "d_cy": jnp.array(make_dct1d_matrix(cy), dtype=jnp.float32),
           "d_cx": jnp.array(make_dct1d_matrix(cx), dtype=jnp.float32),
@@ -1845,6 +1936,67 @@ class StaticVarDCTTopology:
           "idct_r": jnp.array(make_idct1d_matrix(rows), dtype=jnp.float32),
           "idct_c": jnp.array(make_idct1d_matrix(cols), dtype=jnp.float32),
       })
+    self.all_grid_aligned = all(
+        bool(g.get("grid_aligned", False)) for g in self.multi_groups
+    )
+
+  def broadcast_top_left_grid(
+      self, grid_2d: jax.Array, acs_grid: jax.Array | None = None
+  ) -> jax.Array:
+    """Broadcasts top-left anchor values of each multi-block transform across its covered `(cy, cx)` blocks without 2D gather when grid-aligned."""
+    if len(self.multi_groups) == 0:
+      return grid_2d
+    if not self.all_grid_aligned:
+      return grid_2d[self.tl_by_grid, self.tl_bx_grid]
+    out = grid_2d
+    for grp in self.multi_groups:
+      cy, cx = grp["cy"], grp["cx"]
+      nh_cell, nw_cell = grp["nh_cell"], grp["nw_cell"]
+      h_lim, w_lim = grp["h_lim"], grp["w_lim"]
+      tl_vals = grid_2d[:h_lim:cy, :w_lim:cx]
+      tl_bcast = jnp.broadcast_to(
+          tl_vals[:, None, :, None], (nh_cell, cy, nw_cell, cx)
+      ).reshape(h_lim, w_lim)
+      blk_mask = (
+          (acs_grid[:h_lim, :w_lim] == grp["s"])
+          if acs_grid is not None
+          else grp["blk_mask"]
+      )
+      sub = jnp.where(blk_mask, tl_bcast, out[:h_lim, :w_lim])
+      if h_lim == self.h8 and w_lim == self.w8:
+        out = sub
+      else:
+        out = out.at[:h_lim, :w_lim].set(sub)
+    return out
+
+  @property
+  def dq_1x1(self) -> jax.Array:
+    if self._dq_1x1_lazy is None:
+      dq_np = np.stack(
+          [
+              self._dq_dict.get(int(s), self._default_dq[int(s)])
+              for s in self._s_1x1_np
+          ],
+          axis=0,
+      )
+      self._dq_1x1_lazy = jnp.array(dq_np, dtype=jnp.float32)
+    return self._dq_1x1_lazy
+
+  @property
+  def basis_1x1(self) -> jax.Array:
+    if self._basis_1x1_lazy is None:
+      self._basis_1x1_lazy = jnp.array(
+          BASIS_1X1_INV_TABLE_NP[self._s_1x1_np], dtype=jnp.float32
+      )
+    return self._basis_1x1_lazy
+
+  @property
+  def fwd_basis_1x1(self) -> jax.Array:
+    if self._fwd_basis_1x1_lazy is None:
+      self._fwd_basis_1x1_lazy = jnp.array(
+          BASIS_1X1_FWD_TABLE_NP[self._s_1x1_np], dtype=jnp.float32
+      )
+    return self._fwd_basis_1x1_lazy
 
 
 def reconstruct_single_frame_xyb(
@@ -1867,6 +2019,7 @@ def reconstruct_single_frame_xyb(
     epf_iters_override: int | None = None,
     gab_override: bool | None = None,
     enable_noise: bool | None = None,
+    acs_grid: jax.Array | None = None,
 ) -> jax.Array:
   """Reconstructs a single VarDCT frame into XYB `(3, H, W)` after Gaborish, EPF, and optional Noise."""
   if isinstance(state_or_topo, StaticVarDCTTopology):
@@ -1956,8 +2109,8 @@ def reconstruct_single_frame_xyb(
       quant_dc=qdc_val,
       base_correlation_x=topo.base_correlation_x,
       base_correlation_b=topo.base_correlation_b,
-      ytox_dc=topo.ytox_dc,
-      ytob_dc=topo.ytob_dc,
+      ytox_dc=ov.get("ytox_dc", topo.ytox_dc),
+      ytob_dc=ov.get("ytob_dc", topo.ytob_dc),
       color_factor=topo.color_factor,
       hard=hard,
       do_adaptive_dc_smoothing=not skip_adaptive_dc_smoothing,
@@ -1992,106 +2145,168 @@ def reconstruct_single_frame_xyb(
   )
   x_cc_tile = float(topo.base_correlation_x) + ytox_f / float(topo.color_factor)
   b_cc_tile = float(topo.base_correlation_b) + ytob_f / float(topo.color_factor)
+  x_cc_grid = jnp.broadcast_to(
+      x_cc_tile[:, None, :, None], (topo.ht, 8, topo.wt, 8)
+  ).reshape(topo.ht * 8, topo.wt * 8)[: topo.h8, : topo.w8]
+  b_cc_grid = jnp.broadcast_to(
+      b_cc_tile[:, None, :, None], (topo.ht, 8, topo.wt, 8)
+  ).reshape(topo.ht * 8, topo.wt * 8)[: topo.h8, : topo.w8]
 
   xyb_blocks = jnp.zeros((topo.h8, topo.w8, 3, 8, 8), dtype=jnp.float32)
 
   if topo.has_1x1:
-    by = topo.by_1x1
-    bx = topo.bx_1x1
-    q_b = q_hat_blocks[by, bx]
-    q_b = q_b.at[:, :, 0, 0].set(0.0)
-
-    sd = scaled_dequant_grid[by, bx][:, None, None]
-    ty = by // 8
-    tx = bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
-
-    if custom_dq is not None:
-      default_dq = get_default_dequant_matrices()
-      dq_1x1_table = jnp.stack(
-          [
-              _resolve_strategy_dequant_matrix_jax(
-                  s_id,
-                  custom_dq,
-                  jnp.asarray(default_dq[s_id], dtype=jnp.float32),
-              )
-              if (
-                  ACS_COVERED_BLOCKS_X[s_id] == 1
-                  and ACS_COVERED_BLOCKS_Y[s_id] == 1
-              )
-              else jnp.zeros((3, 8, 8), dtype=jnp.float32)
-              for s_id in range(18)
-          ],
-          axis=0,
+    q_b_all = q_hat_blocks.at[:, :, :, 0, 0].set(0.0)
+    sd_all = scaled_dequant_grid[:, :, None, None]
+    x_cc_all = x_cc_grid[:, :, None, None]
+    b_cc_all = b_cc_grid[:, :, None, None]
+    dc_vals_all = jnp.transpose(dc_smoothed, (1, 2, 0))
+    for idx_1x1, grp1 in enumerate(topo.groups_1x1):
+      s_id = grp1["s"]
+      dq_mat = (
+          _resolve_strategy_dequant_matrix_jax(s_id, custom_dq, grp1["dq_mat"])
+          if custom_dq is not None
+          else grp1["dq_mat"]
       )
-      dq_1x1 = dq_1x1_table[topo.s_1x1]
-    else:
-      dq_1x1 = topo.dq_1x1
+      wy = dq_mat[1][None, None]
+      wx = dq_mat[0][None, None]
+      wb = dq_mat[2][None, None]
 
-    wy = dq_1x1[:, 1]
-    wx = dq_1x1[:, 0]
-    wb = dq_1x1[:, 2]
+      coeff_y = q_b_all[:, :, 1] * wy * sd_all
+      coeff_x = q_b_all[:, :, 0] * wx * (sd_all * x_dm_mul) + x_cc_all * coeff_y
+      coeff_b = q_b_all[:, :, 2] * wb * (sd_all * b_dm_mul) + b_cc_all * coeff_y
+      coeffs = jnp.stack([coeff_x, coeff_y, coeff_b], axis=2)
+      coeffs = coeffs.at[:, :, :, 0, 0].set(dc_vals_all)
 
-    coeff_y = q_b[:, 1] * wy * sd
-    coeff_x = q_b[:, 0] * wx * (sd * x_dm_mul) + x_cc * coeff_y
-    coeff_b = q_b[:, 2] * wb * (sd * b_dm_mul) + b_cc * coeff_y
-    coeffs = jnp.stack([coeff_x, coeff_y, coeff_b], axis=1)
-
-    dc_vals = jnp.transpose(dc_smoothed[:, by, bx], (1, 0))
-    coeffs = coeffs.at[:, :, 0, 0].set(dc_vals)
-
-    coeffs_flat = coeffs.reshape(-1, 3, 64)
-    pixels_flat = jnp.einsum("nij,ncj->nci", topo.basis_1x1, coeffs_flat)
-    pixels_1x1 = pixels_flat.reshape(-1, 3, 8, 8)
-    xyb_blocks = xyb_blocks.at[by, bx].set(pixels_1x1)
+      coeffs_flat = coeffs.reshape(topo.h8, topo.w8, 3, 64)
+      pixels_flat = jnp.einsum("ij,hwcj->hwci", grp1["basis"], coeffs_flat)
+      pixels_1x1 = pixels_flat.reshape(topo.h8, topo.w8, 3, 8, 8)
+      if idx_1x1 == 0:
+        xyb_blocks = pixels_1x1
+      else:
+        mask_2d = (acs_grid == s_id) if acs_grid is not None else grp1["mask_2d"]
+        xyb_blocks = jnp.where(
+            mask_2d[:, :, None, None, None], pixels_1x1, xyb_blocks
+        )
 
   for grp in topo.multi_groups:
     cy = grp["cy"]
     cx = grp["cx"]
     cy_l = grp["cy_l"]
     cx_l = grp["cx_l"]
-    by = grp["by"]
-    bx = grp["bx"]
-    m = by.shape[0]
-
-    dy = jnp.arange(cy)[None, :, None]
-    dx = jnp.arange(cx)[None, None, :]
-    sub_q = q_hat_blocks[by[:, None, None] + dy, bx[:, None, None] + dx]
-    sub_q = jnp.transpose(sub_q, (0, 3, 1, 4, 2, 5)).reshape(m, 3, 8 * cy_l, 8 * cx_l)
-    sub_q = sub_q.at[:, :, :cy_l, :cx_l].set(0.0)
-
-    sd = scaled_dequant_grid[by, bx][:, None, None]
-    ty = by // 8
-    tx = bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
-
     dq_mat = (
         _resolve_strategy_dequant_matrix_jax(grp["s"], custom_dq, grp["dq_mat"])
         if custom_dq is not None
         else grp["dq_mat"]
     )
-    coeff_y = sub_q[:, 1] * dq_mat[1][None] * sd
-    coeff_x = sub_q[:, 0] * dq_mat[0][None] * (sd * x_dm_mul) + x_cc * coeff_y
-    coeff_b = sub_q[:, 2] * dq_mat[2][None] * (sd * b_dm_mul) + b_cc * coeff_y
-    coeffs = jnp.stack([coeff_x, coeff_y, coeff_b], axis=1)
+    if grp.get("grid_aligned", False):
+      nh_cell = grp["nh_cell"]
+      nw_cell = grp["nw_cell"]
+      h_lim = grp["h_lim"]
+      w_lim = grp["w_lim"]
+      sub_q = q_hat_blocks[:h_lim, :w_lim].reshape(
+          nh_cell, cy, nw_cell, cx, 3, 8, 8
+      )
+      sub_q = jnp.transpose(sub_q, (0, 2, 4, 1, 5, 3, 6)).reshape(
+          nh_cell, nw_cell, 3, 8 * cy_l, 8 * cx_l
+      )
+      sub_q = sub_q.at[:, :, :, :cy_l, :cx_l].set(0.0)
 
-    dc_sub = jnp.transpose(
-        dc_smoothed[:, by[:, None, None] + dy, bx[:, None, None] + dx], (1, 0, 2, 3)
-    )
-    llf = jnp.einsum("ij,mcjk,lk->mcil", grp["d_cy"], dc_sub, grp["d_cx"])
-    llf = llf * (
-        grp["rs_to_llf_y"][None, None, :, None] * grp["rs_to_llf_x"][None, None, None, :]
-    )
-    if cy >= cx:
-      llf = jnp.swapaxes(llf, -2, -1)
-    coeffs = coeffs.at[:, :, :cy_l, :cx_l].set(llf)
+      sd = scaled_dequant_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      x_cc = x_cc_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      b_cc = b_cc_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
 
-    coeffs_for_idct = jnp.swapaxes(coeffs, -2, -1) if cy >= cx else coeffs
-    pixels = jnp.einsum("ij,mcjk,lk->mcil", grp["idct_r"], coeffs_for_idct, grp["idct_c"])
-    pixels_blk = jnp.transpose(pixels.reshape(m, 3, cy, 8, cx, 8), (0, 2, 4, 1, 3, 5))
-    xyb_blocks = xyb_blocks.at[by[:, None, None] + dy, bx[:, None, None] + dx].set(pixels_blk)
+      coeff_y = sub_q[:, :, 1] * dq_mat[1][None, None] * sd
+      coeff_x = (
+          sub_q[:, :, 0] * dq_mat[0][None, None] * (sd * x_dm_mul)
+          + x_cc * coeff_y
+      )
+      coeff_b = (
+          sub_q[:, :, 2] * dq_mat[2][None, None] * (sd * b_dm_mul)
+          + b_cc * coeff_y
+      )
+      coeffs = jnp.stack([coeff_x, coeff_y, coeff_b], axis=2)
+
+      dc_sub = jnp.transpose(
+          dc_smoothed[:, :h_lim, :w_lim].reshape(3, nh_cell, cy, nw_cell, cx),
+          (1, 3, 0, 2, 4),
+      )
+      llf = jnp.einsum("ij,hwcjk,lk->hwcil", grp["d_cy"], dc_sub, grp["d_cx"])
+      llf = llf * (
+          grp["rs_to_llf_y"][None, None, None, :, None]
+          * grp["rs_to_llf_x"][None, None, None, None, :]
+      )
+      if cy >= cx:
+        llf = jnp.swapaxes(llf, -2, -1)
+      coeffs = coeffs.at[:, :, :, :cy_l, :cx_l].set(llf)
+
+      coeffs_for_idct = jnp.swapaxes(coeffs, -2, -1) if cy >= cx else coeffs
+      pixels = jnp.einsum(
+          "ij,hwcjk,lk->hwcil", grp["idct_r"], coeffs_for_idct, grp["idct_c"]
+      )
+      pixels_blk = jnp.transpose(
+          pixels.reshape(nh_cell, nw_cell, 3, cy, 8, cx, 8),
+          (0, 3, 1, 5, 2, 4, 6),
+      ).reshape(h_lim, w_lim, 3, 8, 8)
+      blk_mask = (
+          (acs_grid[:h_lim, :w_lim] == grp["s"])
+          if acs_grid is not None
+          else grp["blk_mask"]
+      )
+      sub_xyb = jnp.where(
+          blk_mask[:, :, None, None, None],
+          pixels_blk,
+          xyb_blocks[:h_lim, :w_lim],
+      )
+      if h_lim == topo.h8 and w_lim == topo.w8:
+        xyb_blocks = sub_xyb
+      else:
+        xyb_blocks = xyb_blocks.at[:h_lim, :w_lim].set(sub_xyb)
+    else:
+      by = grp["by"]
+      bx = grp["bx"]
+      m = by.shape[0]
+      dy = jnp.arange(cy)[None, :, None]
+      dx = jnp.arange(cx)[None, None, :]
+      sub_q = q_hat_blocks[by[:, None, None] + dy, bx[:, None, None] + dx]
+      sub_q = jnp.transpose(sub_q, (0, 3, 1, 4, 2, 5)).reshape(
+          m, 3, 8 * cy_l, 8 * cx_l
+      )
+      sub_q = sub_q.at[:, :, :cy_l, :cx_l].set(0.0)
+
+      sd = scaled_dequant_grid[by, bx][:, None, None]
+      ty = by // 8
+      tx = bx // 8
+      x_cc = x_cc_tile[ty, tx][:, None, None]
+      b_cc = b_cc_tile[ty, tx][:, None, None]
+
+      coeff_y = sub_q[:, 1] * dq_mat[1][None] * sd
+      coeff_x = sub_q[:, 0] * dq_mat[0][None] * (sd * x_dm_mul) + x_cc * coeff_y
+      coeff_b = sub_q[:, 2] * dq_mat[2][None] * (sd * b_dm_mul) + b_cc * coeff_y
+      coeffs = jnp.stack([coeff_x, coeff_y, coeff_b], axis=1)
+
+      dc_sub = jnp.transpose(
+          dc_smoothed[:, by[:, None, None] + dy, bx[:, None, None] + dx],
+          (1, 0, 2, 3),
+      )
+      llf = jnp.einsum("ij,mcjk,lk->mcil", grp["d_cy"], dc_sub, grp["d_cx"])
+      llf = llf * (
+          grp["rs_to_llf_y"][None, None, :, None]
+          * grp["rs_to_llf_x"][None, None, None, :]
+      )
+      if cy >= cx:
+        llf = jnp.swapaxes(llf, -2, -1)
+      coeffs = coeffs.at[:, :, :cy_l, :cx_l].set(llf)
+
+      coeffs_for_idct = jnp.swapaxes(coeffs, -2, -1) if cy >= cx else coeffs
+      pixels = jnp.einsum(
+          "ij,mcjk,lk->mcil", grp["idct_r"], coeffs_for_idct, grp["idct_c"]
+      )
+      pixels_blk = jnp.transpose(
+          pixels.reshape(m, 3, cy, 8, cx, 8), (0, 2, 4, 1, 3, 5)
+      )
+      xyb_blocks = xyb_blocks.at[
+          by[:, None, None] + dy, bx[:, None, None] + dx
+      ].set(pixels_blk)
 
   xyb = jnp.transpose(xyb_blocks, (2, 0, 3, 1, 4)).reshape(3, topo.h8 * 8, topo.w8 * 8)
   # Crop to unpadded frame size BEFORE Gaborish and EPF so mirror padding reflects at (H, W)
@@ -2111,11 +2326,14 @@ def reconstruct_single_frame_xyb(
       else int(ov.get("epf_iters", topo.epf_iters))
   )
   if epf_iters > 0:
-    raw_q_tl_grid = raw_q_f[topo.tl_by_grid, topo.tl_bx_grid]
+    epf_sharp_val = jnp.asarray(
+        ov.get("epf_sharpness", topo.epf_sharpness), dtype=jnp.int32
+    )
+    raw_q_tl_grid = topo.broadcast_top_left_grid(raw_q_f, acs_grid=acs_grid)
     inv_sigma_grid = compute_epf_inv_sigma_grid(
         raw_quant_tl_grid=raw_q_tl_grid,
-        epf_sharpness=topo.epf_sharpness,
-        global_scale=topo.global_scale,
+        epf_sharpness=epf_sharp_val,
+        global_scale=gs_val,
         epf_quant_mul=topo.epf_quant_mul,
         epf_sharp_lut=topo.epf_sharp_lut,
     )
@@ -2184,6 +2402,7 @@ def reconstruct_single_frame(
     epf_iters_override: int | None = None,
     gab_override: bool | None = None,
     enable_noise: bool | None = None,
+    acs_grid: jax.Array | None = None,
 ) -> jax.Array:
   """Full differentiable single-frame VarDCT reconstruction in JAX -> nonlinear sRGB in [0, 1].
 
@@ -2214,6 +2433,7 @@ def reconstruct_single_frame(
       epf_iters_override=epf_iters_override,
       gab_override=gab_override,
       enable_noise=enable_noise,
+      acs_grid=acs_grid,
   )
   srgb_chw = opsin_to_srgb(xyb, topo.opsin_inv_matrix, topo.opsin_biases, clamp=True)
   if output_layout.upper() == "CHW":
@@ -2226,6 +2446,79 @@ def reconstruct_single_frame(
 # -----------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=16)
+def _get_compiled_dct8_init(
+    h: int, w: int, gab: bool, x_qm_scale: int = 3, b_qm_scale: int = 2
+):
+  """Returns JIT-compiled DCT8 (dc_quant, quant_ac) initializer for `init_state_from_rgb_jax`."""
+  h8 = (h + 7) // 8
+  w8 = (w + 7) // 8
+  ht = (h8 + 7) // 8
+  wt = (w8 + 7) // 8
+  default_dq0 = jnp.asarray(get_default_dequant_matrices()[0], dtype=jnp.float32)
+  fwd_basis0 = jnp.asarray(BASIS_1X1_FWD_TABLE_NP[0], dtype=jnp.float32)
+  wy = default_dq0[1][None, None]
+  wx = default_dq0[0][None, None]
+  wb = default_dq0[2][None, None]
+  x_qm_mul = jnp.float32(1.25 ** (float(x_qm_scale) - 2.0))
+  b_qm_mul = jnp.float32(1.25 ** (float(b_qm_scale) - 2.0))
+  k_dc = jnp.asarray(K_DC_QUANT, dtype=jnp.float32)
+
+  @jax.jit
+  def _fn(arr_hwc, gs, qdc, rq, yx, yb, ytox_dc_f, ytob_dc_f):
+    srgb_chw = jnp.moveaxis(arr_hwc, -1, 0)
+    xyb = srgb_to_xyb(srgb_chw)
+    if gab:
+      xyb = gaborish_inverse_3x3(xyb, K_DEFAULT_GAB_WEIGHTS)
+    pad_h = h8 * 8 - h
+    pad_w = w8 * 8 - w
+    if pad_h > 0 or pad_w > 0:
+      xyb = jnp.pad(xyb, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
+    px_flat = jnp.transpose(xyb.reshape(3, h8, 8, w8, 8), (1, 3, 0, 2, 4)).reshape(
+        h8, w8, 3, 64
+    )
+    coeffs = jnp.einsum("ij,hwcj->hwci", fwd_basis0, px_flat).reshape(
+        h8, w8, 3, 8, 8
+    )
+    dc_continuous = jnp.transpose(coeffs[:, :, :, 0, 0], (2, 0, 1))
+    qs_all = ((gs / K_GLOBAL_SCALE_DENOM) * jnp.maximum(rq, 1.0))[:, :, None, None]
+    x_cc_tile = float(K_BASE_CORRELATION_X) + yx / float(K_DEFAULT_COLOR_FACTOR)
+    b_cc_tile = float(K_BASE_CORRELATION_B) + yb / float(K_DEFAULT_COLOR_FACTOR)
+    x_cc_all = jnp.broadcast_to(
+        x_cc_tile[:, None, :, None], (ht, 8, wt, 8)
+    ).reshape(ht * 8, wt * 8)[:h8, :w8, None, None]
+    b_cc_all = jnp.broadcast_to(
+        b_cc_tile[:, None, :, None], (ht, 8, wt, 8)
+    ).reshape(ht * 8, wt * 8)[:h8, :w8, None, None]
+    cy_val = coeffs[:, :, 1]
+    cx_val = coeffs[:, :, 0] - x_cc_all * cy_val
+    cb_val = coeffs[:, :, 2] - b_cc_all * cy_val
+    qy = jnp.round(cy_val * (qs_all / wy))
+    qx = jnp.round(cx_val * (qs_all * x_qm_mul / wx))
+    qb = jnp.round(cb_val * (qs_all * b_qm_mul / wb))
+    q_blk = jnp.stack([qx, qy, qb], axis=2).at[:, :, :, 0, 0].set(0.0)
+    quant_ac = jnp.transpose(q_blk, (2, 0, 3, 1, 4)).reshape(
+        3, h8 * 8, w8 * 8
+    ).astype(jnp.int32)
+    inv_gs = K_GLOBAL_SCALE_DENOM / gs
+    mul_dc = (inv_gs / qdc) * k_dc
+    cfl_dc_x = float(K_BASE_CORRELATION_X) + ytox_dc_f / float(K_DEFAULT_COLOR_FACTOR)
+    cfl_dc_b = float(K_BASE_CORRELATION_B) + ytob_dc_f / float(K_DEFAULT_COLOR_FACTOR)
+    q_dc_y = jnp.round(dc_continuous[1] / mul_dc[1])
+    q_dc_x = jnp.round(
+        (dc_continuous[0] - q_dc_y * (mul_dc[1] * cfl_dc_x))
+        / mul_dc[0]
+    )
+    q_dc_b = jnp.round(
+        (dc_continuous[2] - q_dc_y * (mul_dc[1] * cfl_dc_b))
+        / mul_dc[2]
+    )
+    dc_quant = jnp.stack([q_dc_x, q_dc_y, q_dc_b], axis=0).astype(jnp.int32)
+    return dc_quant, quant_ac
+
+  return _fn
+
+
 def init_state_from_rgb_jax(
     srgb_hwc: np.ndarray | jax.Array,
     distance: float = 1.0,
@@ -2236,11 +2529,16 @@ def init_state_from_rgb_jax(
     ytob_map: np.ndarray | None = None,
     epf_iters: int = 1,
     gab: bool = True,
+    *,
+    ac_anchors: np.ndarray | None = None,
+    ytox_dc: int = 0,
+    ytob_dc: int = 0,
 ) -> JxlVarDCTState:
   """Constructs a complete JxlVarDCTState from raw RGB [0, 1] 100% in JAX/Python.
 
   Never invokes cjxl or --dump-init on the target image; uses analytical
-  distance scaling and pure-JAX SRGBToXYB + inverse Gaborish + forward DCT.
+  distance scaling calibrated to libjxl's Quantizer::ComputeGlobalScaleAndQuant /
+  InitialQuantDC curve and pure-JAX SRGBToXYB + inverse Gaborish + forward DCT.
   """
   arr = np.asarray(srgb_hwc, dtype=np.float32)
   if arr.ndim == 3 and arr.shape[0] == 3 and arr.shape[2] != 3:
@@ -2254,28 +2552,29 @@ def init_state_from_rgb_jax(
   wt = (w8 + 7) // 8
 
   d = max(float(distance), 0.05)
-  if raw_quant_field is None and d > 2.5:
-    if d <= 8.5:
-      d_eff = 2.5 + 49.5 * (((d - 2.5) / 6.0) ** 1.75)
-    else:
-      d_eff = 52.0 + 78.0 * (((d - 8.5) / 27.5) ** 0.75)
-  else:
-    d_eff = d
-  target_scale = 1.25 / d_eff
-  default_raw_q = 16
-  global_scale = int(
-      np.clip(round(K_GLOBAL_SCALE_DENOM * target_scale / default_raw_q), 1, 65535)
-  )
+  # Smooth analytical calibration matching libjxl's InitialQuantDC(d) and
+  # Quantizer::ComputeGlobalScaleAndQuant (kQuantFieldTarget = 5..6, zero power-law explosion).
+  bt_dc = max(0.5 * d, min(d, 0.3 * ((d / 0.3) ** 0.83)))
+  qdc_float = min(1.095924047623553 / bt_dc, 50.0)
+  q_med = 0.390 / d
+  global_scale = int(np.clip(round(K_GLOBAL_SCALE_DENOM * q_med / 5.0), 1, 32768))
+  scaled_qdc = max(1, int(qdc_float * 4096.0 * 1.6))
+  if global_scale > scaled_qdc:
+    global_scale = scaled_qdc
   inv_global_scale = K_GLOBAL_SCALE_DENOM / float(global_scale)
-  quant_dc = int(np.clip(round(16.0 * (d_eff**0.12)), 4, 64))
+  quant_dc = int(np.clip(round(qdc_float * inv_global_scale), 4, 65535))
+  gab_iqf_mul = (1.0 / 0.62) if not gab else 1.0
+  default_raw_q = int(
+      np.clip(round((0.47 / d) * gab_iqf_mul * inv_global_scale), 1, 256)
+  )
 
-  x_qm_scale = 2
+  x_qm_scale = 3 if d <= 2.5 else 2
   b_qm_scale = 2
   color_factor = K_DEFAULT_COLOR_FACTOR
   base_correlation_x = K_BASE_CORRELATION_X
   base_correlation_b = K_BASE_CORRELATION_B
-  ytox_dc = 0
-  ytob_dc = 0
+  ytox_dc = int(np.clip(int(ytox_dc), -128, 127))
+  ytob_dc = int(np.clip(int(ytob_dc), -128, 127))
 
   if ac_strategy is None:
     ac_strategy = np.zeros((h8, w8), dtype=np.uint8)
@@ -2328,6 +2627,26 @@ def init_state_from_rgb_jax(
       quant_ac=np.zeros((3, h8 * 8, w8 * 8), dtype=np.int32),
       dequant_matrices={k: v.copy() for k, v in default_dq.items()},
   )
+  if ac_anchors is not None:
+    state.ac_strategy_Anchor = np.asarray(ac_anchors, dtype=bool)
+  if float(arr.max()) == 0.0 and float(arr.min()) == 0.0:
+    return state
+  if used_acs == 1:
+    dc_j, ac_j = _get_compiled_dct8_init(
+        h, w, bool(gab), int(x_qm_scale), int(b_qm_scale)
+    )(
+        jnp.asarray(arr, dtype=jnp.float32),
+        jnp.float32(global_scale),
+        jnp.float32(quant_dc),
+        jnp.asarray(state.raw_quant_field, dtype=jnp.float32),
+        jnp.asarray(state.ytox_map, dtype=jnp.float32),
+        jnp.asarray(state.ytob_map, dtype=jnp.float32),
+        jnp.float32(ytox_dc),
+        jnp.float32(ytob_dc),
+    )
+    state.dc_quant = np.asarray(dc_j, dtype=np.int32)
+    state.quant_ac = np.asarray(ac_j, dtype=np.int32)
+    return state
 
   topo = StaticVarDCTTopology(state)
   srgb_chw = jnp.array(np.transpose(arr, (2, 0, 1)), dtype=jnp.float32)
@@ -2355,36 +2674,46 @@ def init_state_from_rgb_jax(
       float(base_correlation_b)
       + jnp.array(state.ytob_map, dtype=jnp.float32) / float(color_factor)
   )
+  x_cc_grid = jnp.broadcast_to(
+      x_cc_tile[:, None, :, None], (ht, 8, wt, 8)
+  ).reshape(ht * 8, wt * 8)[:h8, :w8]
+  b_cc_grid = jnp.broadcast_to(
+      b_cc_tile[:, None, :, None], (ht, 8, wt, 8)
+  ).reshape(ht * 8, wt * 8)[:h8, :w8]
 
   dc_continuous = jnp.zeros((3, h8, w8), dtype=jnp.float32)
   q_ac_blocks = jnp.zeros((h8, w8, 3, 8, 8), dtype=jnp.float32)
 
   if topo.has_1x1:
-    by = topo.by_1x1
-    bx = topo.bx_1x1
-    px_b = xyb_blocks[by, bx].reshape(-1, 3, 64)
-    coeffs = jnp.einsum("nij,ncj->nci", topo.fwd_basis_1x1, px_b).reshape(-1, 3, 8, 8)
-    dc_continuous = dc_continuous.at[:, by, bx].set(jnp.transpose(coeffs[:, :, 0, 0], (1, 0)))
+    px_flat = xyb_blocks.reshape(h8, w8, 3, 64)
+    qs_all = qac_scale_grid[:, :, None, None]
+    x_cc_all = x_cc_grid[:, :, None, None]
+    b_cc_all = b_cc_grid[:, :, None, None]
+    for idx_1x1, grp1 in enumerate(topo.groups_1x1):
+      coeffs = jnp.einsum("ij,hwcj->hwci", grp1["fwd_basis"], px_flat).reshape(
+          h8, w8, 3, 8, 8
+      )
+      dc_s = jnp.transpose(coeffs[:, :, :, 0, 0], (2, 0, 1))
+      dq_mat = grp1["dq_mat"]
+      wy = dq_mat[1][None, None]
+      wx = dq_mat[0][None, None]
+      wb = dq_mat[2][None, None]
 
-    qs = qac_scale_grid[by, bx][:, None, None]
-    ty = by // 8
-    tx = bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
+      cy_val = coeffs[:, :, 1]
+      cx_val = coeffs[:, :, 0] - x_cc_all * cy_val
+      cb_val = coeffs[:, :, 2] - b_cc_all * cy_val
 
-    wy = topo.dq_1x1[:, 1]
-    wx = topo.dq_1x1[:, 0]
-    wb = topo.dq_1x1[:, 2]
-
-    cy_val = coeffs[:, 1]
-    cx_val = coeffs[:, 0] - x_cc * cy_val
-    cb_val = coeffs[:, 2] - b_cc * cy_val
-
-    qy = jnp.round(cy_val * (qs / wy))
-    qx = jnp.round(cx_val * (qs * x_qm_mul / wx))
-    qb = jnp.round(cb_val * (qs * b_qm_mul / wb))
-    q_blk = jnp.stack([qx, qy, qb], axis=1).at[:, :, 0, 0].set(0.0)
-    q_ac_blocks = q_ac_blocks.at[by, bx].set(q_blk)
+      qy = jnp.round(cy_val * (qs_all / wy))
+      qx = jnp.round(cx_val * (qs_all * x_qm_mul / wx))
+      qb = jnp.round(cb_val * (qs_all * b_qm_mul / wb))
+      q_blk = jnp.stack([qx, qy, qb], axis=2).at[:, :, :, 0, 0].set(0.0)
+      if idx_1x1 == 0:
+        dc_continuous = dc_s
+        q_ac_blocks = q_blk
+      else:
+        m2d = grp1["mask_2d"]
+        dc_continuous = jnp.where(m2d[None, :, :], dc_s, dc_continuous)
+        q_ac_blocks = jnp.where(m2d[:, :, None, None, None], q_blk, q_ac_blocks)
 
   for grp in topo.multi_groups:
     cy = grp["cy"]
@@ -2566,6 +2895,9 @@ def pad_mirror_2d(plane: jax.Array, pad: int) -> jax.Array:
   if pad == 0:
     return plane
   h, w = plane.shape[-2], plane.shape[-1]
+  if h >= pad and w >= pad:
+    pad_spec = [(0, 0)] * (plane.ndim - 2) + [(pad, pad), (pad, pad)]
+    return jnp.pad(plane, pad_spec, mode="symmetric")
   iy = mirror_index_1d(jnp.arange(-pad, h + pad, dtype=jnp.int32), h)
   ix = mirror_index_1d(jnp.arange(-pad, w + pad, dtype=jnp.int32), w)
   return plane[..., iy[:, None], ix[None, :]]
@@ -2622,21 +2954,34 @@ def upsample_jxl(
       precision=jax.lax.Precision.HIGHEST,
   ).reshape(c, u, u, h_in, w_in)
 
-  mins = jax.lax.reduce_window(
-      padded,
-      init_value=jnp.inf,
-      computation=jax.lax.min,
-      window_dimensions=(1, 5, 5),
-      window_strides=(1, 1, 1),
-      padding="VALID",
+  # Separable 5x5 min/max avoids XLA's slow 2D select_and_scatter in the backward pass
+  h_min = jnp.minimum(
+      jnp.minimum(
+          jnp.minimum(padded[:, :, :-4], padded[:, :, 1:-3]),
+          padded[:, :, 2:-2],
+      ),
+      jnp.minimum(padded[:, :, 3:-1], padded[:, :, 4:]),
   )
-  maxs = jax.lax.reduce_window(
-      padded,
-      init_value=-jnp.inf,
-      computation=jax.lax.max,
-      window_dimensions=(1, 5, 5),
-      window_strides=(1, 1, 1),
-      padding="VALID",
+  h_max = jnp.maximum(
+      jnp.maximum(
+          jnp.maximum(padded[:, :, :-4], padded[:, :, 1:-3]),
+          padded[:, :, 2:-2],
+      ),
+      jnp.maximum(padded[:, :, 3:-1], padded[:, :, 4:]),
+  )
+  mins = jnp.minimum(
+      jnp.minimum(
+          jnp.minimum(h_min[:, :-4, :], h_min[:, 1:-3, :]),
+          h_min[:, 2:-2, :],
+      ),
+      jnp.minimum(h_min[:, 3:-1, :], h_min[:, 4:, :]),
+  )
+  maxs = jnp.maximum(
+      jnp.maximum(
+          jnp.maximum(h_max[:, :-4, :], h_max[:, 1:-3, :]),
+          h_max[:, 2:-2, :],
+      ),
+      jnp.maximum(h_max[:, 3:-1, :], h_max[:, 4:, :]),
   )
 
   clamped = jnp.clip(raw, mins[:, None, None, :, :], maxs[:, None, None, :, :])
@@ -2702,6 +3047,34 @@ def apply_xyb_patches(
   else:
     ref_chw = ref_arr
     comp = main_arr
+
+  if (
+      len(patches) > 4
+      and alpha_ups is None
+      and all(
+          p.ref == 0
+          and int(p.x0) == int(p.x)
+          and int(p.y0) == int(p.y)
+          and int(p.blend_mode) in (PATCH_BLEND_REPLACE, PATCH_BLEND_ADD)
+          for p in patches
+      )
+  ):
+    _, h, w = comp.shape
+    w_ref = np.zeros((1, h, w), dtype=np.float32)
+    w_main = np.ones((1, h, w), dtype=np.float32)
+    for p in patches:
+      x0 = max(0, min(int(p.x), w))
+      y0 = max(0, min(int(p.y), h))
+      x1 = max(x0, min(int(p.x) + int(p.xsize), w))
+      y1 = max(y0, min(int(p.y) + int(p.ysize), h))
+      if int(p.blend_mode) == PATCH_BLEND_REPLACE:
+        w_ref[:, y0:y1, x0:x1] = 1.0
+        w_main[:, y0:y1, x0:x1] = 0.0
+      elif int(p.blend_mode) == PATCH_BLEND_ADD:
+        w_ref[:, y0:y1, x0:x1] = 1.0
+        w_main[:, y0:y1, x0:x1] = 1.0
+    comp = jnp.asarray(w_main) * comp + jnp.asarray(w_ref) * ref_chw[:, :h, :w]
+    return jnp.moveaxis(comp, 0, -1) if is_hwc else comp
 
   alpha_2d: jax.Array | None = None
   if alpha_ups is not None:
@@ -2868,15 +3241,25 @@ def ste_quantize_alpha_01(alpha_01: jax.Array, hard: bool = False) -> jax.Array:
 
 def _resolve_alpha_composite_args(
     upsampling: int | jax.Array | np.ndarray,
-    dim_shift: int,
+    dim_shift: int | jax.Array | np.ndarray,
     alpha_01: jax.Array | np.ndarray | int | None,
     alpha_dim_shift: int | None,
 ) -> tuple[int, int, jax.Array]:
-  """Resolves both `(upsampling, dim_shift, alpha_01)` and `(alpha_01, upsampling, alpha_dim_shift)` call conventions."""
+  """Resolves `(upsampling, dim_shift, alpha_01)`, `(upsampling, alpha_01, alpha_dim_shift=...)`, and `(alpha_01, upsampling, alpha_dim_shift)` call conventions."""
   ups_arr = jnp.asarray(upsampling)
+  ds_arr = jnp.asarray(dim_shift)
   if ups_arr.ndim >= 2:
     actual_alpha = jnp.asarray(upsampling, dtype=jnp.float32)
     actual_upsampling = int(dim_shift) if int(dim_shift) > 0 else 2
+    if alpha_dim_shift is not None:
+      actual_dim_shift = int(alpha_dim_shift)
+    elif alpha_01 is not None and jnp.asarray(alpha_01).ndim == 0:
+      actual_dim_shift = int(alpha_01)
+    else:
+      actual_dim_shift = 0
+  elif ds_arr.ndim >= 2:
+    actual_upsampling = int(upsampling)
+    actual_alpha = jnp.asarray(dim_shift, dtype=jnp.float32)
     if alpha_dim_shift is not None:
       actual_dim_shift = int(alpha_dim_shift)
     elif alpha_01 is not None and jnp.asarray(alpha_01).ndim == 0:

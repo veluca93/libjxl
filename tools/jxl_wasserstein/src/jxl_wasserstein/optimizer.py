@@ -91,7 +91,7 @@ with jax.ensure_compile_time_eval():
   for _cy, _cx in ((1, 1), (1, 2), (2, 2), (1, 4), (2, 4), (4, 4)):
     get_canonical_ac_scan_tables(_cy, _cx)
 
-DEFAULT_CANDIDATE_AC_STRATEGIES: tuple[int, ...] = (0, 2, 3, 4, 5, 6, 7)
+DEFAULT_CANDIDATE_AC_STRATEGIES: tuple[int, ...] = tuple(range(18))
 _DEFAULT_DC_QUANT_WEIGHTS_NP = np.asarray(
     DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32
 )
@@ -362,7 +362,7 @@ def broadcast_quant_field_to_ac_strategy(
 
 
 def validate_ac_strategy_tiling(ac_strategy: np.ndarray) -> bool:
-  """Verifies that an (H8, W8) ac_strategy grid forms a valid non-overlapping JXL tiling."""
+  """Verifies that an (H8, W8) ac_strategy grid forms a valid <=32x32 JXL tiling without crossing 64x64 CfL tiles."""
   acs = np.asarray(ac_strategy)
   if acs.ndim != 2:
     return False
@@ -373,14 +373,14 @@ def validate_ac_strategy_tiling(ac_strategy: np.ndarray) -> bool:
       if covered[by, bx]:
         continue
       s = int(acs[by, bx])
-      if s < 0 or s >= len(ACS_COVERED_BLOCKS_Y):
+      if s < 0 or s >= 18 or s >= len(ACS_COVERED_BLOCKS_Y):
         return False
       cy = int(ACS_COVERED_BLOCKS_Y[s])
       cx = int(ACS_COVERED_BLOCKS_X[s])
       if by + cy > h8 or bx + cx > w8:
         return False
-      # Multi-block transforms cannot cross 32x32-block group boundaries
-      if (by // 32) != ((by + cy - 1) // 32) or (bx // 32) != ((bx + cx - 1) // 32):
+      # Multi-block transforms cannot cross 8x8-block (64x64 px) CfL tile boundaries
+      if (by // 8) != ((by + cy - 1) // 8) or (bx // 8) != ((bx + cx - 1) // 8):
         return False
       if np.any(covered[by : by + cy, bx : bx + cx]):
         return False
@@ -393,7 +393,7 @@ def validate_ac_strategy_tiling(ac_strategy: np.ndarray) -> bool:
 def _build_uniform_candidate_ac_strategy_grid(
     h8: int, w8: int, strategy_id: int
 ) -> np.ndarray:
-  """Tiles (h8, w8) with non-overlapping blocks of strategy_id within 32x32-block groups."""
+  """Tiles (h8, w8) with non-overlapping blocks of strategy_id within 8x8-block (64x64 px) CfL tiles."""
   s = int(strategy_id)
   cy = int(ACS_COVERED_BLOCKS_Y[s])
   cx = int(ACS_COVERED_BLOCKS_X[s])
@@ -402,14 +402,14 @@ def _build_uniform_candidate_ac_strategy_grid(
     acs[:, :] = np.uint8(s)
     return acs
 
-  num_gy = (h8 + 31) // 32
-  num_gx = (w8 + 31) // 32
-  for gy in range(num_gy):
-    by0 = gy * 32
-    by1 = min((gy + 1) * 32, h8)
-    for gx in range(num_gx):
-      bx0 = gx * 32
-      bx1 = min((gx + 1) * 32, w8)
+  num_ty = (h8 + 7) // 8
+  num_tx = (w8 + 7) // 8
+  for ty in range(num_ty):
+    by0 = ty * 8
+    by1 = min((ty + 1) * 8, h8)
+    for tx in range(num_tx):
+      bx0 = tx * 8
+      bx1 = min((tx + 1) * 8, w8)
       for by in range(by0, by1 - cy + 1, cy):
         for bx in range(bx0, bx1 - cx + 1, cx):
           acs[by : by + cy, bx : bx + cx] = np.uint8(s)
@@ -428,7 +428,7 @@ def stage1_explore_ac_candidates(
     candidate_strategies: Sequence[int] | None = None,
     allow_multiblock: bool = True,
     scale_distance_with_lambda: bool = True,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     num_scales: int = 3,
     num_levels: int = 2,
 ) -> dict[int, dict[str, Any]]:
@@ -459,11 +459,11 @@ def stage1_explore_ac_candidates(
   )
 
   if candidate_strategies is not None:
-    raw_cands = [int(s) for s in candidate_strategies]
+    raw_cands = [int(s) for s in candidate_strategies if 0 <= int(s) < 18]
   elif allow_multiblock:
     raw_cands = list(DEFAULT_CANDIDATE_AC_STRATEGIES)
   else:
-    raw_cands = [0, 2, 3, 14, 15]
+    raw_cands = [0, 1, 2, 3, 12, 13, 14, 15, 16, 17]
 
   valid_cands: list[int] = []
   for s in raw_cands:
@@ -498,10 +498,10 @@ def stage1_explore_ac_candidates(
     return {k: dict(v) for k, v in _STAGE1_CACHE[cache_key].items()}
 
   acs_zero = np.zeros((h8, w8), dtype=np.uint8)
-  raw_q_base, epf_sharp_base, _ = select_quant_and_epf_jax(
+  raw_q_base, epf_sharp_base, epf_iters_base = select_quant_and_epf_jax(
       target_hwc, distance=eff_distance, ac_strategy=acs_zero
   )
-  ytox_map, ytob_map, _, _ = select_cfl_jax(target_hwc)
+  ytox_map, ytob_map, ytox_dc, ytob_dc = select_cfl_jax(target_hwc)
 
   base_state = init_state_from_rgb_jax(
       target_hwc,
@@ -511,9 +511,11 @@ def stage1_explore_ac_candidates(
       epf_sharpness=epf_sharp_base,
       ytox_map=ytox_map,
       ytob_map=ytob_map,
-      epf_iters=0,
+      epf_iters=epf_iters_base,
       gab=True,
   )
+  base_state.ytox_dc = int(ytox_dc)
+  base_state.ytob_dc = int(ytob_dc)
   base_state._orig_dequant_matrices = get_default_dequant_matrices()
   base_state.dequant_matrices = {}
   base_state.dc_quant_weights = _DEFAULT_DC_QUANT_WEIGHTS_NP.copy()
@@ -648,16 +650,18 @@ def stage2_select_non_overlapping_ac_strategy(
     *,
     allow_multiblock: bool = True,
 ) -> np.ndarray:
-  """Stage 2: Selects optimal non-overlapping AcStrategy tiling via hierarchical DP.
+  """Stage 2: Selects optimal non-overlapping <=32x32 AcStrategy tiling via hierarchical DP.
 
-  Solves the exact hierarchical non-overlapping covering DP over 1x1, 1x2, 2x1,
-  2x2, and 4x4 block transforms within each 32x32-block group (`256x256` pixels),
-  strictly respecting JXL group boundaries.
+  Solves the exact hierarchical non-overlapping covering DP over all <=32x32
+  transforms (0..17: 1x1, 1x2, 2x1, 2x2, 1x4, 4x1, 2x4, 4x2, and 4x4 blocks)
+  strictly within each 8x8-block (`64x64` pixel) CfL tile boundary.
   """
   cost_maps: dict[int, np.ndarray] = {}
   if isinstance(candidates_or_cost_maps, Mapping):
     for k, v in candidates_or_cost_maps.items():
       s_id = int(k)
+      if s_id < 0 or s_id >= 18:
+        continue
       if isinstance(v, Mapping):
         arr = v.get(
             "j_map", v.get("cost_map", v.get("spatial_j_map"))
@@ -675,6 +679,8 @@ def stage2_select_non_overlapping_ac_strategy(
                 item.get("ac_strategy_id", item.get("strategy", 0)),
             )
         )
+        if s_id < 0 or s_id >= 18:
+          continue
         arr = item.get(
             "j_map", item.get("cost_map", item.get("spatial_j_map"))
         )
@@ -713,45 +719,61 @@ def stage2_select_non_overlapping_ac_strategy(
   ac_strategy = best_1x1_id.copy()
   covered = np.zeros((h8, w8), dtype=bool)
 
+  def _solve_row_1x2(r: int, c: int) -> tuple[float, np.ndarray]:
+    c1 = float(best_1x1_cost[r, c] + best_1x1_cost[r, c + 1])
+    g1 = best_1x1_id[r, c : c + 2].copy()
+    if 7 in cost_maps:
+      c7 = float(cost_maps[7][r, c] + cost_maps[7][r, c + 1])
+      if c7 < c1:
+        return c7, np.full((2,), 7, dtype=np.uint8)
+    return c1, g1
+
+  def _solve_col_2x1(r: int, c: int) -> tuple[float, np.ndarray]:
+    c1 = float(best_1x1_cost[r, c] + best_1x1_cost[r + 1, c])
+    g1 = best_1x1_id[r : r + 2, c].copy()
+    if 6 in cost_maps:
+      c6 = float(cost_maps[6][r, c] + cost_maps[6][r + 1, c])
+      if c6 < c1:
+        return c6, np.full((2,), 6, dtype=np.uint8)
+    return c1, g1
+
+  def _solve_row_1x4(r: int, c: int) -> tuple[float, np.ndarray]:
+    ca, ga = _solve_row_1x2(r, c)
+    cb, gb = _solve_row_1x2(r, c + 2)
+    best_c = ca + cb
+    best_g = np.concatenate([ga, gb], axis=0)
+    if 9 in cost_maps:
+      c9 = float(np.sum(cost_maps[9][r, c : c + 4]))
+      if c9 < best_c:
+        return c9, np.full((4,), 9, dtype=np.uint8)
+    return best_c, best_g
+
+  def _solve_col_4x1(r: int, c: int) -> tuple[float, np.ndarray]:
+    ca, ga = _solve_col_2x1(r, c)
+    cb, gb = _solve_col_2x1(r + 2, c)
+    best_c = ca + cb
+    best_g = np.concatenate([ga, gb], axis=0)
+    if 8 in cost_maps:
+      c8 = float(np.sum(cost_maps[8][r : r + 4, c]))
+      if c8 < best_c:
+        return c8, np.full((4,), 8, dtype=np.uint8)
+    return best_c, best_g
+
   def _solve_2x2(r: int, c: int) -> tuple[float, np.ndarray]:
     best_c = float(np.sum(best_1x1_cost[r : r + 2, c : c + 2]))
     best_g = best_1x1_id[r : r + 2, c : c + 2].copy()
 
-    if 7 in cost_maps:
-      c_h = 0.0
-      g_h = np.zeros((2, 2), dtype=np.uint8)
-      for dr in (0, 1):
-        c_row_7 = float(cost_maps[7][r + dr, c] + cost_maps[7][r + dr, c + 1])
-        c_row_1 = float(
-            best_1x1_cost[r + dr, c] + best_1x1_cost[r + dr, c + 1]
-        )
-        if c_row_7 < c_row_1:
-          c_h += c_row_7
-          g_h[dr, :] = 7
-        else:
-          c_h += c_row_1
-          g_h[dr, :] = best_1x1_id[r + dr, c : c + 2]
-      if c_h < best_c:
-        best_c = c_h
-        best_g = g_h
+    cr0, gr0 = _solve_row_1x2(r, c)
+    cr1, gr1 = _solve_row_1x2(r + 1, c)
+    if cr0 + cr1 < best_c:
+      best_c = cr0 + cr1
+      best_g = np.stack([gr0, gr1], axis=0)
 
-    if 6 in cost_maps:
-      c_v = 0.0
-      g_v = np.zeros((2, 2), dtype=np.uint8)
-      for dc in (0, 1):
-        c_col_6 = float(cost_maps[6][r, c + dc] + cost_maps[6][r + 1, c + dc])
-        c_col_1 = float(
-            best_1x1_cost[r, c + dc] + best_1x1_cost[r + 1, c + dc]
-        )
-        if c_col_6 < c_col_1:
-          c_v += c_col_6
-          g_v[:, dc] = 6
-        else:
-          c_v += c_col_1
-          g_v[:, dc] = best_1x1_id[r : r + 2, c + dc]
-      if c_v < best_c:
-        best_c = c_v
-        best_g = g_v
+    cc0, gc0 = _solve_col_2x1(r, c)
+    cc1, gc1 = _solve_col_2x1(r, c + 1)
+    if cc0 + cc1 < best_c:
+      best_c = cc0 + cc1
+      best_g = np.stack([gc0, gc1], axis=1)
 
     if 4 in cost_maps:
       c_4 = float(np.sum(cost_maps[4][r : r + 2, c : c + 2]))
@@ -761,66 +783,138 @@ def stage2_select_non_overlapping_ac_strategy(
 
     return best_c, best_g
 
-  num_gy = (h8 + 31) // 32
-  num_gx = (w8 + 31) // 32
-  for gy in range(num_gy):
-    by0 = gy * 32
-    by1 = min((gy + 1) * 32, h8)
-    eff_by1 = by1 - 1 if by1 < h8 else by1
-    for gx in range(num_gx):
-      bx0 = gx * 32
-      bx1 = min((gx + 1) * 32, w8)
-      eff_bx1 = bx1 - 1 if bx1 < w8 else bx1
+  def _solve_2x4(r: int, c: int) -> tuple[float, np.ndarray]:
+    c_l, g_l = _solve_2x2(r, c)
+    c_r, g_r = _solve_2x2(r, c + 2)
+    best_c = c_l + c_r
+    best_g = np.concatenate([g_l, g_r], axis=1)
 
-      for r in range(by0, eff_by1 - 3, 4):
-        for c in range(bx0, eff_bx1 - 3, 4):
-          c00, g00 = _solve_2x2(r, c)
-          c01, g01 = _solve_2x2(r, c + 2)
-          c10, g10 = _solve_2x2(r + 2, c)
-          c11, g11 = _solve_2x2(r + 2, c + 2)
-          c_quads = c00 + c01 + c10 + c11
-          if 5 in cost_maps:
-            c_32 = float(np.sum(cost_maps[5][r : r + 4, c : c + 4]))
-          else:
-            c_32 = float("inf")
-          if c_32 < c_quads:
-            ac_strategy[r : r + 4, c : c + 4] = 5
-          else:
-            ac_strategy[r : r + 2, c : c + 2] = g00
-            ac_strategy[r : r + 2, c + 2 : c + 4] = g01
-            ac_strategy[r + 2 : r + 4, c : c + 2] = g10
-            ac_strategy[r + 2 : r + 4, c + 2 : c + 4] = g11
+    cr0, gr0 = _solve_row_1x4(r, c)
+    cr1, gr1 = _solve_row_1x4(r + 1, c)
+    if cr0 + cr1 < best_c:
+      best_c = cr0 + cr1
+      best_g = np.stack([gr0, gr1], axis=0)
+
+    if 11 in cost_maps:
+      c11 = float(np.sum(cost_maps[11][r : r + 2, c : c + 4]))
+      if c11 < best_c:
+        best_c = c11
+        best_g = np.full((2, 4), 11, dtype=np.uint8)
+
+    return best_c, best_g
+
+  def _solve_4x2(r: int, c: int) -> tuple[float, np.ndarray]:
+    c_t, g_t = _solve_2x2(r, c)
+    c_b, g_b = _solve_2x2(r + 2, c)
+    best_c = c_t + c_b
+    best_g = np.concatenate([g_t, g_b], axis=0)
+
+    cc0, gc0 = _solve_col_4x1(r, c)
+    cc1, gc1 = _solve_col_4x1(r, c + 1)
+    if cc0 + cc1 < best_c:
+      best_c = cc0 + cc1
+      best_g = np.stack([gc0, gc1], axis=1)
+
+    if 10 in cost_maps:
+      c10 = float(np.sum(cost_maps[10][r : r + 4, c : c + 2]))
+      if c10 < best_c:
+        best_c = c10
+        best_g = np.full((4, 2), 10, dtype=np.uint8)
+
+    return best_c, best_g
+
+  def _solve_4x4(r: int, c: int) -> tuple[float, np.ndarray]:
+    ct, gt = _solve_2x4(r, c)
+    cb, gb = _solve_2x4(r + 2, c)
+    best_c = ct + cb
+    best_g = np.concatenate([gt, gb], axis=0)
+
+    cl, gl = _solve_4x2(r, c)
+    cr, gr = _solve_4x2(r, c + 2)
+    if cl + cr < best_c:
+      best_c = cl + cr
+      best_g = np.concatenate([gl, gr], axis=1)
+
+    if 5 in cost_maps:
+      c5 = float(np.sum(cost_maps[5][r : r + 4, c : c + 4]))
+      if c5 < best_c:
+        best_c = c5
+        best_g = np.full((4, 4), 5, dtype=np.uint8)
+
+    return best_c, best_g
+
+  # Partition strictly within each 8x8-block (64x64 px) CfL tile so no multi-block
+  # transform ever crosses a CfL tile boundary.
+  num_ty = (h8 + 7) // 8
+  num_tx = (w8 + 7) // 8
+  for ty in range(num_ty):
+    by0 = ty * 8
+    by1 = min((ty + 1) * 8, h8)
+    for tx in range(num_tx):
+      bx0 = tx * 8
+      bx1 = min((tx + 1) * 8, w8)
+
+      for r in range(by0, by1 - 3, 4):
+        for c in range(bx0, bx1 - 3, 4):
+          _, g4 = _solve_4x4(r, c)
+          ac_strategy[r : r + 4, c : c + 4] = g4
           covered[r : r + 4, c : c + 4] = True
 
-      for r in range(by0, eff_by1 - 1, 2):
-        for c in range(bx0, eff_bx1 - 1, 2):
+      for r in range(by0, by1 - 1, 2):
+        for c in range(bx0, bx1 - 3, 4):
+          if np.any(covered[r : r + 2, c : c + 4]):
+            continue
+          _, g24 = _solve_2x4(r, c)
+          ac_strategy[r : r + 2, c : c + 4] = g24
+          covered[r : r + 2, c : c + 4] = True
+
+      for r in range(by0, by1 - 3, 4):
+        for c in range(bx0, bx1 - 1, 2):
+          if np.any(covered[r : r + 4, c : c + 2]):
+            continue
+          _, g42 = _solve_4x2(r, c)
+          ac_strategy[r : r + 4, c : c + 2] = g42
+          covered[r : r + 4, c : c + 2] = True
+
+      for r in range(by0, by1 - 1, 2):
+        for c in range(bx0, bx1 - 1, 2):
           if np.any(covered[r : r + 2, c : c + 2]):
             continue
           _, g2 = _solve_2x2(r, c)
           ac_strategy[r : r + 2, c : c + 2] = g2
           covered[r : r + 2, c : c + 2] = True
 
-      if 7 in cost_maps:
-        for r in range(by0, eff_by1):
-          for c in range(bx0, eff_bx1 - 1):
-            if np.any(covered[r : r + 1, c : c + 2]):
-              continue
-            c_7 = float(cost_maps[7][r, c] + cost_maps[7][r, c + 1])
-            c_1 = float(best_1x1_cost[r, c] + best_1x1_cost[r, c + 1])
-            if c_7 < c_1:
-              ac_strategy[r, c : c + 2] = 7
-              covered[r, c : c + 2] = True
+      for r in range(by0, by1):
+        for c in range(bx0, bx1 - 3, 4):
+          if np.any(covered[r : r + 1, c : c + 4]):
+            continue
+          _, gr4 = _solve_row_1x4(r, c)
+          ac_strategy[r, c : c + 4] = gr4
+          covered[r, c : c + 4] = True
 
-      if 6 in cost_maps:
-        for r in range(by0, eff_by1 - 1):
-          for c in range(bx0, eff_bx1):
-            if np.any(covered[r : r + 2, c : c + 1]):
-              continue
-            c_6 = float(cost_maps[6][r, c] + cost_maps[6][r + 1, c])
-            c_1 = float(best_1x1_cost[r, c] + best_1x1_cost[r + 1, c])
-            if c_6 < c_1:
-              ac_strategy[r : r + 2, c] = 6
-              covered[r : r + 2, c] = True
+      for r in range(by0, by1 - 3, 4):
+        for c in range(bx0, bx1):
+          if np.any(covered[r : r + 4, c : c + 1]):
+            continue
+          _, gc4 = _solve_col_4x1(r, c)
+          ac_strategy[r : r + 4, c] = gc4
+          covered[r : r + 4, c] = True
+
+      for r in range(by0, by1):
+        for c in range(bx0, bx1 - 1, 2):
+          if np.any(covered[r : r + 1, c : c + 2]):
+            continue
+          _, gr2 = _solve_row_1x2(r, c)
+          ac_strategy[r, c : c + 2] = gr2
+          covered[r, c : c + 2] = True
+
+      for r in range(by0, by1 - 1, 2):
+        for c in range(bx0, bx1):
+          if np.any(covered[r : r + 2, c : c + 1]):
+            continue
+          _, gc2 = _solve_col_2x1(r, c)
+          ac_strategy[r : r + 2, c] = gc2
+          covered[r : r + 2, c] = True
 
   return ac_strategy
 
@@ -893,15 +987,31 @@ def select_quant_and_epf_jax(
   med_e_np = float(np.median(ehf_smooth)) + 1e-5
   rel_act = (ehf_smooth + 1e-5) / med_e_np
 
-  raw_q_float = 16.0 * np.clip(rel_act**0.12, 0.75, 1.35)
+  d_clamped = max(float(distance), 0.05)
+  bt_dc = max(0.5 * d_clamped, min(d_clamped, 0.3 * ((d_clamped / 0.3) ** 0.83)))
+  qdc_float = min(1.095924047623553 / bt_dc, 50.0)
+  gs_est = int(np.clip(round(65536.0 * (0.390 / d_clamped) / 5.0), 1, 32768))
+  scaled_qdc = max(1, int(qdc_float * 4096.0 * 1.6))
+  if gs_est > scaled_qdc:
+    gs_est = scaled_qdc
+  inv_gs_est = 65536.0 / float(gs_est)
+  gab_boost = 1.0 + 0.38 * float(np.clip((0.85 - d_clamped) / 0.50, 0.0, 1.0))
+  base_raw_q = (0.546 / d_clamped) * gab_boost * inv_gs_est
+
+  raw_q_float = base_raw_q * np.clip(rel_act**0.12, 0.75, 1.35)
   raw_q_np = np.clip(np.round(raw_q_float), 1, 256).astype(np.int32)
   raw_q_np = broadcast_quant_field_to_ac_strategy(raw_q_np, ac_strategy)
+
+  if float(distance) < 0.5:
+    epf_sharpness = np.zeros((h8, w8), dtype=np.uint8)
+    epf_iters = 0
+    return raw_q_np, epf_sharpness, epf_iters
 
   epf_sharpness = np.full((h8, w8), 2, dtype=np.uint8)
   for by in range(h8):
     for bx in range(w8):
       s = int(ac_strategy[by, bx])
-      if s in (4, 5):
+      if s in (4, 5, 8, 9, 10, 11):
         epf_sharpness[by, bx] = 3
       elif e_hf[by, bx] > 1.8 * med_e_np and aniso_np[by, bx] < 0.25:
         epf_sharpness[by, bx] = 0
@@ -912,9 +1022,7 @@ def select_quant_and_epf_jax(
       else:
         epf_sharpness[by, bx] = 2
 
-  epf_iters = 0 if float(distance) < 0.2 else 1
-  if epf_iters == 0:
-    epf_sharpness[:] = 0
+  epf_iters = 1 if float(distance) < 3.0 else 2
   return raw_q_np, epf_sharpness, epf_iters
 
 
@@ -1167,91 +1275,154 @@ def compute_continuous_latents_jax(
   dc_continuous = jnp.zeros((3, h8, w8), dtype=jnp.float32)
   q_ac_blocks = jnp.zeros((h8, w8, 3, 8, 8), dtype=jnp.float32)
 
-  if topo.has_1x1:
-    by = topo.by_1x1
-    bx = topo.bx_1x1
-    px_b = xyb_blocks[by, bx].reshape(-1, 3, 64)
-    coeffs = jnp.einsum("nij,ncj->nci", topo.fwd_basis_1x1, px_b).reshape(
-        -1, 3, 8, 8
-    )
-    dc_continuous = dc_continuous.at[:, by, bx].set(
-        jnp.transpose(coeffs[:, :, 0, 0], (1, 0))
-    )
+  ntiles_y, ntiles_x = x_cc_tile.shape
+  x_cc_grid = jnp.broadcast_to(
+      x_cc_tile[:, None, :, None], (ntiles_y, 8, ntiles_x, 8)
+  ).reshape(ntiles_y * 8, ntiles_x * 8)[:h8, :w8]
+  b_cc_grid = jnp.broadcast_to(
+      b_cc_tile[:, None, :, None], (ntiles_y, 8, ntiles_x, 8)
+  ).reshape(ntiles_y * 8, ntiles_x * 8)[:h8, :w8]
 
-    qs = qac_scale_grid[by, bx][:, None, None]
-    ty = by // 8
-    tx = bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
-
-    wy = topo.dq_1x1[:, 1]
-    wx = topo.dq_1x1[:, 0]
-    wb = topo.dq_1x1[:, 2]
-
-    cy_val = coeffs[:, 1]
-    cx_val = coeffs[:, 0] - x_cc * cy_val
-    cb_val = coeffs[:, 2] - b_cc * cy_val
-
-    qy = cy_val * (qs / wy)
-    qx = cx_val * (qs * x_qm_mul / wx)
-    qb = cb_val * (qs * b_qm_mul / wb)
-    q_blk = jnp.stack([qx, qy, qb], axis=1).at[:, :, 0, 0].set(0.0)
-    q_ac_blocks = q_ac_blocks.at[by, bx].set(q_blk)
+  if len(topo.groups_1x1) > 0:
+    px_flat = xyb_blocks.reshape(h8, w8, 3, 64)
+    qs_all = qac_scale_grid[:, :, None, None]
+    x_cc_all = x_cc_grid[:, :, None, None]
+    b_cc_all = b_cc_grid[:, :, None, None]
+    for grp1 in topo.groups_1x1:
+      with jax.ensure_compile_time_eval():
+        mask_2d = jnp.asarray(grp1["mask_2d"], dtype=jnp.float32)
+      coeffs = jnp.einsum("ij,hwcj->hwci", grp1["fwd_basis"], px_flat).reshape(
+          h8, w8, 3, 8, 8
+      )
+      dc_continuous = dc_continuous + (
+          jnp.transpose(coeffs[:, :, :, 0, 0], (2, 0, 1)) * mask_2d[None, :, :]
+      )
+      dq_mat = grp1["dq_mat"]
+      wy = dq_mat[1][None, None]
+      wx = dq_mat[0][None, None]
+      wb = dq_mat[2][None, None]
+      cy_val = coeffs[:, :, 1]
+      cx_val = coeffs[:, :, 0] - x_cc_all * cy_val
+      cb_val = coeffs[:, :, 2] - b_cc_all * cy_val
+      qy = cy_val * (qs_all / wy)
+      qx = cx_val * (qs_all * x_qm_mul / wx)
+      qb = cb_val * (qs_all * b_qm_mul / wb)
+      q_blk = jnp.stack([qx, qy, qb], axis=2).at[:, :, :, 0, 0].set(0.0)
+      q_ac_blocks = q_ac_blocks + q_blk * mask_2d[:, :, None, None, None]
 
   for grp in topo.multi_groups:
     cy = grp["cy"]
     cx = grp["cx"]
     cy_l = grp["cy_l"]
     cx_l = grp["cx_l"]
-    by = grp["by"]
-    bx = grp["bx"]
-    m = by.shape[0]
-    dy = jnp.arange(cy)[None, :, None]
-    dx = jnp.arange(cx)[None, None, :]
-
-    px_sub = xyb_blocks[by[:, None, None] + dy, bx[:, None, None] + dx]
-    px_full = jnp.transpose(px_sub, (0, 3, 1, 4, 2, 5)).reshape(
-        m, 3, 8 * cy, 8 * cx
-    )
-    coeffs_rc = jnp.einsum(
-        "ij,mcjk,lk->mcil", grp["dct_r"], px_full, grp["dct_c"]
-    )
-    coeffs = jnp.swapaxes(coeffs_rc, -2, -1) if cy >= cx else coeffs_rc
-
-    llf = coeffs[:, :, :cy_l, :cx_l]
-    llf_rc = jnp.swapaxes(llf, -2, -1) if cy >= cx else llf
-    llf_scaled = llf_rc * (
-        grp["rs_from_llf_y"][None, None, :, None]
-        * grp["rs_from_llf_x"][None, None, None, :]
-    )
-    dc_sub = jnp.einsum(
-        "ij,mcjk,lk->mcil", grp["idct_cy"], llf_scaled, grp["idct_cx"]
-    )
-    dc_continuous = dc_continuous.at[
-        :, by[:, None, None] + dy, bx[:, None, None] + dx
-    ].set(jnp.transpose(dc_sub, (1, 0, 2, 3)))
-
-    qs = qac_scale_grid[by, bx][:, None, None]
-    ty = by // 8
-    tx = bx // 8
-    x_cc = x_cc_tile[ty, tx][:, None, None]
-    b_cc = b_cc_tile[ty, tx][:, None, None]
-
     dq_mat = grp["dq_mat"]
-    cy_val = coeffs[:, 1]
-    cx_val = coeffs[:, 0] - x_cc * cy_val
-    cb_val = coeffs[:, 2] - b_cc * cy_val
+    if grp.get("grid_aligned", False):
+      nh_cell = grp["nh_cell"]
+      nw_cell = grp["nw_cell"]
+      h_lim = grp["h_lim"]
+      w_lim = grp["w_lim"]
+      with jax.ensure_compile_time_eval():
+        blk_mask = jnp.asarray(grp["blk_mask"], dtype=jnp.float32)
+      px_cell = xyb_blocks[:h_lim, :w_lim].reshape(
+          nh_cell, cy, nw_cell, cx, 3, 8, 8
+      )
+      px_full = jnp.transpose(px_cell, (0, 2, 4, 1, 5, 3, 6)).reshape(
+          nh_cell, nw_cell, 3, 8 * cy, 8 * cx
+      )
+      coeffs_rc = jnp.einsum(
+          "ij,abcjk,lk->abcil", grp["dct_r"], px_full, grp["dct_c"]
+      )
+      coeffs = jnp.swapaxes(coeffs_rc, -2, -1) if cy >= cx else coeffs_rc
+      llf = coeffs[:, :, :, :cy_l, :cx_l]
+      llf_rc = jnp.swapaxes(llf, -2, -1) if cy >= cx else llf
+      llf_scaled = llf_rc * (
+          grp["rs_from_llf_y"][None, None, None, :, None]
+          * grp["rs_from_llf_x"][None, None, None, None, :]
+      )
+      dc_sub = jnp.einsum(
+          "ij,abcjk,lk->abcil", grp["idct_cy"], llf_scaled, grp["idct_cx"]
+      )
+      dc_grid = (
+          jnp.transpose(dc_sub, (2, 0, 3, 1, 4)).reshape(3, h_lim, w_lim)
+          * blk_mask[None, :, :]
+      )
+      if h_lim == h8 and w_lim == w8:
+        dc_continuous = dc_continuous + dc_grid
+      else:
+        dc_continuous = dc_continuous.at[:, :h_lim, :w_lim].add(dc_grid)
 
-    qy = cy_val * (qs / dq_mat[1][None])
-    qx = cx_val * (qs * x_qm_mul / dq_mat[0][None])
-    qb = cb_val * (qs * b_qm_mul / dq_mat[2][None])
-    q_canon = jnp.stack([qx, qy, qb], axis=1).at[:, :, :cy_l, :cx_l].set(0.0)
-    q_sub = jnp.transpose(
-        q_canon.reshape(m, 3, cy, 8, cx, 8), (0, 2, 4, 1, 3, 5)
-    )
-    q_ac_blocks = q_ac_blocks.at[
-        by[:, None, None] + dy, bx[:, None, None] + dx
-    ].set(q_sub)
+      qs = qac_scale_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      x_cc = x_cc_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      b_cc = b_cc_grid[:h_lim:cy, :w_lim:cx][:, :, None, None]
+      cy_val = coeffs[:, :, 1]
+      cx_val = coeffs[:, :, 0] - x_cc * cy_val
+      cb_val = coeffs[:, :, 2] - b_cc * cy_val
+      qy = cy_val * (qs / dq_mat[1][None, None])
+      qx = cx_val * (qs * x_qm_mul / dq_mat[0][None, None])
+      qb = cb_val * (qs * b_qm_mul / dq_mat[2][None, None])
+      q_canon = (
+          jnp.stack([qx, qy, qb], axis=2).at[:, :, :, :cy_l, :cx_l].set(0.0)
+      )
+      q_sub = (
+          jnp.transpose(
+              q_canon.reshape(nh_cell, nw_cell, 3, cy, 8, cx, 8),
+              (0, 3, 1, 5, 2, 4, 6),
+          ).reshape(h_lim, w_lim, 3, 8, 8)
+          * blk_mask[:, :, None, None, None]
+      )
+      if h_lim == h8 and w_lim == w8:
+        q_ac_blocks = q_ac_blocks + q_sub
+      else:
+        q_ac_blocks = q_ac_blocks.at[:h_lim, :w_lim].add(q_sub)
+    else:
+      by = grp["by"]
+      bx = grp["bx"]
+      m = by.shape[0]
+      dy = jnp.arange(cy)[None, :, None]
+      dx = jnp.arange(cx)[None, None, :]
+
+      px_sub = xyb_blocks[by[:, None, None] + dy, bx[:, None, None] + dx]
+      px_full = jnp.transpose(px_sub, (0, 3, 1, 4, 2, 5)).reshape(
+          m, 3, 8 * cy, 8 * cx
+      )
+      coeffs_rc = jnp.einsum(
+          "ij,mcjk,lk->mcil", grp["dct_r"], px_full, grp["dct_c"]
+      )
+      coeffs = jnp.swapaxes(coeffs_rc, -2, -1) if cy >= cx else coeffs_rc
+
+      llf = coeffs[:, :, :cy_l, :cx_l]
+      llf_rc = jnp.swapaxes(llf, -2, -1) if cy >= cx else llf
+      llf_scaled = llf_rc * (
+          grp["rs_from_llf_y"][None, None, :, None]
+          * grp["rs_from_llf_x"][None, None, None, :]
+      )
+      dc_sub = jnp.einsum(
+          "ij,mcjk,lk->mcil", grp["idct_cy"], llf_scaled, grp["idct_cx"]
+      )
+      dc_continuous = dc_continuous.at[
+          :, by[:, None, None] + dy, bx[:, None, None] + dx
+      ].set(jnp.transpose(dc_sub, (1, 0, 2, 3)))
+
+      qs = qac_scale_grid[by, bx][:, None, None]
+      ty = by // 8
+      tx = bx // 8
+      x_cc = x_cc_tile[ty, tx][:, None, None]
+      b_cc = b_cc_tile[ty, tx][:, None, None]
+
+      cy_val = coeffs[:, 1]
+      cx_val = coeffs[:, 0] - x_cc * cy_val
+      cb_val = coeffs[:, 2] - b_cc * cy_val
+
+      qy = cy_val * (qs / dq_mat[1][None])
+      qx = cx_val * (qs * x_qm_mul / dq_mat[0][None])
+      qb = cb_val * (qs * b_qm_mul / dq_mat[2][None])
+      q_canon = jnp.stack([qx, qy, qb], axis=1).at[:, :, :cy_l, :cx_l].set(0.0)
+      q_sub = jnp.transpose(
+          q_canon.reshape(m, 3, cy, 8, cx, 8), (0, 2, 4, 1, 3, 5)
+      )
+      q_ac_blocks = q_ac_blocks.at[
+          by[:, None, None] + dy, bx[:, None, None] + dx
+      ].set(q_sub)
 
   inv_global_scale = K_GLOBAL_SCALE_DENOM / float(state.global_scale)
   mul_dc = [inv_global_scale / float(state.quant_dc) * k for k in K_DC_QUANT]
@@ -1400,7 +1571,7 @@ def rd_lambda_to_distance(
   if not scale_distance_with_lambda and base_distance is not None:
     return float(np.clip(base_distance, 0.1, 15.0))
   d0 = 1.0 if base_distance is None else float(base_distance)
-  d_eff = d0 * ((lam / 0.1) ** 0.45)
+  d_eff = d0 * ((lam / 0.08) ** 0.62)
   return float(np.clip(d_eff, 0.15, 12.0))
 
 
@@ -1541,22 +1712,80 @@ def _get_vgg_params(vgg_params: Any = None) -> Any:
   return _CACHED_VGG_PARAMS
 
 
+def _build_base_dequant_3hw_np(topo: StaticVarDCTTopology) -> np.ndarray:
+  """Builds the (3, H8*8, W8*8) default dequant weight plane matching `topo.ac_strategy`."""
+  h8, w8 = topo.h8, topo.w8
+  default_dq = get_default_dequant_matrices()
+  w_blk = np.broadcast_to(default_dq[0][None, None], (h8, w8, 3, 8, 8)).copy()
+  for grp1 in topo.groups_1x1:
+    s_id = int(grp1["s"])
+    m2d = np.asarray(grp1["mask_2d"], dtype=bool)
+    w_blk[m2d] = default_dq[s_id]
+  for grp in topo.multi_groups:
+    s_id = int(grp["s"])
+    cy, cx = int(grp["cy"]), int(grp["cx"])
+    dq_s = default_dq[s_id].reshape(3, cy, 8, cx, 8).transpose(1, 3, 0, 2, 4)
+    bys = np.asarray(grp["by"], dtype=np.int32)
+    bxs = np.asarray(grp["bx"], dtype=np.int32)
+    for by, bx in zip(bys.tolist(), bxs.tolist()):
+      w_blk[by : by + cy, bx : bx + cx] = dq_s
+  return w_blk.transpose(2, 0, 3, 1, 4).reshape(3, h8 * 8, w8 * 8).astype(np.float32)
+
+
 def _effective_q_ac(
     q_ac_init: jax.Array,
     delta_q_ac: jax.Array,
     raw_quant_tl: jax.Array,
     raw_quant_init_tl: jax.Array,
     ac_dequant_scale: jax.Array | None = None,
+    *,
+    ytox_cur: jax.Array | None = None,
+    ytob_cur: jax.Array | None = None,
+    ytox_init: jax.Array | None = None,
+    ytob_init: jax.Array | None = None,
+    wy_over_wx: jax.Array | None = None,
+    wy_over_wb: jax.Array | None = None,
+    color_factor: float = float(K_DEFAULT_COLOR_FACTOR),
 ) -> jax.Array:
-  """Couples unquantized DCT (q_ac_init + delta_q_ac) with raw_quant_field and AC dequant scale."""
+  """Couples unquantized DCT (q_ac_init + delta_q_ac) with raw_quant_field, AC dequant scale, and CfL deltas."""
   rq_ratio = raw_quant_tl / jnp.maximum(raw_quant_init_tl, 1.0)
-  rq_ratio_px = jnp.repeat(jnp.repeat(rq_ratio, 8, axis=0), 8, axis=1)[
-      None, :, :
-  ]
+  h8_t, w8_t = rq_ratio.shape
+  rq_ratio_px = jnp.broadcast_to(
+      rq_ratio[:, None, :, None], (h8_t, 8, w8_t, 8)
+  ).reshape(1, h8_t * 8, w8_t * 8)
   q_ac_eff = (q_ac_init + delta_q_ac) * rq_ratio_px
   if ac_dequant_scale is not None:
-    ac_s = jnp.clip(ac_dequant_scale, 0.65, 1.55)[:, None, None]
-    q_ac_eff = q_ac_eff / ac_s
+    ac_s = jnp.clip(ac_dequant_scale, 0.65, 1.55)
+    q_ac_eff = q_ac_eff / ac_s[:, None, None]
+  else:
+    ac_s = None
+  if (
+      ytox_cur is not None
+      and ytob_cur is not None
+      and ytox_init is not None
+      and ytob_init is not None
+      and wy_over_wx is not None
+      and wy_over_wb is not None
+  ):
+    ht_t, wt_t = ytox_cur.shape
+    dx_tile = (
+        jnp.clip(ytox_cur, -128.0, 127.0) - jnp.clip(ytox_init, -128.0, 127.0)
+    ) / jnp.float32(color_factor)
+    db_tile = (
+        jnp.clip(ytob_cur, -128.0, 127.0) - jnp.clip(ytob_init, -128.0, 127.0)
+    ) / jnp.float32(color_factor)
+    dx_px = jnp.broadcast_to(
+        dx_tile[:, None, :, None], (ht_t, 64, wt_t, 64)
+    ).reshape(ht_t * 64, wt_t * 64)[: h8_t * 8, : w8_t * 8]
+    db_px = jnp.broadcast_to(
+        db_tile[:, None, :, None], (ht_t, 64, wt_t, 64)
+    ).reshape(ht_t * 64, wt_t * 64)[: h8_t * 8, : w8_t * 8]
+    s_yx = (ac_s[1] / ac_s[0]) if ac_s is not None else 1.0
+    s_yb = (ac_s[1] / ac_s[2]) if ac_s is not None else 1.0
+    u_y = q_ac_eff[1]
+    u_x = q_ac_eff[0] - dx_px * u_y * (wy_over_wx * s_yx)
+    u_b = q_ac_eff[2] - db_px * u_y * (wy_over_wb * s_yb)
+    q_ac_eff = jnp.stack([u_x, u_y, u_b], axis=0)
   return q_ac_eff
 
 
@@ -1592,26 +1821,48 @@ def _make_topo_step_fns(
   base_dq_j = {
       s: jnp.asarray(default_dq[s], dtype=jnp.float32) for s in used_s
   }
+  base_w_3hw_np = _build_base_dequant_3hw_np(topo)
+  x_qm_mul = float(1.25 ** (init_state.x_qm_scale - 2.0))
+  b_qm_mul = float(1.25 ** (init_state.b_qm_scale - 2.0))
+  wy_over_wx_j = jnp.asarray(
+      (base_w_3hw_np[1] * x_qm_mul) / np.maximum(base_w_3hw_np[0], 1e-12),
+      dtype=jnp.float32,
+  )
+  wy_over_wb_j = jnp.asarray(
+      (base_w_3hw_np[1] * b_qm_mul) / np.maximum(base_w_3hw_np[2], 1e-12),
+      dtype=jnp.float32,
+  )
+  cf_val = float(init_state.color_factor)
 
-  topo_grad = copy.copy(topo)
-  topo_grad.epf_iters = 0
+  topo_grad = topo
 
   @jax.jit
   def _forward_ste(
       params: dict[str, jax.Array],
       q_ac_init: jax.Array,
       raw_quant_init_tl: jax.Array,
+      ytox_init: jax.Array,
+      ytob_init: jax.Array,
   ) -> jax.Array:
-    rq_tl = jnp.clip(
-        params["raw_quant"][topo.tl_by_grid, topo.tl_bx_grid], 1.0, 256.0
+    rq_tl = topo.broadcast_top_left_grid(
+        jnp.clip(params["raw_quant"], 1.0, 256.0)
     )
     ac_s_param = params.get("ac_dequant_scale") if opt_custom_dequant else None
+    ytox_use = jnp.clip(params["ytox"], -128.0, 127.0)
+    ytob_use = jnp.clip(params["ytob"], -128.0, 127.0)
     q_ac_eff = _effective_q_ac(
         q_ac_init,
         params["delta_q_ac"],
         rq_tl,
         raw_quant_init_tl,
         ac_s_param,
+        ytox_cur=ytox_use,
+        ytob_cur=ytob_use,
+        ytox_init=ytox_init,
+        ytob_init=ytob_init,
+        wy_over_wx=wy_over_wx_j,
+        wy_over_wb=wy_over_wb_j,
+        color_factor=cf_val,
     )
     if opt_custom_dequant and "dc_dequant_scale" in params:
       dc_scale = jnp.clip(params["dc_dequant_scale"], 0.5, 2.0)
@@ -1625,8 +1876,6 @@ def _make_topo_step_fns(
       dq_mats_ste = {s: base_dq_j[s] * ac_scale for s in used_s}
     else:
       dq_mats_ste = None
-    ytox_use = jnp.clip(params["ytox"], -128.0, 127.0)
-    ytob_use = jnp.clip(params["ytob"], -128.0, 127.0)
     lut_f = (
         jnp.clip(params["noise_lut_q"], 0.0, 45.0)
         / jnp.float32(NOISE_PRECISION)
@@ -1654,17 +1903,33 @@ def _make_topo_step_fns(
       params: dict[str, jax.Array],
       q_ac_init: jax.Array,
       raw_quant_init_tl: jax.Array,
+      ytox_init: jax.Array,
+      ytob_init: jax.Array,
       grad_recon_chw: jax.Array,
       lam_f: jax.Array,
       ac_rate_weight: float = 1.0,
+      cluster_blend: jax.Array = jnp.float32(0.0),
   ) -> tuple[jax.Array, dict[str, jax.Array]]:
     def _loss(p: dict[str, jax.Array]) -> tuple[jax.Array, jax.Array]:
-      rq_tl = jnp.clip(
-          p["raw_quant"][topo.tl_by_grid, topo.tl_bx_grid], 1.0, 256.0
+      rq_tl = topo.broadcast_top_left_grid(
+          jnp.clip(p["raw_quant"], 1.0, 256.0)
       )
       ac_s_param = p.get("ac_dequant_scale") if opt_custom_dequant else None
+      ytox_use = jnp.clip(p["ytox"], -128.0, 127.0)
+      ytob_use = jnp.clip(p["ytob"], -128.0, 127.0)
       q_ac_eff = _effective_q_ac(
-          q_ac_init, p["delta_q_ac"], rq_tl, raw_quant_init_tl, ac_s_param
+          q_ac_init,
+          p["delta_q_ac"],
+          rq_tl,
+          raw_quant_init_tl,
+          ac_s_param,
+          ytox_cur=ytox_use,
+          ytob_cur=ytob_use,
+          ytox_init=ytox_init,
+          ytob_init=ytob_init,
+          wy_over_wx=wy_over_wx_j,
+          wy_over_wb=wy_over_wb_j,
+          color_factor=cf_val,
       )
       if opt_custom_dequant and "dc_dequant_scale" in p:
         dc_scale = jnp.clip(p["dc_dequant_scale"], 0.5, 2.0)
@@ -1678,8 +1943,6 @@ def _make_topo_step_fns(
         dq_mats_ste = {s: base_dq_j[s] * ac_scale for s in used_s}
       else:
         dq_mats_ste = None
-      ytox_use = jnp.clip(p["ytox"], -128.0, 127.0)
-      ytob_use = jnp.clip(p["ytob"], -128.0, 127.0)
       lut_f = (
           jnp.clip(p["noise_lut_q"], 0.0, 45.0)
           / jnp.float32(NOISE_PRECISION)
@@ -1709,14 +1972,31 @@ def _make_topo_step_fns(
           p["q_dc"]
       ) * (1.0 - ac_rate_weight)
       q_ac_eff_r = _effective_q_ac(
-          q_ac_init, d_ac_r, rq_tl, raw_quant_init_tl, ac_s_param
+          q_ac_init,
+          d_ac_r,
+          rq_tl,
+          raw_quant_init_tl,
+          ac_s_param,
+          ytox_cur=ytox_use,
+          ytob_cur=ytob_use,
+          ytox_init=ytox_init,
+          ytob_init=ytob_init,
+          wy_over_wx=wy_over_wx_j,
+          wy_over_wb=wy_over_wb_j,
+          color_factor=cf_val,
       )
       q_dc_eff_r = (
           q_dc_r / jnp.clip(p["dc_dequant_scale"], 0.5, 2.0)[:, None, None]
           if (opt_custom_dequant and "dc_dequant_scale" in p)
           else q_dc_r
       )
-      ac_bits = soft_ac_rate_bits(q_ac_eff_r, topology=topo_grad, tau=0.20)
+      ac_bits = soft_ac_rate_bits(
+          q_ac_eff_r,
+          topology=topo_grad,
+          tau=0.20,
+          raw_quant_field=rq_tl,
+          cluster_blend=cluster_blend,
+      )
       dc_bits = soft_dc_rate_bits(
           q_dc_eff_r, ac_strategy=init_state.ac_strategy, tau=0.12
       )
@@ -2065,7 +2345,7 @@ def optimize_single_frame(
     enable_custom_dequant: bool | None = None,
     dequant_matrices: dict[int, np.ndarray] | None = None,
     scale_distance_with_lambda: bool = True,
-    log2_sigma: float = 2.0,
+    log2_sigma: float = 1.0,
     num_scales: int = 3,
     num_levels: int = 2,
     checkpoint_interval: int | None = None,
@@ -2132,7 +2412,7 @@ def optimize_single_frame(
   raw_quant_field, epf_sharpness, epf_iters = select_quant_and_epf_jax(
       target_hwc, distance=eff_distance, ac_strategy=stage2_acs
   )
-  ytox_map, ytob_map, _, _ = select_cfl_jax(target_hwc)
+  ytox_map, ytob_map, ytox_dc, ytob_dc = select_cfl_jax(target_hwc)
   init_state = init_state_from_rgb_jax(
       target_hwc,
       distance=eff_distance,
@@ -2144,6 +2424,8 @@ def optimize_single_frame(
       epf_iters=epf_iters,
       gab=True,
   )
+  init_state.ytox_dc = int(ytox_dc)
+  init_state.ytob_dc = int(ytob_dc)
   init_state._orig_dequant_matrices = get_default_dequant_matrices()
   init_state.dequant_matrices = {}
   init_state.dc_quant_weights = _DEFAULT_DC_QUANT_WEIGHTS_NP.copy()
@@ -2399,7 +2681,9 @@ def optimize_single_frame(
         if (enable_noise and step_idx <= stage3_joint_steps)
         else latents
     )
-    recon_chw_ste = forward_ste_fn(latents_fwd, q_ac_init, raw_quant_init_tl)
+    recon_chw_ste = forward_ste_fn(
+        latents_fwd, q_ac_init, raw_quant_init_tl, ytox_init, ytob_init
+    )
     _, grad_recon_ls = _jit_wd_val_and_grad_chw(
         params_vgg,
         recon_chw_ste,
@@ -2422,13 +2706,19 @@ def optimize_single_frame(
     else:
       grad_recon = grad_recon_ls
 
+    use_mc_blend = jnp.float32(
+        1.0 if (step_idx > stage3_joint_steps and h8 * w8 >= 64) else 0.0
+    )
     bpp_s, grads = surrogate_grad_fn(
         latents_fwd,
         q_ac_init,
         raw_quant_init_tl,
+        ytox_init,
+        ytob_init,
         grad_recon,
         lam_eff,
         ac_rate_w,
+        use_mc_blend,
     )
     if is_non_dct_init:
       q_ac_cur = q_ac_init + latents["delta_q_ac"]
@@ -2493,12 +2783,30 @@ def optimize_single_frame(
           latents["raw_quant"][topo.tl_by_grid, topo.tl_bx_grid], 1.0, 256.0
       )
       ac_s_cur = latents["ac_dequant_scale"] if use_custom_dequant else None
+      base_w_3hw_np_cur = _build_base_dequant_3hw_np(topo)
+      x_qm_m_cur = float(1.25 ** (init_state.x_qm_scale - 2.0))
+      b_qm_m_cur = float(1.25 ** (init_state.b_qm_scale - 2.0))
       q_ac_eff_cur = _effective_q_ac(
           q_ac_init,
           latents["delta_q_ac"],
           rq_tl_cur,
           raw_quant_init_tl,
           ac_s_cur,
+          ytox_cur=latents["ytox"],
+          ytob_cur=latents["ytob"],
+          ytox_init=ytox_init,
+          ytob_init=ytob_init,
+          wy_over_wx=jnp.asarray(
+              (base_w_3hw_np_cur[1] * x_qm_m_cur)
+              / np.maximum(base_w_3hw_np_cur[0], 1e-12),
+              dtype=jnp.float32,
+          ),
+          wy_over_wb=jnp.asarray(
+              (base_w_3hw_np_cur[1] * b_qm_m_cur)
+              / np.maximum(base_w_3hw_np_cur[2], 1e-12),
+              dtype=jnp.float32,
+          ),
+          color_factor=float(init_state.color_factor),
       )
       dq_mats_cur = dequant_matrices
       if (
@@ -2720,7 +3028,9 @@ def init_pure_jax_wd_state(
         stage1_steps=1,
     )
     _WD_STATE_ACS_CACHE[acs_cache_key] = ac_strategy.copy()
-  epf_sharp = np.zeros((h8, w8), dtype=np.uint8)
+  _, epf_sharp, epf_iters = select_quant_and_epf_jax(
+      arr, distance=float(distance), ac_strategy=ac_strategy
+  )
 
   y_blocks = xyb_pad[1].reshape(h8, 8, w8, 8).transpose(0, 2, 1, 3)
   y_std = np.std(y_blocks, axis=(2, 3))
@@ -2760,7 +3070,7 @@ def init_pure_jax_wd_state(
           tx * 64 : min((tx + 1) * 64, w8 * 8),
       ]
       xs = x_ac_only[
-          ty * 64 : min((tx + 1) * 64, h8 * 8),
+          ty * 64 : min((ty + 1) * 64, h8 * 8),
           tx * 64 : min((tx + 1) * 64, w8 * 8),
       ]
       bs = b_ac_only[
@@ -2793,8 +3103,8 @@ def init_pure_jax_wd_state(
       epf_sharpness=epf_sharp,
       ytox_map=ytox_map,
       ytob_map=ytob_map,
-      epf_iters=0,
-      gab=False,
+      epf_iters=epf_iters,
+      gab=True,
   )
   state._orig_dequant_matrices = get_default_dequant_matrices()
   state.dequant_matrices = {}
@@ -2933,7 +3243,7 @@ def _single_compile_1x1_loss_and_grad(
     feats_rec = multiscale_vgg_features(
         vgg_params, srgb_chw, num_scales=(len(feats_ref) - 1) // 5
     )
-    ls_map = jnp.full((h_orig, w_orig), 4.0, dtype=jnp.float32)
+    ls_map = jnp.full((h_orig, w_orig), 1.0, dtype=jnp.float32)
     wd_val = multi_wasserstein_distortion(feats_ref, feats_rec, ls_map)
 
     q_ac_5d = jnp.transpose(
@@ -2963,12 +3273,12 @@ def _make_mb_point_step_fn(
       state.width,
       bytes(np.asarray(state.ac_strategy, dtype=np.uint8).tobytes()),
       bool(state.gab),
+      int(state.epf_iters),
   )
   if key in _COMPILED_MB_SOLVERS:
     return _COMPILED_MB_SOLVERS[key]
 
-  topo_grad = copy.copy(topo)
-  topo_grad.epf_iters = 0
+  topo_grad = topo
   num_px = float(state.height * state.width)
 
   @jax.jit
@@ -3015,6 +3325,7 @@ def _make_mb_point_step_fn(
       x_qm_f: jax.Array,
       b_qm_f: jax.Array,
       lam_rate: jax.Array,
+      cluster_blend: jax.Array = jnp.float32(0.0),
   ) -> dict[str, jax.Array]:
     def _surrogate(p: dict[str, jax.Array]) -> jax.Array:
       r_chw = reconstruct_single_frame(
@@ -3036,7 +3347,13 @@ def _make_mb_point_step_fn(
           output_layout="CHW",
       )
       wd_lin = jnp.sum(jax.lax.stop_gradient(grad_recon) * r_chw)
-      ac_b = soft_ac_rate_bits(p["u_ac"], topology=topo_grad, tau=0.20)
+      ac_b = soft_ac_rate_bits(
+          p["u_ac"],
+          topology=topo_grad,
+          tau=0.20,
+          raw_quant_field=raw_q_j,
+          cluster_blend=cluster_blend,
+      )
       dc_b = soft_dc_rate_bits(
           p["u_dc"], ac_strategy=state.ac_strategy, tau=0.12
       )
@@ -3275,10 +3592,12 @@ def optimize_rate_wd_point(
     opt = optax.adam(learning_rate=eff_lr)
     opt_state = opt.init(params)
 
-    has_multiblock = bool(topo.multi_groups)
+    has_multiblock = bool(
+        topo.multi_groups or state.epf_iters > 0 or state.gab
+    )
     dc_w_j = jnp.asarray(state.dc_quant_weights, dtype=jnp.float32)
     eff_scales_m = (len(feats_ref) - 1) // 5
-    ls_map_m = jnp.full((h, w), 4.0, dtype=jnp.float32)
+    ls_map_m = jnp.full((h, w), 1.0, dtype=jnp.float32)
     target_feats_list = list(feats_ref)
 
     if not has_multiblock:
@@ -3332,6 +3651,9 @@ def optimize_rate_wd_point(
             eff_scales_m,
             2,
         )
+        mc_blend_m = jnp.float32(
+            1.0 if (step > int(0.7 * eff_steps) and h8 * w8 >= 64) else 0.0
+        )
         grads = mb_grad_fn(
             params,
             grad_recon,
@@ -3344,6 +3666,7 @@ def optimize_rate_wd_point(
             x_qm_f,
             b_qm_f,
             lam_rate,
+            mc_blend_m,
         )
 
       masked_grads = {

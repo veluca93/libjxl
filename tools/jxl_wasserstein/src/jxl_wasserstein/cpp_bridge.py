@@ -20,7 +20,12 @@ HELPER_BIN = REPO_ROOT / "build" / "tools" / "jxl_wasserstein_helper"
 CJXL_BIN = REPO_ROOT / "build" / "tools" / "cjxl"
 DJXL_BIN = REPO_ROOT / "build" / "tools" / "djxl"
 JXLINFO_BIN = REPO_ROOT / "build" / "tools" / "jxlinfo"
-JXL_CLI_BIN = Path("/usr/local/google/home/veluca/jxl-rs/target/release/jxl_cli")
+_JXL_CLI_DEFAULT = Path("/usr/local/google/home/veluca/jxl-rs/target/release/jxl_cli")
+JXL_CLI_BIN = (
+    _JXL_CLI_DEFAULT
+    if _JXL_CLI_DEFAULT.exists()
+    else (Path.home() / "jxl-rs" / "target" / "release" / "jxl_cli")
+)
 
 STATE_MAGIC = b"JXLWST01"
 PATCHES_MAGIC = b"JXLWPT01"
@@ -228,6 +233,22 @@ class JxlVarDCTState:
         "dc_quant_weights",
         np.asarray(self.dc_quant_weights, dtype=np.float32).reshape(3).copy(),
     )
+    acs_arr = np.asarray(self.ac_strategy, dtype=np.int32)
+    if np.all(acs_arr == 0):
+      anc = np.ones((self.h8, self.w8), dtype=bool)
+    else:
+      anc = np.zeros((self.h8, self.w8), dtype=bool)
+      vis = np.zeros((self.h8, self.w8), dtype=bool)
+      for by in range(self.h8):
+        for bx in range(self.w8):
+          if vis[by, bx]:
+            continue
+          s_id = int(acs_arr[by, bx])
+          cy = ACS_COVERED_BLOCKS_Y[s_id] if 0 <= s_id < len(ACS_COVERED_BLOCKS_Y) else 1
+          cx = ACS_COVERED_BLOCKS_X[s_id] if 0 <= s_id < len(ACS_COVERED_BLOCKS_X) else 1
+          anc[by, bx] = True
+          vis[by : by + cy, bx : bx + cx] = True
+    object.__setattr__(self, "ac_strategy_Anchor", anc)
 
   def copy(self) -> JxlVarDCTState:
     copied = JxlVarDCTState(
@@ -279,6 +300,11 @@ class JxlVarDCTState:
     dc_grid = getattr(self, "_dc_quant_grid", None)
     if dc_grid is not None and np.asarray(self.dc_quant).ndim != 3:
       object.__setattr__(copied, "_dc_quant_grid", np.asarray(dc_grid).copy())
+    anc = getattr(self, "ac_strategy_Anchor", None)
+    if anc is not None:
+      object.__setattr__(
+          copied, "ac_strategy_Anchor", np.asarray(anc, dtype=bool).copy()
+      )
     return copied
 
 
@@ -477,9 +503,9 @@ def roundtrip_custom_dequant_matrices(
         pred_dct[:, :ys, :xs] = ref[:, :ys, :xs]
       rt_dequant[s] = pred_dct
     else:
-      qtable_den = np.float32(1.0 / 65536.0)
+      qtable_den = np.float32(1.0 / 16384.0)
       qtable = np.clip(
-          np.rint(np.maximum(1e-7, arr) / qtable_den), 1.0, 65535.0
+          np.rint(np.maximum(1e-7, arr) / qtable_den), 1.0, 32767.0
       )
       rt_dequant[s] = (qtable * qtable_den).astype(np.float32)
 
@@ -698,7 +724,9 @@ def save_state_bin(
     dc_w = _get_dc_quant_weights(state)
     chunks.append(np.ascontiguousarray(dc_w, dtype="<f4").tobytes())
 
-  out_path.write_bytes(b"".join(chunks))
+  with open(out_path, "wb") as f:
+    for chunk in chunks:
+      f.write(chunk)
   return out_path
 
 
@@ -720,7 +748,9 @@ def save_patches_bin(patches: Sequence[PatchEntry], path: str | Path) -> Path:
             int(p.blend_mode),
         )
     )
-  out_path.write_bytes(b"".join(chunks))
+  with open(out_path, "wb") as f:
+    for chunk in chunks:
+      f.write(chunk)
   return out_path
 
 
@@ -757,6 +787,9 @@ def _format_noise_lut(noise_lut: Sequence[float]) -> str:
   return ",".join(f"{float(v):.8g}" for v in noise_lut)
 
 
+_SHM_DIR: str | None = "/dev/shm" if Path("/dev/shm").is_dir() else None
+
+
 def dump_init_state(
     input_image: str | Path | np.ndarray,
     distance: float = 1.0,
@@ -765,7 +798,7 @@ def dump_init_state(
     output_jxl: str | Path | None = None,
 ) -> JxlVarDCTState:
   """Runs `jxl_wasserstein_helper --dump-init` on an image path or RGB array."""
-  with tempfile.TemporaryDirectory(prefix="jxlw_dump_") as tmpdir:
+  with tempfile.TemporaryDirectory(prefix="jxlw_dump_", dir=_SHM_DIR) as tmpdir:
     tmp = Path(tmpdir)
     if isinstance(input_image, np.ndarray):
       arr = np.asarray(input_image)
@@ -809,7 +842,7 @@ def encode_single_frame(
     noise_lut: Sequence[float] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
   """Serializes a single VarDCT frame state into a valid .jxl bitstream."""
-  with tempfile.TemporaryDirectory(prefix="jxlw_single_") as tmpdir:
+  with tempfile.TemporaryDirectory(prefix="jxlw_single_", dir=_SHM_DIR) as tmpdir:
     tmp = Path(tmpdir)
     if isinstance(state, JxlVarDCTState):
       state_path = save_state_bin(
@@ -853,7 +886,7 @@ def encode_patches_composite(
     noise_lut: Sequence[float] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
   """Serializes a 2-frame ReferenceOnly + PatchDictionary composite .jxl bitstream."""
-  with tempfile.TemporaryDirectory(prefix="jxlw_patches_") as tmpdir:
+  with tempfile.TemporaryDirectory(prefix="jxlw_patches_", dir=_SHM_DIR) as tmpdir:
     tmp = Path(tmpdir)
     if isinstance(ref_state, JxlVarDCTState):
       ref_path = save_state_bin(
@@ -918,7 +951,7 @@ def encode_alpha_composite(
     alpha_clamp: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
   """Serializes a 2-frame ReferenceOnly + ExtraChannel::kAlpha XYB PatchDictionary composite .jxl bitstream."""
-  with tempfile.TemporaryDirectory(prefix="jxlw_alpha_") as tmpdir:
+  with tempfile.TemporaryDirectory(prefix="jxlw_alpha_", dir=_SHM_DIR) as tmpdir:
     tmp = Path(tmpdir)
     if isinstance(ref_state, JxlVarDCTState):
       ref_path = save_state_bin(

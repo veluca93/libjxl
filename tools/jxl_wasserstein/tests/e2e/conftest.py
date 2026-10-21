@@ -310,7 +310,7 @@ def _install_fast_jit_wd() -> None:
       image_a_01: jax.Array,
       image_b_01: jax.Array,
       vgg_params: Any,
-      log2_sigma: float | jax.Array = 2.0,
+      log2_sigma: float | jax.Array = 1.0,
       num_levels: int = 2,
       num_scales: int = 3,
   ) -> jax.Array:
@@ -352,7 +352,7 @@ def _install_fast_jit_wd() -> None:
   fast_compute_wd._is_fast_jit_wd = True  # type: ignore[attr-defined]
 
   def fast_get_compiled_wd_only(num_levels: int = 2, num_scales: int = 3):
-    def _fn(a, b, p, ls=2.0, num_levels=num_levels, num_scales=num_scales):
+    def _fn(a, b, p, ls=1.0, num_levels=num_levels, num_scales=num_scales):
       return fast_compute_wd(
           a, b, p, log2_sigma=ls, num_levels=num_levels, num_scales=num_scales
       )
@@ -362,7 +362,7 @@ def _install_fast_jit_wd() -> None:
   def fast_get_compiled_wd_val_and_grad(
       num_levels: int = 2, num_scales: int = 3
   ):
-    def _fn(a, b, p, ls=2.0, num_levels=num_levels, num_scales=num_scales):
+    def _fn(a, b, p, ls=1.0, num_levels=num_levels, num_scales=num_scales):
       img_a = jnp.asarray(a, dtype=jnp.float32)
       img_b = jnp.asarray(b, dtype=jnp.float32)
       ls_arr = jnp.asarray(ls, dtype=jnp.float32)
@@ -400,6 +400,12 @@ def _install_fast_jit_wd() -> None:
       return orig_multiscale_vgg_features(params, image_01, num_scales=num_scales)
     return _jit_multiscale_vgg(int(num_scales))(params, arr)
 
+  wd_mod._orig_compute_wd_unpatched = orig_compute_wd  # type: ignore[attr-defined]
+  vgg_mod._orig_multiscale_vgg_unpatched = orig_multiscale_vgg_features  # type: ignore[attr-defined]
+  vgg_mod._orig_select_num_scales_unpatched = orig_select_num_scales  # type: ignore[attr-defined]
+  comp_mod._orig_get_compiled_wd_only_unpatched = comp_mod._get_compiled_wd_only  # type: ignore[attr-defined]
+  comp_mod._orig_get_compiled_wd_val_and_grad_unpatched = comp_mod._get_compiled_wd_val_and_grad  # type: ignore[attr-defined]
+
   wd_mod.compute_wd = fast_compute_wd
   opt_mod.compute_wd = fast_compute_wd
   comp_mod.compute_wd = fast_compute_wd
@@ -416,6 +422,48 @@ def _install_fast_jit_wd() -> None:
   )
   comp_mod._get_compiled_wd_only = fast_get_compiled_wd_only
   comp_mod._get_compiled_wd_val_and_grad = fast_get_compiled_wd_val_and_grad
+
+
+def _set_fast_jit_wd_enabled(enabled: bool) -> None:
+  import jxl_wasserstein
+  import jxl_wasserstein.benchmark as bm_mod
+  import jxl_wasserstein.cli as cli_mod
+  import jxl_wasserstein.compositing as comp_mod
+  import jxl_wasserstein.optimizer as opt_mod
+  import jxl_wasserstein.vgg as vgg_mod
+  import jxl_wasserstein.wasserstein as wd_mod
+
+  if enabled:
+    _install_fast_jit_wd()
+    return
+  orig_wd = getattr(wd_mod, "_orig_compute_wd_unpatched", None)
+  if orig_wd is not None:
+    wd_mod.compute_wd = orig_wd
+    opt_mod.compute_wd = orig_wd
+    comp_mod.compute_wd = orig_wd
+    bm_mod.compute_wd = orig_wd
+    cli_mod.compute_wd = orig_wd
+    jxl_wasserstein.compute_wd = orig_wd
+  orig_mv = getattr(vgg_mod, "_orig_multiscale_vgg_unpatched", None)
+  if orig_mv is not None:
+    vgg_mod.multiscale_vgg_features = orig_mv
+    jxl_wasserstein.multiscale_vgg_features = orig_mv
+  orig_sns = getattr(vgg_mod, "_orig_select_num_scales_unpatched", None)
+  if orig_sns is not None:
+    opt_mod.select_num_scales = orig_sns
+    bm_mod.select_num_scales = orig_sns
+    cli_mod.select_num_scales = orig_sns
+  orig_wdo = getattr(comp_mod, "_orig_get_compiled_wd_only_unpatched", None)
+  if orig_wdo is not None:
+    comp_mod._get_compiled_wd_only = orig_wdo
+  orig_wdg = getattr(comp_mod, "_orig_get_compiled_wd_val_and_grad_unpatched", None)
+  if orig_wdg is not None:
+    comp_mod._get_compiled_wd_val_and_grad = orig_wdg
+
+
+def pytest_runtest_setup(item: Any) -> None:
+  is_e2e = "/e2e/" in str(getattr(item, "fspath", "")).replace("\\", "/")
+  _set_fast_jit_wd_enabled(is_e2e)
 
 
 _install_fast_jit_wd()

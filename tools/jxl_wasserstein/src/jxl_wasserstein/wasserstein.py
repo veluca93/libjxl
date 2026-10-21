@@ -201,16 +201,38 @@ def multi_wasserstein_distortion(
   return dist
 
 
+@functools.partial(jax.jit, static_argnames=("eff_scales", "num_levels"))
+def _jit_compute_wd_impl(
+    img_a: jax.Array,
+    img_b: jax.Array,
+    vgg_params: Any,
+    ls_map: jax.Array,
+    eff_scales: int,
+    num_levels: int,
+) -> jax.Array:
+  from jxl_wasserstein.vgg import multiscale_vgg_features
+
+  features_a = multiscale_vgg_features(
+      vgg_params, jnp.transpose(img_a, (2, 0, 1)), num_scales=eff_scales
+  )
+  features_b = multiscale_vgg_features(
+      vgg_params, jnp.transpose(img_b, (2, 0, 1)), num_scales=eff_scales
+  )
+  return multi_wasserstein_distortion(
+      features_a, features_b, ls_map, num_levels=num_levels
+  )
+
+
 def compute_wd(
     image_a_01: jax.Array,
     image_b_01: jax.Array,
     vgg_params: Any,
-    log2_sigma: float | jax.Array = 2.0,
+    log2_sigma: float | jax.Array = 1.0,
     num_levels: int = 2,
     num_scales: int = 3,
 ) -> jax.Array:
   """Computes multi-scale VGG-16 Wasserstein Distortion on (H, W, 3) sRGB [0, 1] images."""
-  from jxl_wasserstein.vgg import multiscale_vgg_features, select_num_scales
+  from jxl_wasserstein.vgg import select_num_scales
 
   img_a = jnp.asarray(image_a_01, dtype=jnp.float32)
   img_b = jnp.asarray(image_b_01, dtype=jnp.float32)
@@ -241,14 +263,8 @@ def compute_wd(
     )
 
   eff_scales = select_num_scales(h, w, max_scales=num_scales)
-  features_a = multiscale_vgg_features(
-      vgg_params, jnp.transpose(img_a, (2, 0, 1)), num_scales=eff_scales
-  )
-  features_b = multiscale_vgg_features(
-      vgg_params, jnp.transpose(img_b, (2, 0, 1)), num_scales=eff_scales
-  )
-  return multi_wasserstein_distortion(
-      features_a, features_b, ls_map, num_levels=num_levels
+  return _jit_compute_wd_impl(
+      img_a, img_b, vgg_params, ls_map, int(eff_scales), int(num_levels)
   )
 
 
@@ -257,7 +273,7 @@ def compute_spatial_wd_map(
     img_b: jax.Array,
     vgg_params: Any,
     block_size: int = 8,
-    log2_sigma: float | jax.Array = 4.0,
+    log2_sigma: float | jax.Array = 1.0,
     num_levels: int = 2,
     num_scales: int = 3,
 ) -> tuple[jax.Array, jax.Array]:

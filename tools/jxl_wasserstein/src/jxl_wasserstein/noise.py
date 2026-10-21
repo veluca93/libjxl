@@ -107,27 +107,53 @@ def generate_raw_noise_planes_np(
   num_gx = math.ceil(w / gdim)
   num_gy = math.ceil(h / gdim)
 
+  tile_groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
   for gy in range(num_gy):
     y0 = gy * gdim
     ysize = min(gdim, h - y0)
     for gx in range(num_gx):
       x0 = gx * gdim
       xsize = min(gdim, w - x0)
-      rng = Xorshift128Plus(
-          int(visible_frame_index),
-          int(nonvisible_frame_index),
-          x0,
-          y0,
-      )
+      tile_groups.setdefault((ysize, xsize), []).append((y0, x0))
+
+  golden = np.uint64(0x9E3779B97F4A7C15)
+  u1 = np.uint64(int(visible_frame_index) & 0xFFFFFFFF)
+  u2 = np.uint64(int(nonvisible_frame_index) & 0xFFFFFFFF)
+  seed12 = ((u1 << np.uint64(32)) + u2) + golden
+
+  with np.errstate(over="ignore"):
+    for (ysize, xsize), coords in tile_groups.items():
+      nt = len(coords)
+      y0_arr = np.array([c[0] for c in coords], dtype=np.uint64)
+      x0_arr = np.array([c[1] for c in coords], dtype=np.uint64)
+      seed34 = ((x0_arr << np.uint64(32)) + y0_arr) + golden
+
+      s0 = np.zeros((nt, 8), dtype=np.uint64)
+      s1 = np.zeros((nt, 8), dtype=np.uint64)
+      s0[:, 0] = _splitmix64_u64(np.full(nt, seed12, dtype=np.uint64))
+      s1[:, 0] = _splitmix64_u64(seed34)
+      for i in range(1, 8):
+        s0[:, i] = _splitmix64_u64(s0[:, i - 1])
+        s1[:, i] = _splitmix64_u64(s1[:, i - 1])
+
       batches_per_row = math.ceil(xsize / 16)
-      for c in range(3):
-        for y in range(ysize):
-          if batches_per_row == 1:
-            row_vals = rng.fill_f32_batch()[:xsize]
-          else:
-            row_chunks = [rng.fill_f32_batch() for _ in range(batches_per_row)]
-            row_vals = np.concatenate(row_chunks, axis=0)[:xsize]
-          planes[c, y0 + y, x0 : x0 + xsize] = row_vals
+      total_steps = 3 * ysize * batches_per_row
+      out_u64 = np.empty((total_steps, nt, 8), dtype=np.uint64)
+      for step in range(total_steps):
+        s1_c = s0
+        s0_c = s1
+        out_u64[step] = s1_c + s0_c
+        s0 = s0_c
+        s1_t = s1_c ^ (s1_c << np.uint64(23))
+        s1 = s1_t ^ s0_c ^ (s1_t >> np.uint64(18)) ^ (s0_c >> np.uint64(5))
+
+      u32_bits = (out_u64.view(np.uint32) >> np.uint32(9)) | np.uint32(0x3F800000)
+      floats = u32_bits.view(np.float32)  # (total_steps, nt, 16)
+      floats_tile = np.transpose(
+          floats.reshape(3, ysize, batches_per_row, nt, 16), (3, 0, 1, 2, 4)
+      ).reshape(nt, 3, ysize, batches_per_row * 16)[:, :, :, :xsize]
+      for idx_t, (y0, x0) in enumerate(coords):
+        planes[:, y0 : y0 + ysize, x0 : x0 + xsize] = floats_tile[idx_t]
 
   planes.setflags(write=False)
   return planes
@@ -240,9 +266,11 @@ def eval_noise_strength_lut(
       NUM_NOISE_POINTS - 2,
   )
   frac_x = scaled_vx - floor_int.astype(jnp.float32)
-  low = lut[floor_int]
-  hi = lut[floor_int + 1]
-  interpolated = low + frac_x * (hi - low)
+  idx = jnp.arange(NUM_NOISE_POINTS, dtype=jnp.int32)
+  w_low = (floor_int[..., None] == idx).astype(jnp.float32)
+  w_hi = ((floor_int + 1)[..., None] == idx).astype(jnp.float32)
+  w = w_low * (jnp.float32(1.0) - frac_x[..., None]) + w_hi * frac_x[..., None]
+  interpolated = jnp.dot(w, lut)
   return jnp.clip(interpolated, jnp.float32(0.0), jnp.float32(1.0))
 
 
