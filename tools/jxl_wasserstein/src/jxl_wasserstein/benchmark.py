@@ -50,11 +50,14 @@ from jxl_wasserstein.vgg import (
 )
 from jxl_wasserstein.wasserstein import compute_wd
 
-DEFAULT_CORPUS_ROOT = Path(
-    "/usr/local/google/home/veluca/libjxl/image-corpus"
+_CANDIDATE_ROOTS = (
+    Path("/usr/local/google/home/veluca/libjxl/image-corpus"),
+    Path.home() / "image-corpus",
+    Path("/home/luca/image-corpus"),
 )
-DEFAULT_KODAK_DIR = Path(
-    "/usr/local/google/home/veluca/libjxl/image-corpus/qoi_benchmark_suite/photo_kodak"
+DEFAULT_CORPUS_ROOT = next((p for p in _CANDIDATE_ROOTS if p.is_dir()), _CANDIDATE_ROOTS[0])
+DEFAULT_KODAK_DIR = (
+    DEFAULT_CORPUS_ROOT / "qoi_benchmark_suite" / "photo_kodak"
 )
 DEFAULT_BENCHMARK_DISTANCES: tuple[float, ...] = (1.4, 2.4, 4.0, 6.8)
 DEFAULT_KODAK_SUBSET: tuple[str, ...] = (
