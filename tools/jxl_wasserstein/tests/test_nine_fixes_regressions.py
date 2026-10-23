@@ -458,3 +458,55 @@ def test_high_rate_encode_achieves_strong_butteraugli_and_ssimulacra2(vgg_params
       ba_3 = float(ba_lines[1].split(":")[-1].strip())
       assert ba_max < 1.0, f"Expected Butteraugli max < 1.0 at d=0.18, got {ba_max:.3f}"
       assert ba_3 < 0.45, f"Expected Butteraugli 3-norm < 0.45 at d=0.18, got {ba_3:.3f}"
+
+
+def test_flower_foveon_auto_selects_multires_and_noise(vgg_params):
+  """Verifies mode='auto' selects multi-resolution (U>1) + noise synthesis on flower_foveon."""
+  repo_root = Path(CJXL_BIN).resolve().parents[2]
+  flower_img = repo_root / "image-corpus/imagecompression.info.rgb8/flower_foveon.ppm.png"
+  if flower_img.exists():
+    full_u8 = np.asarray(Image.open(flower_img).convert("RGB"), dtype=np.uint8)
+    # 512x768 crop spanning the sharp petal boundary and noisy dark bokeh background
+    crop_u8 = np.ascontiguousarray(full_u8[256:768, 1280:2048])
+  else:
+    rng = np.random.default_rng(42)
+    yy, xx = np.meshgrid(
+        np.linspace(0.0, 1.0, 512, dtype=np.float32),
+        np.linspace(0.0, 1.0, 512, dtype=np.float32),
+        indexing="ij",
+    )
+    fg = (xx < 0.38).astype(np.float32)
+    bg_rgb = np.stack([0.14 + 0.03 * yy, 0.20 + 0.04 * yy, 0.10 + 0.02 * xx], axis=-1)
+    fg_rgb = np.stack(
+        [
+            0.78 + 0.14 * np.sin(26.0 * np.pi * xx) * np.cos(22.0 * np.pi * yy),
+            0.22 + 0.08 * np.cos(20.0 * np.pi * yy),
+            0.48 + 0.10 * np.sin(24.0 * np.pi * xx),
+        ],
+        axis=-1,
+    )
+    base = fg[:, :, None] * fg_rgb + (1.0 - fg[:, :, None]) * bg_rgb
+    grain = rng.normal(0.0, 0.012, size=base.shape).astype(np.float32)
+    crop_u8 = np.round(np.clip(base + grain, 0.01, 0.99) * 255.0).astype(np.uint8)
+
+  res = compositing.encode_image_to_jxl(
+      crop_u8,
+      distance=1.30,
+      mode="auto",
+      steps=2,
+      verify_decoders=True,
+      vgg_params=vgg_params,
+  )
+  assert res.mode_selected in ("patches", "alpha"), (
+      f"Expected multi-res mode ('patches' or 'alpha') on flower_foveon, got {res.mode_selected}"
+  )
+  assert res.upsampling > 1, f"Expected upsampling > 1, got {res.upsampling}"
+  assert res.has_noise is True, "Expected automatic noise synthesis to be enabled"
+  assert res.noise_lut is not None and max(res.noise_lut) > 0.0
+  assert res.psnr_djxl_vs_jxlrs >= 45.0
+  single_cands = [c for c in res.all_candidates if c["mode"] == "single"]
+  assert single_cands, "Expected single-frame baseline in all_candidates"
+  assert res.rd_cost < float(single_cands[0]["rd_cost"]), (
+      f"Expected selected multi-res rd_cost ({res.rd_cost:.5f}) < "
+      f"single rd_cost ({single_cands[0]['rd_cost']:.5f})"
+  )

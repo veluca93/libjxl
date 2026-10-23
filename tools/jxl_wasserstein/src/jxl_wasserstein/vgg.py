@@ -66,11 +66,13 @@ class VggBlock(nn.Module):
 
   @nn.compact
   def __call__(self, x: Array) -> Array:
-    for _ in range(self.num_layers):
-      x = nn.Conv(
+    conv_cls = nn.remat(nn.Conv, prevent_cse=False)
+    for layer_idx in range(self.num_layers):
+      x = conv_cls(
           features=self.num_features,
           kernel_size=(3, 3),
           padding="same",
+          name=f"Conv_{layer_idx}",
       )(x)
       x = nn.relu(x)
     return x

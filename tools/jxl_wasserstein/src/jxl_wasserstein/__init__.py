@@ -6,6 +6,8 @@ import importlib
 import os
 from typing import Any
 
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
 if "--xla_gpu_deterministic_ops=true" not in os.environ.get("XLA_FLAGS", ""):
   os.environ["XLA_FLAGS"] = (
       f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_deterministic_ops=true".strip()

@@ -83,6 +83,8 @@ from jxl_wasserstein.wasserstein import (
     compute_spatial_wd_map,
     compute_wd,
     multi_wasserstein_distortion,
+    stream_vgg_spatial_wd_against_targets,
+    stream_vgg_wd_against_targets,
 )
 
 # Pre-warm canonical AC scan table cache in eager mode outside @jax.jit so
@@ -142,11 +144,13 @@ def _jit_wd_eval_chw(
     eff_scales: int,
     num_levels: int,
 ) -> jax.Array:
-  recon_feats = multiscale_vgg_features(
-      vgg_params, recon_chw, num_scales=eff_scales
-  )
-  return multi_wasserstein_distortion(
-      recon_feats, target_features, ls_map, num_levels=num_levels
+  return stream_vgg_wd_against_targets(
+      vgg_params,
+      recon_chw,
+      target_features,
+      ls_map,
+      eff_scales=eff_scales,
+      num_levels=num_levels,
   )
 
 
@@ -160,11 +164,13 @@ def _jit_wd_val_and_grad_chw(
     num_levels: int,
 ) -> tuple[jax.Array, jax.Array]:
   def _wd_of_recon(r_chw: jax.Array) -> jax.Array:
-    recon_feats = multiscale_vgg_features(
-        vgg_params, r_chw, num_scales=eff_scales
-    )
-    return multi_wasserstein_distortion(
-        recon_feats, target_features, ls_map, num_levels=num_levels
+    return stream_vgg_wd_against_targets(
+        vgg_params,
+        r_chw,
+        target_features,
+        ls_map,
+        eff_scales=eff_scales,
+        num_levels=num_levels,
     )
 
   return jax.value_and_grad(_wd_of_recon)(recon_chw)
@@ -184,81 +190,16 @@ def _jit_spatial_wd_map_chw(
     num_levels: int,
 ) -> tuple[jax.Array, jax.Array]:
   """Evaluates scalar WD and (H8, W8) additive per-block WD map reusing target_features."""
-  recon_feats = multiscale_vgg_features(
-      vgg_params, recon_chw, num_scales=eff_scales
-  )
-  wd_total, intermediates = multi_wasserstein_distortion(
-      recon_feats,
+  return stream_vgg_spatial_wd_against_targets(
+      vgg_params,
+      recon_chw,
       target_features,
       ls_map,
+      h8=h8,
+      w8=w8,
+      eff_scales=eff_scales,
       num_levels=num_levels,
-      return_intermediates=True,
   )
-  wd_block_map = jnp.zeros((h8, w8), dtype=jnp.float32)
-  num_blocks = float(max(1, h8 * w8))
-  for wd_maps_f, weights_f in zip(
-      intermediates["wd_maps"], intermediates["weights"]
-  ):
-    for wd_map, weight in zip(wd_maps_f, weights_f):
-      spatial_2d = weight * jnp.mean(wd_map, axis=0)
-      term_scalar = jnp.mean(spatial_2d)
-      resized = jax.image.resize(
-          spatial_2d, (h8, w8), method="linear", antialias=True
-      )
-      resized_pos = jnp.maximum(resized, 0.0)
-      resized_sum = jnp.sum(resized_pos)
-      norm_scale = jax.lax.stop_gradient(
-          jnp.where(
-              resized_sum > 1e-12,
-              term_scalar / jnp.maximum(resized_sum, 1e-12),
-              1.0 / num_blocks,
-          )
-      )
-      term_offset = jax.lax.stop_gradient(
-          jnp.where(resized_sum > 1e-12, 0.0, term_scalar / num_blocks)
-      )
-      term_block = resized * norm_scale + term_offset
-      wd_block_map = wd_block_map + term_block
-
-  # Local per-8x8-block 1D Gaussian Wasserstein-2 distance on full-resolution VGGBlock_0
-  f_r = recon_feats[1]
-  f_t = target_features[1]
-  c_dim, fh, fw = f_r.shape
-  pad_h = h8 * 8 - fh
-  pad_w = w8 * 8 - fw
-  if pad_h > 0 or pad_w > 0:
-    f_r = jnp.pad(f_r, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
-    f_t = jnp.pad(f_t, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
-  f_r_blk = jnp.transpose(f_r.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4))
-  f_t_blk = jnp.transpose(f_t.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4))
-  mu_r = jnp.mean(f_r_blk, axis=(3, 4))
-  mu_t = jnp.mean(f_t_blk, axis=(3, 4))
-  sigma_r = jnp.sqrt(jnp.var(f_r_blk, axis=(3, 4)) + 1e-7)
-  sigma_t = jnp.sqrt(jnp.var(f_t_blk, axis=(3, 4)) + 1e-7)
-  w2_blk = jnp.mean(
-      jnp.square(mu_r - mu_t) + jnp.square(sigma_r - sigma_t), axis=2
-  )
-  wd_block_map = wd_block_map + 0.25 * w2_blk
-
-  wd_block_map_pos = jnp.maximum(wd_block_map, 0.0)
-  map_sum = jnp.sum(wd_block_map_pos)
-  total_scale = jax.lax.stop_gradient(
-      jnp.where(
-          map_sum > 1e-12,
-          wd_total / jnp.maximum(map_sum, 1e-12),
-          1.0,
-      )
-  )
-  total_offset = jax.lax.stop_gradient(
-      jnp.where(
-          map_sum > 1e-12,
-          wd_block_map_pos - wd_block_map,
-          jnp.full((h8, w8), wd_total / num_blocks, dtype=jnp.float32)
-          - wd_block_map,
-      )
-  )
-  wd_map = (wd_block_map + total_offset) * total_scale
-  return wd_total, wd_map
 
 
 # =============================================================================

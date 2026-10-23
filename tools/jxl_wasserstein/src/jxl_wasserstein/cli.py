@@ -161,8 +161,17 @@ def build_parser() -> argparse.ArgumentParser:
       "--noise",
       dest="enable_noise",
       action="store_true",
-      default=False,
-      help="Enable differentiable JXL NoiseParams LUT synthesis.",
+      default=None,
+      help=(
+          "Enable differentiable JXL NoiseParams LUT synthesis (default: auto"
+          " in --mode auto, disabled otherwise)."
+      ),
+  )
+  parser.add_argument(
+      "--no-noise",
+      dest="enable_noise",
+      action="store_false",
+      help="Explicitly disable JXL NoiseParams LUT synthesis.",
   )
   parser.add_argument(
       "--custom-dequant",
@@ -315,7 +324,7 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
 
   if (
       mode == "single"
-      and not args.enable_noise
+      and not bool(args.enable_noise)
       and custom_dequant in (None, True)
   ):
     pad_h = ((h + 7) // 8) * 8 - h
@@ -376,7 +385,7 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
         distance=distance,
         lambda_rd=explicit_lam,
         num_steps=eff_steps,
-        enable_noise=bool(args.enable_noise),
+        enable_noise=args.enable_noise,
         custom_dequant=custom_dequant,
         log2_sigma=log2_sigma,
         vgg_params=vgg_params,
@@ -412,7 +421,7 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
             else 0,
         )
     )
-    has_noise = bool(args.enable_noise)
+    has_noise = bool(res.get("has_noise", bool(args.enable_noise)))
 
   if args.output is not None:
     out_path = Path(args.output)

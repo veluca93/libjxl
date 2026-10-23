@@ -1617,15 +1617,14 @@ def _epf_pixel_inv_sigma(
   return row_sigma_px * vsm, row_sigma_px
 
 
-def epf_stage0(
-    xyb: jax.Array,
+@functools.partial(jax.checkpoint, prevent_cse=False, static_argnums=(2, 3, 4))
+def _epf_stage0_ckpt(
+    arr: jax.Array,
     inv_sigma_grid: jax.Array,
-    pass0_sigma_scale: float = K_DEFAULT_EPF_PASS0_SIGMA_SCALE,
-    border_sad_mul: float = K_DEFAULT_EPF_BORDER_SAD_MUL,
-    channel_scale: Sequence[float] = K_DEFAULT_EPF_CHANNEL_SCALE,
+    pass0_sigma_scale: float,
+    border_sad_mul: float,
+    channel_scale: tuple[float, ...],
 ) -> jax.Array:
-  """Exact EPF0Stage (lib/jxl/render_pipeline/stage_epf.cc:54-193)."""
-  arr = jnp.asarray(xyb, dtype=jnp.float32)
   _, h, w = arr.shape
   inv_sigma_eff, row_sigma_px = _epf_pixel_inv_sigma(
       inv_sigma_grid, h, w, pass0_sigma_scale, border_sad_mul
@@ -1660,14 +1659,30 @@ def epf_stage0(
   return jnp.where((row_sigma_px >= K_MIN_SIGMA)[None, :, :], filtered, arr)
 
 
-def epf_stage1(
+def epf_stage0(
     xyb: jax.Array,
     inv_sigma_grid: jax.Array,
+    pass0_sigma_scale: float = K_DEFAULT_EPF_PASS0_SIGMA_SCALE,
     border_sad_mul: float = K_DEFAULT_EPF_BORDER_SAD_MUL,
     channel_scale: Sequence[float] = K_DEFAULT_EPF_CHANNEL_SCALE,
 ) -> jax.Array:
-  """Exact EPF1Stage (lib/jxl/render_pipeline/stage_epf.cc:197-379)."""
-  arr = jnp.asarray(xyb, dtype=jnp.float32)
+  """Exact EPF0Stage (lib/jxl/render_pipeline/stage_epf.cc:54-193)."""
+  return _epf_stage0_ckpt(
+      jnp.asarray(xyb, dtype=jnp.float32),
+      jnp.asarray(inv_sigma_grid, dtype=jnp.float32),
+      float(pass0_sigma_scale),
+      float(border_sad_mul),
+      tuple(float(x) for x in channel_scale),
+  )
+
+
+@functools.partial(jax.checkpoint, prevent_cse=False, static_argnums=(2, 3))
+def _epf_stage1_ckpt(
+    arr: jax.Array,
+    inv_sigma_grid: jax.Array,
+    border_sad_mul: float,
+    channel_scale: tuple[float, ...],
+) -> jax.Array:
   _, h, w = arr.shape
   inv_sigma_eff, row_sigma_px = _epf_pixel_inv_sigma(
       inv_sigma_grid, h, w, 1.0, border_sad_mul
@@ -1698,15 +1713,29 @@ def epf_stage1(
   return jnp.where((row_sigma_px >= K_MIN_SIGMA)[None, :, :], filtered, arr)
 
 
-def epf_stage2(
+def epf_stage1(
     xyb: jax.Array,
     inv_sigma_grid: jax.Array,
-    pass2_sigma_scale: float = K_DEFAULT_EPF_PASS2_SIGMA_SCALE,
     border_sad_mul: float = K_DEFAULT_EPF_BORDER_SAD_MUL,
     channel_scale: Sequence[float] = K_DEFAULT_EPF_CHANNEL_SCALE,
 ) -> jax.Array:
-  """Exact EPF2Stage (lib/jxl/render_pipeline/stage_epf.cc:383-506)."""
-  arr = jnp.asarray(xyb, dtype=jnp.float32)
+  """Exact EPF1Stage (lib/jxl/render_pipeline/stage_epf.cc:197-379)."""
+  return _epf_stage1_ckpt(
+      jnp.asarray(xyb, dtype=jnp.float32),
+      jnp.asarray(inv_sigma_grid, dtype=jnp.float32),
+      float(border_sad_mul),
+      tuple(float(x) for x in channel_scale),
+  )
+
+
+@functools.partial(jax.checkpoint, prevent_cse=False, static_argnums=(2, 3, 4))
+def _epf_stage2_ckpt(
+    arr: jax.Array,
+    inv_sigma_grid: jax.Array,
+    pass2_sigma_scale: float,
+    border_sad_mul: float,
+    channel_scale: tuple[float, ...],
+) -> jax.Array:
   _, h, w = arr.shape
   inv_sigma_eff, row_sigma_px = _epf_pixel_inv_sigma(
       inv_sigma_grid, h, w, pass2_sigma_scale, border_sad_mul
@@ -1731,6 +1760,23 @@ def epf_stage2(
 
   filtered = x_sum / w_sum
   return jnp.where((row_sigma_px >= K_MIN_SIGMA)[None, :, :], filtered, arr)
+
+
+def epf_stage2(
+    xyb: jax.Array,
+    inv_sigma_grid: jax.Array,
+    pass2_sigma_scale: float = K_DEFAULT_EPF_PASS2_SIGMA_SCALE,
+    border_sad_mul: float = K_DEFAULT_EPF_BORDER_SAD_MUL,
+    channel_scale: Sequence[float] = K_DEFAULT_EPF_CHANNEL_SCALE,
+) -> jax.Array:
+  """Exact EPF2Stage (lib/jxl/render_pipeline/stage_epf.cc:383-506)."""
+  return _epf_stage2_ckpt(
+      jnp.asarray(xyb, dtype=jnp.float32),
+      jnp.asarray(inv_sigma_grid, dtype=jnp.float32),
+      float(pass2_sigma_scale),
+      float(border_sad_mul),
+      tuple(float(x) for x in channel_scale),
+  )
 
 
 # -----------------------------------------------------------------------------

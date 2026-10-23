@@ -150,6 +150,401 @@ def wasserstein_distortion(
   return dist
 
 
+def _single_wd_chunk(
+    fa: jax.Array,
+    fb: jax.Array,
+    ls_curr: jax.Array,
+    num_levels: int,
+    sqrt_grad_limit: float,
+) -> jax.Array:
+  feat_a = fa
+  feat_b = fb
+  sq_a = jnp.square(feat_a)
+  sq_b = jnp.square(feat_b)
+  dist = jnp.zeros((), dtype=fa.dtype)
+  ls_i = ls_curr
+
+  for i in range(int(num_levels) + 1):
+    if i == 0:
+      wd_map = jnp.square(fa - fb)
+    else:
+      ma = lowpass(feat_a, stride=1)
+      pa = lowpass(sq_a, stride=1)
+      va = pa - jnp.square(ma)
+      mb = lowpass(feat_b, stride=1)
+      pb = lowpass(sq_b, stride=1)
+      vb = pb - jnp.square(mb)
+      sa = safe_sqrt(lower_limit(va, 0.0), sqrt_grad_limit)
+      sb = safe_sqrt(lower_limit(vb, 0.0), sqrt_grad_limit)
+      wd_map = jnp.square(ma - mb) + jnp.square(sa - sb)
+      if i < int(num_levels):
+        feat_a = ma[..., ::2, ::2]
+        sq_a = pa[..., ::2, ::2]
+        feat_b = mb[..., ::2, ::2]
+        sq_b = pb[..., ::2, ::2]
+
+    weight = jax.nn.relu(1.0 - jnp.abs(ls_i - i))
+    dist = dist + jnp.mean(weight * wd_map)
+    if i > 0 and i < int(num_levels):
+      ls_i = lowpass(ls_i[None], stride=2).squeeze(0)
+
+  return dist
+
+
+@functools.partial(jax.checkpoint, prevent_cse=False, static_argnums=(3, 4))
+def _checkpointed_single_wd(
+    fa: jax.Array,
+    fb: jax.Array,
+    ls_base: jax.Array,
+    num_levels: int,
+    sqrt_grad_limit: float,
+) -> jax.Array:
+  """Checkpointed scalar WD for a single feature pair, chunked across channels."""
+  ls_curr = jax.image.resize(
+      ls_base, fa.shape[-2:], method="linear", antialias=True
+  )
+  log_ratio_h = jnp.log2(ls_base.shape[-2] / fa.shape[-2])
+  log_ratio_w = jnp.log2(ls_base.shape[-1] / fa.shape[-1])
+  ls_curr = jax.nn.relu(ls_curr - 0.5 * (log_ratio_h + log_ratio_w))
+
+  c_dim, fh, fw = fa.shape
+  if c_dim > 8 and c_dim % 8 == 0 and fh * fw >= 65536:
+    n_chunks = c_dim // 8
+    fa_chunks = fa.reshape(n_chunks, 8, fh, fw)
+    fb_chunks = fb.reshape(n_chunks, 8, fh, fw)
+
+    @functools.partial(jax.checkpoint, prevent_cse=False)
+    def _scan_body(acc: jax.Array, pair: tuple[jax.Array, jax.Array]):
+      ca, cb = pair
+      d_c = _single_wd_chunk(ca, cb, ls_curr, num_levels, sqrt_grad_limit)
+      return acc + d_c, None
+
+    total_c, _ = jax.lax.scan(
+        _scan_body,
+        jnp.zeros((), dtype=fa.dtype),
+        (fa_chunks, fb_chunks),
+    )
+    return total_c / float(n_chunks)
+
+  return _single_wd_chunk(fa, fb, ls_curr, num_levels, sqrt_grad_limit)
+
+
+@functools.partial(
+    jax.checkpoint, prevent_cse=False, static_argnums=(3, 4, 5, 6, 7)
+)
+def _checkpointed_single_spatial_wd(
+    fa: jax.Array,
+    fb: jax.Array,
+    ls_base: jax.Array,
+    h8: int,
+    w8: int,
+    num_levels: int,
+    sqrt_grad_limit: float,
+    add_blk0_w2: bool,
+) -> tuple[jax.Array, jax.Array]:
+  """Checkpointed scalar + `(h8, w8)` spatial WD contribution, chunked across channels."""
+  ls_curr = jax.image.resize(
+      ls_base, fa.shape[-2:], method="linear", antialias=True
+  )
+  log_ratio_h = jnp.log2(ls_base.shape[-2] / fa.shape[-2])
+  log_ratio_w = jnp.log2(ls_base.shape[-1] / fa.shape[-1])
+  ls_curr = jax.nn.relu(ls_curr - 0.5 * (log_ratio_h + log_ratio_w))
+
+  c_dim, fh, fw = fa.shape
+  num_blocks = float(max(1, h8 * w8))
+
+  def _spatial_levels_mean_2d(
+      ca: jax.Array, cb: jax.Array
+  ) -> list[jax.Array]:
+    feat_a = ca
+    feat_b = cb
+    sq_a = jnp.square(feat_a)
+    sq_b = jnp.square(feat_b)
+    means_2d: list[jax.Array] = []
+    for i in range(int(num_levels) + 1):
+      if i == 0:
+        wd_m = jnp.square(ca - cb)
+      else:
+        ma = lowpass(feat_a, stride=1)
+        pa = lowpass(sq_a, stride=1)
+        va = pa - jnp.square(ma)
+        mb = lowpass(feat_b, stride=1)
+        pb = lowpass(sq_b, stride=1)
+        vb = pb - jnp.square(mb)
+        sa = safe_sqrt(lower_limit(va, 0.0), sqrt_grad_limit)
+        sb = safe_sqrt(lower_limit(vb, 0.0), sqrt_grad_limit)
+        wd_m = jnp.square(ma - mb) + jnp.square(sa - sb)
+        if i < int(num_levels):
+          feat_a = ma[..., ::2, ::2]
+          sq_a = pa[..., ::2, ::2]
+          feat_b = mb[..., ::2, ::2]
+          sq_b = pb[..., ::2, ::2]
+      means_2d.append(jnp.mean(wd_m, axis=0))
+    return means_2d
+
+  if c_dim > 8 and c_dim % 8 == 0 and fh * fw >= 65536:
+    n_chunks = c_dim // 8
+    fa_chunks = fa.reshape(n_chunks, 8, fh, fw)
+    fb_chunks = fb.reshape(n_chunks, 8, fh, fw)
+    init_m2d = [
+        jnp.zeros((fh >> max(0, i - 1), fw >> max(0, i - 1)), dtype=fa.dtype)
+        for i in range(int(num_levels) + 1)
+    ]
+    # Note: stride-2 slicing `ma[..., ::2, ::2]` has ceil(dim / 2) shape:
+    init_m2d = []
+    sh_i, sw_i = fh, fw
+    for i in range(int(num_levels) + 1):
+      if i >= 2:
+        sh_i = (sh_i + 1) // 2
+        sw_i = (sw_i + 1) // 2
+      init_m2d.append(jnp.zeros((sh_i, sw_i), dtype=fa.dtype))
+
+    @functools.partial(jax.checkpoint, prevent_cse=False)
+    def _scan_sp(acc_m2d: list[jax.Array], pair: tuple[jax.Array, jax.Array]):
+      ca, cb = pair
+      cur_m2d = _spatial_levels_mean_2d(ca, cb)
+      return [a + b for a, b in zip(acc_m2d, cur_m2d)], None
+
+    sum_m2d, _ = jax.lax.scan(
+        _scan_sp, init_m2d, (fa_chunks, fb_chunks)
+    )
+    level_means_2d = [m / float(n_chunks) for m in sum_m2d]
+  else:
+    level_means_2d = _spatial_levels_mean_2d(fa, fb)
+
+  dist = jnp.zeros((), dtype=fa.dtype)
+  blk_acc = jnp.zeros((h8, w8), dtype=jnp.float32)
+  ls_i = ls_curr
+  for i, mean_wd_2d in enumerate(level_means_2d):
+    weight = jax.nn.relu(1.0 - jnp.abs(ls_i - i))
+    spatial_2d = weight * mean_wd_2d
+    term_scalar = jnp.mean(spatial_2d)
+    dist = dist + term_scalar
+    resized = jax.image.resize(
+        spatial_2d, (h8, w8), method="linear", antialias=True
+    )
+    resized_pos = jnp.maximum(resized, 0.0)
+    resized_sum = jnp.sum(resized_pos)
+    norm_scale = jax.lax.stop_gradient(
+        jnp.where(
+            resized_sum > 1e-12,
+            term_scalar / jnp.maximum(resized_sum, 1e-12),
+            1.0 / num_blocks,
+        )
+    )
+    term_offset = jax.lax.stop_gradient(
+        jnp.where(resized_sum > 1e-12, 0.0, term_scalar / num_blocks)
+    )
+    blk_acc = blk_acc + (resized * norm_scale + term_offset)
+    if i > 0 and i < int(num_levels):
+      ls_i = lowpass(ls_i[None], stride=2).squeeze(0)
+
+  if add_blk0_w2:
+    pad_h = h8 * 8 - fh
+    pad_w = w8 * 8 - fw
+    f_r = (
+        jnp.pad(fa, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
+        if (pad_h > 0 or pad_w > 0)
+        else fa
+    )
+    f_t = (
+        jnp.pad(fb, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
+        if (pad_h > 0 or pad_w > 0)
+        else fb
+    )
+    f_r_blk = jnp.transpose(f_r.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4))
+    f_t_blk = jnp.transpose(f_t.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4))
+    mu_r = jnp.mean(f_r_blk, axis=(3, 4))
+    mu_t = jnp.mean(f_t_blk, axis=(3, 4))
+    sigma_r = jnp.sqrt(jnp.var(f_r_blk, axis=(3, 4)) + 1e-7)
+    sigma_t = jnp.sqrt(jnp.var(f_t_blk, axis=(3, 4)) + 1e-7)
+    w2_blk = jnp.mean(
+        jnp.square(mu_r - mu_t) + jnp.square(sigma_r - sigma_t), axis=2
+    )
+    blk_acc = blk_acc + (0.25 / num_blocks) * w2_blk
+
+  return dist, blk_acc
+
+
+@functools.partial(jax.checkpoint, prevent_cse=False, static_argnums=(4, 5, 6))
+def _checkpointed_vgg_block_wd_target(
+    nhwc_in: jax.Array,
+    block_params: Any,
+    target_feat: jax.Array,
+    ls_map: jax.Array,
+    num_features: int,
+    num_layers: int,
+    num_levels: int,
+) -> tuple[jax.Array, jax.Array]:
+  import flax.linen as nn
+  from jxl_wasserstein.vgg import VggBlock
+
+  blk_out = VggBlock(num_features=num_features, num_layers=num_layers).apply(
+      {"params": block_params}, nhwc_in
+  )
+  fa = jnp.transpose(jnp.squeeze(blk_out, axis=0), (2, 0, 1))
+  d = _checkpointed_single_wd(fa, target_feat, ls_map, int(num_levels), 1e6)
+  pooled = nn.avg_pool(
+      blk_out, window_shape=(2, 2), strides=(2, 2), padding="VALID"
+  )
+  return pooled, d
+
+
+@functools.partial(
+    jax.checkpoint, prevent_cse=False, static_argnums=(4, 5, 6, 7, 8, 9)
+)
+def _checkpointed_vgg_block_spatial_wd_target(
+    nhwc_in: jax.Array,
+    block_params: Any,
+    target_feat: jax.Array,
+    ls_map: jax.Array,
+    h8: int,
+    w8: int,
+    num_features: int,
+    num_layers: int,
+    num_levels: int,
+    add_blk0_w2: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  import flax.linen as nn
+  from jxl_wasserstein.vgg import VggBlock
+
+  blk_out = VggBlock(num_features=num_features, num_layers=num_layers).apply(
+      {"params": block_params}, nhwc_in
+  )
+  fa = jnp.transpose(jnp.squeeze(blk_out, axis=0), (2, 0, 1))
+  d, blk_c = _checkpointed_single_spatial_wd(
+      fa, target_feat, ls_map, h8, w8, int(num_levels), 1e6, bool(add_blk0_w2)
+  )
+  pooled = nn.avg_pool(
+      blk_out, window_shape=(2, 2), strides=(2, 2), padding="VALID"
+  )
+  return pooled, d, blk_c
+
+
+def stream_vgg_wd_against_targets(
+    vgg_params: Any,
+    recon_chw: jax.Array,
+    target_features: Sequence[jax.Array],
+    ls_map: jax.Array,
+    eff_scales: int,
+    num_levels: int,
+) -> jax.Array:
+  """Streams multi-scale VGG-16 + WD block-by-block with rematerialization."""
+  from jxl_wasserstein.vgg import (
+      _VGG_BLOCKS,
+      IMAGENET_MEAN,
+      IMAGENET_STD,
+      ensure_chw_rgb,
+      multiscale_vgg_features,
+  )
+
+  if not isinstance(vgg_params, dict) or "params" not in vgg_params:
+    recon_feats = multiscale_vgg_features(
+        vgg_params, recon_chw, num_scales=eff_scales
+    )
+    return multi_wasserstein_distortion(
+        recon_feats, target_features, ls_map, num_levels=num_levels
+    )
+
+  image = ensure_chw_rgb(jnp.asarray(recon_chw, dtype=jnp.float32))
+  mean = jnp.array(IMAGENET_MEAN, dtype=image.dtype)[:, None, None]
+  std = jnp.array(IMAGENET_STD, dtype=image.dtype)[:, None, None]
+  image = (image - mean) / std
+
+  dist = _checkpointed_single_wd(
+      image, target_features[0], ls_map, int(num_levels), 1e6
+  )
+  p_blocks = vgg_params["params"]
+  for scale_idx in range(int(eff_scales)):
+    if scale_idx > 0:
+      image = lowpass(image, stride=2)
+    nhwc = jnp.transpose(image, (1, 2, 0))[None, ...]
+    for blk_idx, (num_features, num_layers) in enumerate(_VGG_BLOCKS):
+      feat_idx = 1 + scale_idx * 5 + blk_idx
+      nhwc, d_blk = _checkpointed_vgg_block_wd_target(
+          nhwc,
+          p_blocks[f"VggBlock_{blk_idx}"],
+          target_features[feat_idx],
+          ls_map,
+          num_features,
+          num_layers,
+          int(num_levels),
+      )
+      dist = dist + d_blk
+  return dist
+
+
+def stream_vgg_spatial_wd_against_targets(
+    vgg_params: Any,
+    recon_chw: jax.Array,
+    target_features: Sequence[jax.Array],
+    ls_map: jax.Array,
+    h8: int,
+    w8: int,
+    eff_scales: int,
+    num_levels: int,
+) -> tuple[jax.Array, jax.Array]:
+  """Streams multi-scale VGG-16 + `(h8, w8)` spatial WD map block-by-block."""
+  from jxl_wasserstein.vgg import (
+      _VGG_BLOCKS,
+      IMAGENET_MEAN,
+      IMAGENET_STD,
+      ensure_chw_rgb,
+  )
+
+  image = ensure_chw_rgb(jnp.asarray(recon_chw, dtype=jnp.float32))
+  mean = jnp.array(IMAGENET_MEAN, dtype=image.dtype)[:, None, None]
+  std = jnp.array(IMAGENET_STD, dtype=image.dtype)[:, None, None]
+  image = (image - mean) / std
+
+  wd_total, wd_block_map = _checkpointed_single_spatial_wd(
+      image, target_features[0], ls_map, h8, w8, int(num_levels), 1e6, False
+  )
+  p_blocks = vgg_params["params"]
+  for scale_idx in range(int(eff_scales)):
+    if scale_idx > 0:
+      image = lowpass(image, stride=2)
+    nhwc = jnp.transpose(image, (1, 2, 0))[None, ...]
+    for blk_idx, (num_features, num_layers) in enumerate(_VGG_BLOCKS):
+      feat_idx = 1 + scale_idx * 5 + blk_idx
+      add_w2 = bool(int(num_levels) < 2 and scale_idx == 0 and blk_idx == 0)
+      nhwc, d_blk, blk_c = _checkpointed_vgg_block_spatial_wd_target(
+          nhwc,
+          p_blocks[f"VggBlock_{blk_idx}"],
+          target_features[feat_idx],
+          ls_map,
+          h8,
+          w8,
+          num_features,
+          num_layers,
+          int(num_levels),
+          add_w2,
+      )
+      wd_total = wd_total + d_blk
+      wd_block_map = wd_block_map + blk_c
+
+  num_blocks = float(max(1, h8 * w8))
+  wd_block_map_pos = jnp.maximum(wd_block_map, 0.0)
+  map_sum = jnp.sum(wd_block_map_pos)
+  total_scale = jax.lax.stop_gradient(
+      jnp.where(
+          map_sum > 1e-12,
+          wd_total / jnp.maximum(map_sum, 1e-12),
+          1.0,
+      )
+  )
+  total_offset = jax.lax.stop_gradient(
+      jnp.where(
+          map_sum > 1e-12,
+          wd_block_map_pos - wd_block_map,
+          jnp.full((h8, w8), wd_total / num_blocks, dtype=jnp.float32)
+          - wd_block_map,
+      )
+  )
+  wd_map = (wd_block_map + total_offset) * total_scale
+  return wd_total, wd_map
+
+
 def multi_wasserstein_distortion(
     features_a: Sequence[jax.Array],
     features_b: Sequence[jax.Array],
@@ -169,6 +564,18 @@ def multi_wasserstein_distortion(
   ls_base = jnp.asarray(log2_sigma)
   if ls_base.ndim != 2:
     raise ValueError(f"Expected 2D (H, W) `log2_sigma`, got {ls_base.shape}")
+
+  if not return_intermediates:
+    dist = jnp.zeros((), dtype=ls_base.dtype)
+    for fa, fb in zip(features_a, features_b):
+      if fa.shape != fb.shape:
+        raise ValueError(
+            f"Feature arrays must have identical shapes, got {fa.shape} vs {fb.shape}"
+        )
+      dist = dist + _checkpointed_single_wd(
+          fa, fb, ls_base, int(num_levels), float(sqrt_grad_limit)
+      )
+    return dist
 
   dist = jnp.zeros((), dtype=ls_base.dtype)
   intermediates: dict[str, list[Any]] = collections.defaultdict(list)
