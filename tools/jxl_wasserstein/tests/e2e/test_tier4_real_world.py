@@ -21,7 +21,6 @@ from jxl_wasserstein.benchmark import (
 )
 from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     compute_psnr,
     decode_with_djxl,
     encode_single_frame,
@@ -299,7 +298,7 @@ def test_scenario6_textured_photography_noise_synthesis_and_cross_decoder_matrix
   assert ver_single["cross_decoder_psnr"] >= 45.0
   assert float(get_field(cached_single_frame_opt, "psnr_jax_vs_djxl", "psnr_vs_djxl", "psnr")) >= 40.0
 
-  # Patch composite modes (U=2 kReplace + U=4 kAdd)
+  # Patch composite modes (U=2 kAdd + U=4 kAdd)
   for res_p in (
       cached_patch_composite_u2,
       optimize_patch_composite(

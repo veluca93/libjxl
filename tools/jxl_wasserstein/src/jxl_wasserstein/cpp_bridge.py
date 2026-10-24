@@ -47,14 +47,37 @@ _ALPHA_HEADER_FMT = "<8s4I"
 _ALPHA_HEADER_SIZE = struct.calcsize(_ALPHA_HEADER_FMT)
 assert _ALPHA_HEADER_SIZE == 24
 
-PATCH_BLEND_NONE = 0
-PATCH_BLEND_REPLACE = 1
 PATCH_BLEND_ADD = 2
-PATCH_BLEND_MUL = 3
 PATCH_BLEND_ALPHA_ABOVE = 4
 PATCH_BLEND_ALPHA_BELOW = 5
 PATCH_BLEND_MUL_ADD_ABOVE = 6
 PATCH_BLEND_MUL_ADD_BELOW = 7
+
+VALID_ALPHA_BLEND_MODES: tuple[int, ...] = (
+    PATCH_BLEND_ALPHA_ABOVE,
+    PATCH_BLEND_ALPHA_BELOW,
+    PATCH_BLEND_MUL_ADD_ABOVE,
+    PATCH_BLEND_MUL_ADD_BELOW,
+)
+VALID_ALPHA_BLEND_MODE_NAMES: dict[str, int] = {
+    "kblendabove": PATCH_BLEND_ALPHA_ABOVE,
+    "blend_above": PATCH_BLEND_ALPHA_ABOVE,
+    "alpha_above": PATCH_BLEND_ALPHA_ABOVE,
+    "4": PATCH_BLEND_ALPHA_ABOVE,
+    "kblendbelow": PATCH_BLEND_ALPHA_BELOW,
+    "blend_below": PATCH_BLEND_ALPHA_BELOW,
+    "alpha_below": PATCH_BLEND_ALPHA_BELOW,
+    "5": PATCH_BLEND_ALPHA_BELOW,
+    "kalphaweightedaddabove": PATCH_BLEND_MUL_ADD_ABOVE,
+    "alpha_weighted_add_above": PATCH_BLEND_MUL_ADD_ABOVE,
+    "mul_add_above": PATCH_BLEND_MUL_ADD_ABOVE,
+    "6": PATCH_BLEND_MUL_ADD_ABOVE,
+    "kalphaweightedaddbelow": PATCH_BLEND_MUL_ADD_BELOW,
+    "alpha_weighted_add_below": PATCH_BLEND_MUL_ADD_BELOW,
+    "mul_add_below": PATCH_BLEND_MUL_ADD_BELOW,
+    "alphamuladd": PATCH_BLEND_MUL_ADD_BELOW,
+    "7": PATCH_BLEND_MUL_ADD_BELOW,
+}
 
 DEFAULT_DC_QUANT_WEIGHTS: tuple[float, float, float] = (
     1.0 / 4096.0,
@@ -157,7 +180,7 @@ _DEFAULT_DCT8_DEQUANT: np.ndarray = _eval_dct_quant_weights(
 
 @dataclass(frozen=True)
 class PatchEntry:
-  """One rectangular XYB patch copy/add/blend instruction from a ReferenceOnly frame."""
+  """Single full-frame XYB patch add/alpha-blend instruction from a ReferenceOnly frame."""
 
   ref: int
   x0: int
@@ -166,7 +189,7 @@ class PatchEntry:
   ysize: int
   x: int
   y: int
-  blend_mode: int = PATCH_BLEND_REPLACE
+  blend_mode: int = PATCH_BLEND_ADD
 
 
 @dataclass
@@ -876,16 +899,64 @@ def encode_single_frame(
     return jxl_bytes, stats
 
 
+def _validate_single_full_frame_patch(
+    patches: Sequence[PatchEntry],
+    expected_hw: tuple[int, int] | None,
+    allowed_blend_modes: Sequence[int],
+) -> None:
+  """Validates that `patches` contains strictly 1 full-frame `(0, 0, W, H)` patch with an allowed blend mode."""
+  if len(patches) != 1:
+    raise ValueError(
+        f"Expected exactly 1 full-frame patch, got {len(patches)} patches"
+    )
+  p = patches[0]
+  if int(p.ref) != 0 or int(p.x0) != 0 or int(p.y0) != 0 or int(p.x) != 0 or int(p.y) != 0:
+    raise ValueError(
+        f"Patch must be co-located at origin (0, 0) referencing frame 0, got {p!r}"
+    )
+  if expected_hw is not None:
+    exp_h, exp_w = int(expected_hw[0]), int(expected_hw[1])
+    if int(p.xsize) != exp_w or int(p.ysize) != exp_h:
+      raise ValueError(
+          f"Patch must span full frame ({exp_w}x{exp_h}), got ({p.xsize}x{p.ysize})"
+      )
+  if int(p.blend_mode) not in allowed_blend_modes:
+    raise ValueError(
+        f"Unsupported patch blend_mode {p.blend_mode} (allowed: {tuple(allowed_blend_modes)})"
+    )
+
+
 def encode_patches_composite(
     ref_state: JxlVarDCTState | str | Path,
     main_state: JxlVarDCTState | str | Path,
     upsampling: int,
-    patches: Sequence[PatchEntry],
+    patches: Sequence[PatchEntry] | None = None,
     output_jxl: str | Path | None = None,
     effort: int = 7,
     noise_lut: Sequence[float] | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-  """Serializes a 2-frame ReferenceOnly + PatchDictionary composite .jxl bitstream."""
+  """Serializes a 2-frame ReferenceOnly + single full-frame kAdd PatchDictionary composite .jxl bitstream."""
+  expected_hw = (
+      (int(main_state.height), int(main_state.width))
+      if isinstance(main_state, JxlVarDCTState)
+      else None
+  )
+  if patches is not None:
+    _validate_single_full_frame_patch(patches, expected_hw, (PATCH_BLEND_ADD,))
+  elif expected_hw is not None:
+    patches = [
+        PatchEntry(
+            ref=0,
+            x0=0,
+            y0=0,
+            xsize=expected_hw[1],
+            ysize=expected_hw[0],
+            x=0,
+            y=0,
+            blend_mode=PATCH_BLEND_ADD,
+        )
+    ]
+
   with tempfile.TemporaryDirectory(prefix="jxlw_patches_", dir=_SHM_DIR) as tmpdir:
     tmp = Path(tmpdir)
     if isinstance(ref_state, JxlVarDCTState):
@@ -906,7 +977,6 @@ def encode_patches_composite(
     else:
       main_path = Path(main_state)
 
-    patches_path = save_patches_bin(patches, tmp / "patches.bin")
     jxl_path = Path(output_jxl) if output_jxl is not None else (tmp / "out.jxl")
     json_path = tmp / "stats.json"
     cmd: list[str | Path] = [
@@ -918,8 +988,6 @@ def encode_patches_composite(
         main_path,
         "--upsampling",
         str(int(upsampling)),
-        "--patches",
-        patches_path,
         "--output-jxl",
         jxl_path,
         "--effort",
@@ -927,6 +995,9 @@ def encode_patches_composite(
         "--json-out",
         json_path,
     ]
+    if patches is not None:
+      patches_path = save_patches_bin(patches, tmp / "patches.bin")
+      cmd.extend(["--patches", patches_path])
     if noise_lut is not None:
       cmd.extend(["--noise-lut", _format_noise_lut(noise_lut)])
 
@@ -950,7 +1021,30 @@ def encode_alpha_composite(
     alpha_bits: int = 8,
     alpha_clamp: bool = False,
 ) -> tuple[bytes, dict[str, Any]]:
-  """Serializes a 2-frame ReferenceOnly + ExtraChannel::kAlpha XYB PatchDictionary composite .jxl bitstream."""
+  """Serializes a 2-frame ReferenceOnly + ExtraChannel::kAlpha single-patch XYB composite .jxl bitstream."""
+  if isinstance(alpha_blend_mode, str):
+    key = alpha_blend_mode.strip().lower()
+    if key not in VALID_ALPHA_BLEND_MODE_NAMES:
+      raise ValueError(
+          f"Unsupported alpha_blend_mode {alpha_blend_mode!r}; expected one of {VALID_ALPHA_BLEND_MODES}"
+      )
+    bm_int = VALID_ALPHA_BLEND_MODE_NAMES[key]
+  else:
+    bm_int = int(alpha_blend_mode)
+    if bm_int not in VALID_ALPHA_BLEND_MODES:
+      raise ValueError(
+          f"Unsupported alpha_blend_mode {alpha_blend_mode}; expected one of {VALID_ALPHA_BLEND_MODES}"
+      )
+
+  expected_hw = (
+      (int(main_state.height), int(main_state.width))
+      if isinstance(main_state, JxlVarDCTState)
+      else None
+  )
+  if patches is not None:
+    _validate_single_full_frame_patch(
+        patches, expected_hw, VALID_ALPHA_BLEND_MODES
+    )
   with tempfile.TemporaryDirectory(prefix="jxlw_alpha_", dir=_SHM_DIR) as tmpdir:
     tmp = Path(tmpdir)
     if isinstance(ref_state, JxlVarDCTState):

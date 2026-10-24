@@ -34,7 +34,6 @@ from scipy.stats import spearmanr
 
 from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     JxlVarDCTState,
     PatchEntry,
     encode_alpha_composite,
@@ -538,49 +537,47 @@ def test_noise_header_delta_80_bits() -> None:
 
 def test_patch_dictionary_and_alpha_composite_sweeps() -> None:
   """6. Multi-resolution PatchDictionary & Modular ExtraChannel::kAlpha composite sweeps."""
-  rgb = _load_kodak_crop("kodim01", crop_h=128, crop_w=128)
+  rgb512 = _load_kodak_crop("kodim01", crop_h=512, crop_w=512, y0=0, x0=0)
+  rgb = rgb512[:128, :128]
 
-  # 6a. PatchDictionary sweep (varying upsampling, distances, patch count, blend modes)
+  # 6a. Single full-frame kAdd PatchDictionary sweep (varying frame dimensions, upsampling, distances)
   true_patch_dict_bits: list[float] = []
   proxy_patch_dict_bits: list[float] = []
   true_patch_comp_bits: list[float] = []
   proxy_patch_comp_bits: list[float] = []
 
   configs = [
-      (2, 4.0, 2.5, 0, PATCH_BLEND_REPLACE),
-      (2, 3.0, 2.0, 1, PATCH_BLEND_REPLACE),
-      (2, 2.5, 1.5, 2, PATCH_BLEND_REPLACE),
-      (2, 2.0, 1.2, 4, PATCH_BLEND_ADD),
-      (2, 1.5, 1.0, 8, PATCH_BLEND_REPLACE),
-      (4, 3.0, 1.5, 12, PATCH_BLEND_ADD),
-      (4, 1.2, 0.8, 16, PATCH_BLEND_REPLACE),
-      (8, 2.0, 0.6, 24, PATCH_BLEND_ADD),
+      (16, 2, 4.0, 2.5),
+      (32, 2, 3.0, 2.0),
+      (64, 4, 2.5, 1.6),
+      (128, 4, 2.0, 1.2),
+      (256, 8, 1.5, 0.9),
+      (512, 8, 1.2, 0.7),
   ]
 
-  for upsampling, ref_d, main_d, num_patches, blend_mode in configs:
-    h_ref, w_ref = 128 // upsampling, 128 // upsampling
+  for sz, upsampling, ref_d, main_d in configs:
+    rgb_crop = rgb512[:sz, :sz]
+    h_ref, w_ref = sz // upsampling, sz // upsampling
     rgb_ref = np.asarray(
-        jax.image.resize(jnp.asarray(rgb), (h_ref, w_ref, 3), method="bilinear")
+        jax.image.resize(
+            jnp.asarray(rgb_crop), (h_ref, w_ref, 3), method="bilinear"
+        )
     )
-    ref_st = init_state_from_rgb_jax(rgb_ref, distance=ref_d)
-    main_st = init_state_from_rgb_jax(rgb, distance=main_d)
+    ref_st = init_state_from_rgb_jax(rgb_ref * 0.6, distance=ref_d)
+    main_st = init_state_from_rgb_jax(rgb_crop * 0.4, distance=main_d)
 
-    patches: list[PatchEntry] = []
-    for i in range(num_patches):
-      gy = ((i // 4) * 16 + 8) % 96
-      gx = ((i % 4) * 24 + 8) % 96
-      patches.append(
-          PatchEntry(
-              ref=0,
-              x0=gx,
-              y0=gy,
-              xsize=16,
-              ysize=16,
-              x=gx,
-              y=gy,
-              blend_mode=blend_mode,
-          )
-      )
+    patches = [
+        PatchEntry(
+            ref=0,
+            x0=0,
+            y0=0,
+            xsize=sz,
+            ysize=sz,
+            x=0,
+            y=0,
+            blend_mode=PATCH_BLEND_ADD,
+        )
+    ]
 
     _, stats_p = encode_patches_composite(
         ref_state=ref_st,
@@ -623,7 +620,7 @@ def test_patch_dictionary_and_alpha_composite_sweeps() -> None:
       ref_state=ref_st_a,
       main_state=main_st_a,
       upsampling=2,
-      patches=[],
+      patches=None,
   )
   base_2frame_bits = float(base_2frame_stats["file_bytes"] * 8)
 

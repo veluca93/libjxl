@@ -14,7 +14,10 @@ from jxl_wasserstein.cpp_bridge import (
     ACS_COVERED_BLOCKS_X,
     ACS_COVERED_BLOCKS_Y,
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ALPHA_ABOVE,
+    PATCH_BLEND_ALPHA_BELOW,
+    PATCH_BLEND_MUL_ADD_ABOVE,
+    PATCH_BLEND_MUL_ADD_BELOW,
     JxlVarDCTState,
     PatchEntry,
 )
@@ -22,12 +25,8 @@ from jxl_wasserstein.noise import synthesize_jxl_noise
 
 synthesize_jxl_noise_xyb = synthesize_jxl_noise
 
-PATCH_BLEND_NONE: int = 0
-PATCH_BLEND_MUL: int = 3
-PATCH_BLEND_ALPHA_ABOVE: int = 4
-PATCH_BLEND_ALPHA_BELOW: int = 5
-PATCH_BLEND_ALPHA_WEIGHTED_ADD_ABOVE: int = 6
-PATCH_BLEND_ALPHA_WEIGHTED_ADD_BELOW: int = 7
+PATCH_BLEND_ALPHA_WEIGHTED_ADD_ABOVE: int = PATCH_BLEND_MUL_ADD_ABOVE
+PATCH_BLEND_ALPHA_WEIGHTED_ADD_BELOW: int = PATCH_BLEND_MUL_ADD_BELOW
 
 ACS_NAMES: tuple[str, ...] = (
     "DCT",
@@ -3052,16 +3051,10 @@ def _blend_xyb_pair(
     blend_mode: int,
     alpha_3d: jax.Array | None = None,
 ) -> jax.Array:
-  """Blends `cur_xyb` (Frame 1) and `ref_xyb` (Frame 0 patch) in XYB space per PatchBlendMode."""
+  """Blends `cur_xyb` (Frame 1) and `ref_xyb` (Frame 0 single full-frame patch) in XYB space."""
   mode = int(blend_mode)
-  if mode == PATCH_BLEND_NONE:
-    return cur_xyb
-  if mode == PATCH_BLEND_REPLACE:
-    return ref_xyb
   if mode == PATCH_BLEND_ADD:
     return cur_xyb + ref_xyb
-  if mode == PATCH_BLEND_MUL:
-    return cur_xyb * ref_xyb
   if mode == PATCH_BLEND_ALPHA_ABOVE:
     if alpha_3d is None:
       return ref_xyb
@@ -3078,7 +3071,9 @@ def _blend_xyb_pair(
     if alpha_3d is None:
       return ref_xyb
     return ref_xyb + alpha_3d * cur_xyb
-  raise ValueError(f"Unsupported patch blend_mode: {blend_mode}")
+  raise ValueError(
+      f"Unsupported patch blend_mode: {blend_mode} (expected 2, 4, 5, 6, or 7)"
+  )
 
 
 def apply_xyb_patches(
@@ -3087,7 +3082,11 @@ def apply_xyb_patches(
     patches: Sequence[PatchEntry],
     alpha_ups: jax.Array | None = None,
 ) -> jax.Array:
-  """Applies PatchDictionaryStage in XYB domain (lib/jxl/dec_patch_dictionary.cc:290-361)."""
+  """Applies a single full-frame PatchDictionaryStage in XYB domain (lib/jxl/dec_patch_dictionary.cc:290-361)."""
+  if len(patches) != 1:
+    raise ValueError(
+        f"apply_xyb_patches requires a single full-frame patch, got {len(patches)}"
+    )
   ref_arr = jnp.asarray(ref_xyb_ups, dtype=jnp.float32)
   main_arr = jnp.asarray(main_xyb, dtype=jnp.float32)
   is_hwc = main_arr.ndim == 3 and main_arr.shape[2] == 3 and main_arr.shape[0] != 3
@@ -3098,82 +3097,43 @@ def apply_xyb_patches(
     ref_chw = ref_arr
     comp = main_arr
 
+  _, h, w = comp.shape
+  p = patches[0]
+  if int(p.ref) != 0:
+    raise ValueError(f"Expected patch ref == 0, got {p.ref}")
   if (
-      len(patches) > 4
-      and alpha_ups is None
-      and all(
-          p.ref == 0
-          and int(p.x0) == int(p.x)
-          and int(p.y0) == int(p.y)
-          and int(p.blend_mode) in (PATCH_BLEND_REPLACE, PATCH_BLEND_ADD)
-          for p in patches
-      )
+      int(p.x0) != 0
+      or int(p.y0) != 0
+      or int(p.x) != 0
+      or int(p.y) != 0
+      or int(p.xsize) != w
+      or int(p.ysize) != h
   ):
-    _, h, w = comp.shape
-    w_ref = np.zeros((1, h, w), dtype=np.float32)
-    w_main = np.ones((1, h, w), dtype=np.float32)
-    for p in patches:
-      x0 = max(0, min(int(p.x), w))
-      y0 = max(0, min(int(p.y), h))
-      x1 = max(x0, min(int(p.x) + int(p.xsize), w))
-      y1 = max(y0, min(int(p.y) + int(p.ysize), h))
-      if int(p.blend_mode) == PATCH_BLEND_REPLACE:
-        w_ref[:, y0:y1, x0:x1] = 1.0
-        w_main[:, y0:y1, x0:x1] = 0.0
-      elif int(p.blend_mode) == PATCH_BLEND_ADD:
-        w_ref[:, y0:y1, x0:x1] = 1.0
-        w_main[:, y0:y1, x0:x1] = 1.0
-    comp = jnp.asarray(w_main) * comp + jnp.asarray(w_ref) * ref_chw[:, :h, :w]
-    return jnp.moveaxis(comp, 0, -1) if is_hwc else comp
+    raise ValueError(
+        f"Expected single full-frame (0, 0, {w}, {h}) patch referencing frame 0, got {p!r}"
+    )
 
-  alpha_2d: jax.Array | None = None
+  a_3d: jax.Array | None = None
   if alpha_ups is not None:
     a_arr = jnp.asarray(alpha_ups, dtype=jnp.float32)
     if a_arr.ndim == 3 and a_arr.shape[0] == 1:
-      alpha_2d = a_arr[0]
+      a_3d = a_arr[:, :h, :w]
     elif a_arr.ndim == 3 and a_arr.shape[2] == 1:
-      alpha_2d = a_arr[:, :, 0]
+      a_3d = jnp.moveaxis(a_arr[:h, :w, :], -1, 0)
     else:
-      alpha_2d = a_arr
+      a_3d = a_arr[None, :h, :w]
 
-  for p in patches:
-    if p.ref != 0:
-      raise ValueError(f"Expected patch ref == 0, got {p.ref}")
-    ref_slice = jax.lax.dynamic_slice(
-        ref_chw,
-        (0, int(p.y0), int(p.x0)),
-        (3, int(p.ysize), int(p.xsize)),
-    )
-    if p.blend_mode == PATCH_BLEND_REPLACE:
-      comp = jax.lax.dynamic_update_slice(comp, ref_slice, (0, int(p.y), int(p.x)))
-    else:
-      cur_slice = jax.lax.dynamic_slice(
-          comp,
-          (0, int(p.y), int(p.x)),
-          (3, int(p.ysize), int(p.xsize)),
-      )
-      a_slice_3d: jax.Array | None = None
-      if alpha_2d is not None:
-        a_slice = jax.lax.dynamic_slice(
-            alpha_2d,
-            (int(p.y), int(p.x)),
-            (int(p.ysize), int(p.xsize)),
-        )
-        a_slice_3d = a_slice[None, :, :]
-      blended_slice = _blend_xyb_pair(
-          cur_slice, ref_slice, int(p.blend_mode), alpha_3d=a_slice_3d
-      )
-      comp = jax.lax.dynamic_update_slice(
-          comp, blended_slice, (0, int(p.y), int(p.x))
-      )
-  return jnp.moveaxis(comp, 0, -1) if is_hwc else comp
+  blended = _blend_xyb_pair(
+      comp, ref_chw[:, :h, :w], int(p.blend_mode), alpha_3d=a_3d
+  )
+  return jnp.moveaxis(blended, 0, -1) if is_hwc else blended
 
 
 def reconstruct_patch_composite(
     ref_state: JxlVarDCTState | StaticVarDCTTopology,
     main_state: JxlVarDCTState | StaticVarDCTTopology,
     upsampling: int,
-    patches: Sequence[PatchEntry],
+    patches: Sequence[PatchEntry] | None = None,
     include_noise: bool = False,
     noise_lut: jax.Array | Sequence[float] | None = None,
     ref_params_override: Mapping[str, Any] | None = None,
@@ -3244,7 +3204,10 @@ def reconstruct_patch_composite(
       dc_quant_weights=main_dc_quant_weights,
   )
 
-  comp_xyb = apply_xyb_patches(ref_xyb_ups, main_xyb, patches)
+  if patches is None:
+    comp_xyb = main_xyb + ref_xyb_ups
+  else:
+    comp_xyb = apply_xyb_patches(ref_xyb_ups, main_xyb, patches)
 
   lut_to_use = (
       noise_lut

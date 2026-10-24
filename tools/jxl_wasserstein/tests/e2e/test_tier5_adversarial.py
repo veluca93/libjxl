@@ -57,7 +57,8 @@ from jxl_wasserstein import benchmark, cli, compositing, cpp_bridge, optimizer  
 from jxl_wasserstein.cpp_bridge import (  # noqa: E402
     HELPER_BIN,
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ALPHA_BELOW,
+    PATCH_BLEND_MUL_ADD_BELOW,
     PatchEntry,
     _format_noise_lut,
     _run_cmd,
@@ -399,8 +400,8 @@ def test_adv_5_forward_model_topology_patch_and_alpha_edge_cases() -> None:
   Exercises:
   - reconstruct_single_frame_xyb raising ValueError when StaticVarDCTTopology
     is passed without all 5 state tensors (forward_model.py:1098-1102).
-  - apply_xyb_patches raising ValueError when ref != 0 or blend_mode not in {1,2}
-     and HWC vs CHW layout branch (forward_model.py:1760-1789).
+  - apply_xyb_patches raising ValueError when ref != 0, blend_mode not in {2,4,5,6,7},
+     or non-full-frame geometry, plus HWC vs CHW layout branch.
   - reconstruct_alpha_composite with (1, H, W) and (H, W, 1) 3D alpha tensors
     and quantize_alpha=False vs True (forward_model.py:1986-1993).
   """
@@ -421,29 +422,43 @@ def test_adv_5_forward_model_topology_patch_and_alpha_edge_cases() -> None:
       ref=1,
       x0=0,
       y0=0,
-      xsize=8,
-      ysize=8,
+      xsize=16,
+      ysize=16,
       x=0,
       y=0,
-      blend_mode=PATCH_BLEND_REPLACE,
+      blend_mode=PATCH_BLEND_ADD,
   )
   with pytest.raises(ValueError, match="Expected patch ref == 0"):
     apply_xyb_patches(ref0_chw, canvas_chw, [bad_ref_patch])
 
   bad_blend_patch = PatchEntry(
-      ref=0, x0=0, y0=0, xsize=8, ysize=8, x=0, y=0, blend_mode=99
+      ref=0, x0=0, y0=0, xsize=16, ysize=16, x=0, y=0, blend_mode=99
   )
   with pytest.raises(ValueError, match="Unsupported patch blend_mode: 99"):
     apply_xyb_patches(ref0_chw, canvas_chw, [bad_blend_patch])
+
+  # Color kReplace (1) and sub-frame geometry must be rejected
+  with pytest.raises(ValueError, match="Unsupported patch blend_mode: 1"):
+    apply_xyb_patches(
+        ref0_chw,
+        canvas_chw,
+        [PatchEntry(ref=0, x0=0, y0=0, xsize=16, ysize=16, x=0, y=0, blend_mode=1)],
+    )
+  with pytest.raises(ValueError, match="full-frame"):
+    apply_xyb_patches(
+        ref0_chw,
+        canvas_chw,
+        [PatchEntry(ref=0, x0=0, y0=0, xsize=8, ysize=8, x=4, y=4, blend_mode=PATCH_BLEND_ADD)],
+    )
 
   valid_add_patch = PatchEntry(
       ref=0,
       x0=0,
       y0=0,
-      xsize=8,
-      ysize=8,
-      x=4,
-      y=4,
+      xsize=16,
+      ysize=16,
+      x=0,
+      y=0,
       blend_mode=PATCH_BLEND_ADD,
   )
   patched_hwc = apply_xyb_patches(
@@ -630,7 +645,7 @@ def test_adv_8_entropy_proxy_dict_patches_delta_coding_and_breakdowns() -> None:
           "ysize": 8,
           "x": 8,
           "y": 0,
-          "blend_mode": PATCH_BLEND_REPLACE,
+          "blend_mode": PATCH_BLEND_ALPHA_BELOW,
       },
       {
           "ref": 0,
@@ -650,7 +665,7 @@ def test_adv_8_entropy_proxy_dict_patches_delta_coding_and_breakdowns() -> None:
           "ysize": 8,
           "x": 24,
           "y": 16,
-          "blend_mode": PATCH_BLEND_REPLACE,
+          "blend_mode": PATCH_BLEND_MUL_ADD_BELOW,
       },
       {
           "ref": 0,
@@ -674,7 +689,7 @@ def test_adv_8_entropy_proxy_dict_patches_delta_coding_and_breakdowns() -> None:
           ysize=8,
           x=8,
           y=0,
-          blend_mode=PATCH_BLEND_REPLACE,
+          blend_mode=PATCH_BLEND_ALPHA_BELOW,
       ),
       PatchEntry(
           ref=0,
@@ -694,7 +709,7 @@ def test_adv_8_entropy_proxy_dict_patches_delta_coding_and_breakdowns() -> None:
           ysize=8,
           x=24,
           y=16,
-          blend_mode=PATCH_BLEND_REPLACE,
+          blend_mode=PATCH_BLEND_MUL_ADD_BELOW,
       ),
       PatchEntry(
           ref=0,
@@ -704,7 +719,7 @@ def test_adv_8_entropy_proxy_dict_patches_delta_coding_and_breakdowns() -> None:
           ysize=8,
           x=0,
           y=16,
-          blend_mode=PATCH_BLEND_REPLACE,
+          blend_mode=PATCH_BLEND_ADD,
       ),
   ]
   bits_obj = soft_patch_dictionary_bits(obj_patches)
@@ -917,35 +932,28 @@ def test_adv_m4_03_single_frame_multiblock_llf_masking_and_stage2_freeze(
 
 
 # ---------------------------------------------------------------------------
-# 4. Patch Extraction Edge Cases (0-Patch Fallback, Non-Multiple-of-8 Clipping, blend_mode="auto")
+# 4. Single Full-Frame Patch Edge Cases (Non-Multiple-of-8 Dimensions & blend_mode="auto")
 # ---------------------------------------------------------------------------
 def test_adv_m4_04_patch_extraction_zero_fg_single_block_and_auto_blend(
     vgg_params: Any,
 ) -> None:
-  """Tests 0-patch fallback, non-8-multiple rectangle clipping, and blend_mode='auto'."""
-  empty_rects = compositing.extract_patch_rectangles(
-      np.zeros((4, 4), dtype=bool), height=32, width=32
+  """Tests single full-frame kAdd patch on non-8-multiple dimensions and blend_mode='auto'."""
+  img_odd = _e2e_conftest.make_composite_smooth_sharp_image(32, 32)[:19, :29]
+  res_odd = compositing.optimize_patch_composite(
+      img_odd,
+      upsampling=2,
+      blend_mode="auto",
+      distance=0.55,
+      lambda_rd=0.05,
+      num_steps=1,
+      verify_decoders=True,
+      vgg_params=vgg_params,
   )
-  assert empty_rects == []
-
-  mask_l = np.array(
-      [
-          [True, True, False, True],
-          [True, False, False, True],
-          [True, True, True, True],
-      ],
-      dtype=bool,
-  )
-  rects_l = compositing.extract_patch_rectangles(mask_l, height=19, width=29)
-  assert len(rects_l) >= 3
-  cov = np.zeros((19, 29), dtype=int)
-  for p in rects_l:
-    assert 0 <= p.x < 29 and 0 <= p.y < 19
-    assert p.x + p.xsize <= 29 and p.y + p.ysize <= 19
-    cov[p.y : p.y + p.ysize, p.x : p.x + p.xsize] += 1
-  assert np.all(cov <= 1), (
-      "Overlapping patches produced by extract_patch_rectangles!"
-  )
+  assert res_odd.num_patches == 1
+  assert res_odd.patches == [
+      PatchEntry(0, 0, 0, 29, 19, 0, 0, cpp_bridge.PATCH_BLEND_ADD)
+  ]
+  assert res_odd.psnr_djxl_vs_jxlrs >= 45.0
 
   img64 = _e2e_conftest.make_composite_smooth_sharp_image(64, 64)
   res_auto_bm = compositing.optimize_patch_composite(
@@ -958,10 +966,8 @@ def test_adv_m4_04_patch_extraction_zero_fg_single_block_and_auto_blend(
       verify_decoders=True,
       vgg_params=vgg_params,
   )
-  assert res_auto_bm.blend_mode in (
-      cpp_bridge.PATCH_BLEND_REPLACE,
-      cpp_bridge.PATCH_BLEND_ADD,
-  )
+  assert res_auto_bm.blend_mode == cpp_bridge.PATCH_BLEND_ADD
+  assert res_auto_bm.num_patches == 1
   assert res_auto_bm.psnr_djxl_vs_jxlrs >= 45.0
 
 

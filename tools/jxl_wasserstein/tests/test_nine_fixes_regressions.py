@@ -20,7 +20,7 @@ from jxl_wasserstein.cpp_bridge import (
     CJXL_BIN,
     PATCH_BLEND_ADD,
     PATCH_BLEND_ALPHA_BELOW,
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_MUL_ADD_BELOW,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -381,38 +381,43 @@ def test_decoder_proxy_max_u8_error_across_modes_and_transforms():
     rec_odd = np.asarray(forward_model.reconstruct_single_frame(st_odd, hard=True))
     assert _max_u8_err(rec_odd, jb_odd) <= 2.0
 
-  # 3. Multi-resolution patches (kReplace & kAdd) and XYB patch-alpha (dim_shift=0, 1, 2)
+  # 3. Single full-frame patches (kAdd) and XYB patch-alpha / alphamuladd (dim_shift=0, 1, 2)
   for u in (2, 4):
     ref_s = compositing._init_frame_state_with_aq_epf_cfl(img[::u, ::u], distance=1.2)
     main_s = compositing._init_frame_state_with_aq_epf_cfl(img, distance=0.8, ac_strategy=acs)
-    for bm in (PATCH_BLEND_REPLACE, PATCH_BLEND_ADD):
-      patches = [PatchEntry(0, 16, 16, 64, 64, 16, 16, bm)]
-      jb_p, _ = encode_patches_composite(ref_s, main_s, u, patches)
-      rec_p = np.asarray(forward_model.reconstruct_patch_composite(ref_s, main_s, u, patches, hard=True))
-      fast_p = np.asarray(compositing._fast_reconstruct_patch_composite(ref_s, main_s, u, patches))
-      assert _max_u8_err(rec_p, jb_p) <= 2.0
-      assert float(np.max(np.abs(fast_p - rec_p)) * 255.0) <= 0.05
+    ref_s_add = compositing._init_frame_state_with_aq_epf_cfl(img[::u, ::u] // 2, distance=1.2)
+    main_s_add = compositing._init_frame_state_with_aq_epf_cfl(img // 3, distance=0.8, ac_strategy=acs)
+    patches = [PatchEntry(0, 0, 0, 128, 128, 0, 0, PATCH_BLEND_ADD)]
+    jb_p, _ = encode_patches_composite(ref_s_add, main_s_add, u, patches)
+    rec_p = np.asarray(forward_model.reconstruct_patch_composite(ref_s_add, main_s_add, u, patches, hard=True))
+    fast_p = np.asarray(compositing._fast_reconstruct_patch_composite(ref_s_add, main_s_add, u, patches))
+    assert _max_u8_err(rec_p, jb_p) <= 2.0
+    assert float(np.max(np.abs(fast_p - rec_p)) * 255.0) <= 0.05
 
     for ds in (0, 1, 2):
       ah, aw = (128 + (1 << ds) - 1) >> ds, (128 + (1 << ds) - 1) >> ds
       yy, xx = np.meshgrid(np.linspace(0.0, 1.0, ah), np.linspace(0.0, 1.0, aw), indexing="ij")
       alpha_01 = np.clip(0.5 + 0.5 * np.sin(3.0 * np.pi * yy) * np.cos(3.0 * np.pi * xx), 0.0, 1.0).astype(np.float32)
       alpha_u8 = np.rint(alpha_01 * 255.0).astype(np.uint8)
-      jb_a, _ = encode_alpha_composite(
-          ref_s, main_s, upsampling=u, alpha_u8=alpha_u8, dim_shift=ds, alpha_blend_mode=PATCH_BLEND_ALPHA_BELOW
-      )
-      rec_a = np.asarray(
-          forward_model.reconstruct_alpha_composite(
-              ref_s, main_s, upsampling=u, dim_shift=ds, alpha_01=alpha_01, alpha_blend_mode=PATCH_BLEND_ALPHA_BELOW, hard=True
-          )
-      )
-      fast_a = np.asarray(
-          compositing._fast_reconstruct_alpha_composite(
-              ref_s, main_s, upsampling=u, dim_shift=ds, alpha_01=alpha_01, alpha_blend_mode=PATCH_BLEND_ALPHA_BELOW
-          )
-      )
-      assert _max_u8_err(rec_a, jb_a) <= 2.0
-      assert float(np.max(np.abs(fast_a - rec_a)) * 255.0) <= 0.05
+      for a_bm, r_st, m_st in (
+          (PATCH_BLEND_ALPHA_BELOW, ref_s, main_s),
+          (PATCH_BLEND_MUL_ADD_BELOW, ref_s_add, main_s_add),
+      ):
+        jb_a, _ = encode_alpha_composite(
+            r_st, m_st, upsampling=u, alpha_u8=alpha_u8, dim_shift=ds, alpha_blend_mode=a_bm
+        )
+        rec_a = np.asarray(
+            forward_model.reconstruct_alpha_composite(
+                r_st, m_st, upsampling=u, dim_shift=ds, alpha_01=alpha_01, alpha_blend_mode=a_bm, hard=True
+            )
+        )
+        fast_a = np.asarray(
+            compositing._fast_reconstruct_alpha_composite(
+                r_st, m_st, upsampling=u, dim_shift=ds, alpha_01=alpha_01, alpha_blend_mode=a_bm
+            )
+        )
+        assert _max_u8_err(rec_a, jb_a) <= 2.0
+        assert float(np.max(np.abs(fast_a - rec_a)) * 255.0) <= 0.05
 
 
 def test_high_rate_encode_achieves_strong_butteraugli_and_ssimulacra2(vgg_params):

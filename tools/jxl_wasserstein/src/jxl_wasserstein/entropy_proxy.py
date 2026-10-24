@@ -32,7 +32,7 @@ import numpy as np
 from jxl_wasserstein.cpp_bridge import (
     ACS_COVERED_BLOCKS_X,
     ACS_COVERED_BLOCKS_Y,
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ADD,
     JxlVarDCTState,
     PatchEntry,
 )
@@ -1718,7 +1718,7 @@ def soft_patch_dictionary_bits(
       val = (
           int(p["x"]),
           int(p["y"]),
-          int(p.get("blend_mode", PATCH_BLEND_REPLACE)),
+          int(p.get("blend_mode", PATCH_BLEND_ADD)),
       )
     else:
       ref_val = int(getattr(p, "ref", getattr(p, "ref_idx", 0)))
@@ -1726,7 +1726,7 @@ def soft_patch_dictionary_bits(
       val = (
           int(p.x),
           int(p.y),
-          int(getattr(p, "blend_mode", PATCH_BLEND_REPLACE)),
+          int(getattr(p, "blend_mode", PATCH_BLEND_ADD)),
       )
     ref_groups.setdefault(key, []).append(val)
 
@@ -3009,7 +3009,7 @@ def compute_spatial_rate_map_bits(
 def soft_patch_composite_rate_proxy(
     ref_state: JxlVarDCTState,
     main_state: JxlVarDCTState,
-    patches: Sequence[PatchEntry | Any],
+    patches: Sequence[PatchEntry | Any] | None = None,
     upsampling: int = 2,
     *,
     ref_quant_ac: jax.Array | None = None,
@@ -3034,6 +3034,19 @@ def soft_patch_composite_rate_proxy(
     main_cluster_blend: float | jax.Array | None = None,
 ) -> jax.Array | RateBreakdown:
   """Differentiable total bit-rate proxy for 2-frame XYB `PatchDictionary` compositing."""
+  if patches is None:
+    patches = [
+        PatchEntry(
+            ref=0,
+            x0=0,
+            y0=0,
+            xsize=int(main_state.width),
+            ysize=int(main_state.height),
+            x=0,
+            y=0,
+            blend_mode=PATCH_BLEND_ADD,
+        )
+    ]
   eff_ref_cb = ref_cluster_blend if ref_cluster_blend is not None else cluster_blend
   eff_main_cb = (
       main_cluster_blend if main_cluster_blend is not None else cluster_blend

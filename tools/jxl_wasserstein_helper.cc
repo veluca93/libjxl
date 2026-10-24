@@ -157,7 +157,7 @@ struct JxlPatchEntry {
   uint32_t ysize;
   uint32_t x;
   uint32_t y;
-  uint32_t blend_mode;  // 1 = kReplace, 2 = kAdd
+  uint32_t blend_mode;  // 2 = kAdd (or 4..7 for alpha / alphamuladd)
 };
 static_assert(sizeof(JxlPatchEntry) == 32, "JxlPatchEntry must be 32 bytes");
 
@@ -2022,7 +2022,37 @@ Status RunEncodePatches(const std::string& ref_state_path,
   JXL_RETURN_IF_ERROR(ReadStateFile(main_state_path, &main_state));
 
   std::vector<JxlPatchEntry> patch_entries;
-  JXL_RETURN_IF_ERROR(LoadPatchesFile(patches_path, &patch_entries));
+  if (!patches_path.empty()) {
+    JXL_RETURN_IF_ERROR(LoadPatchesFile(patches_path, &patch_entries));
+  } else {
+    patch_entries.push_back(JxlPatchEntry{
+        /*ref=*/0,
+        /*x0=*/0,
+        /*y0=*/0,
+        /*xsize=*/main_state.hdr.width,
+        /*ysize=*/main_state.hdr.height,
+        /*x=*/0,
+        /*y=*/0,
+        /*blend_mode=*/static_cast<uint32_t>(PatchBlendMode::kAdd),
+    });
+  }
+  if (patch_entries.size() != 1) {
+    return JXL_FAILURE(
+        "--encode-patches requires exactly 1 full-frame patch (got %zu)",
+        patch_entries.size());
+  }
+  {
+    const auto& p = patch_entries[0];
+    if (p.ref != 0 || p.x0 != 0 || p.y0 != 0 || p.x != 0 || p.y != 0 ||
+        p.xsize != main_state.hdr.width || p.ysize != main_state.hdr.height ||
+        p.blend_mode != static_cast<uint32_t>(PatchBlendMode::kAdd)) {
+      return JXL_FAILURE(
+          "--encode-patches requires a single full-frame (0, 0, %u, %u) kAdd "
+          "(2) patch (got ref=%u, (%u,%u)->(%u,%u) %ux%u, mode=%u)",
+          main_state.hdr.width, main_state.hdr.height, p.ref, p.x0, p.y0, p.x,
+          p.y, p.xsize, p.ysize, p.blend_mode);
+    }
+  }
 
   CodecMetadata metadata;
   JXL_RETURN_IF_ERROR(
@@ -2119,9 +2149,7 @@ Status RunEncodePatches(const std::string& ref_state_path,
                        main_state.hdr.width &&
                    static_cast<uint64_t>(p.y) + p.ysize <=
                        main_state.hdr.height);
-        JXL_ENSURE(p.blend_mode ==
-                       static_cast<uint32_t>(PatchBlendMode::kReplace) ||
-                   p.blend_mode == static_cast<uint32_t>(PatchBlendMode::kAdd));
+        JXL_ENSURE(p.blend_mode == static_cast<uint32_t>(PatchBlendMode::kAdd));
 
         size_t ref_idx = ref_positions.size();
         if (!ref_positions.empty() && ref_positions.back().ref == p.ref &&
@@ -2209,9 +2237,6 @@ Status LoadAlphaFile(const std::string& alpha_path, size_t expected_h,
 }
 
 uint32_t ParseAlphaBlendModeArg(const std::string& s) {
-  if (s == "kReplace") return static_cast<uint32_t>(PatchBlendMode::kReplace);
-  if (s == "kAdd") return static_cast<uint32_t>(PatchBlendMode::kAdd);
-  if (s == "kMul") return static_cast<uint32_t>(PatchBlendMode::kMul);
   if (s == "kBlendAbove")
     return static_cast<uint32_t>(PatchBlendMode::kBlendAbove);
   if (s == "kBlendBelow")
@@ -2220,7 +2245,12 @@ uint32_t ParseAlphaBlendModeArg(const std::string& s) {
     return static_cast<uint32_t>(PatchBlendMode::kAlphaWeightedAddAbove);
   if (s == "kAlphaWeightedAddBelow")
     return static_cast<uint32_t>(PatchBlendMode::kAlphaWeightedAddBelow);
-  return static_cast<uint32_t>(std::strtoul(s.c_str(), nullptr, 10));
+  char* endptr = nullptr;
+  unsigned long val = std::strtoul(s.c_str(), &endptr, 10);
+  if (endptr == s.c_str() || *endptr != '\0') {
+    return 0;
+  }
+  return static_cast<uint32_t>(val);
 }
 
 Status RunEncodeAlpha(const std::string& ref_state_path,
@@ -2238,16 +2268,17 @@ Status RunEncodeAlpha(const std::string& ref_state_path,
     return JXL_FAILURE("--dim-shift must be in {0, 1, 2, 3} (got %u)",
                        dim_shift);
   }
-  if (alpha_blend_mode != static_cast<uint32_t>(PatchBlendMode::kReplace) &&
-      alpha_blend_mode != static_cast<uint32_t>(PatchBlendMode::kAdd) &&
-      alpha_blend_mode != static_cast<uint32_t>(PatchBlendMode::kMul) &&
-      alpha_blend_mode != static_cast<uint32_t>(PatchBlendMode::kBlendAbove) &&
-      alpha_blend_mode != static_cast<uint32_t>(PatchBlendMode::kBlendBelow) &&
-      alpha_blend_mode !=
-          static_cast<uint32_t>(PatchBlendMode::kAlphaWeightedAddAbove) &&
-      alpha_blend_mode !=
-          static_cast<uint32_t>(PatchBlendMode::kAlphaWeightedAddBelow)) {
-    return JXL_FAILURE("Unsupported --alpha-blend-mode: %u", alpha_blend_mode);
+  const auto is_valid_alpha_bmode = [](uint32_t bm) {
+    return bm == static_cast<uint32_t>(PatchBlendMode::kBlendAbove) ||
+           bm == static_cast<uint32_t>(PatchBlendMode::kBlendBelow) ||
+           bm ==
+               static_cast<uint32_t>(PatchBlendMode::kAlphaWeightedAddAbove) ||
+           bm == static_cast<uint32_t>(PatchBlendMode::kAlphaWeightedAddBelow);
+  };
+  if (!is_valid_alpha_bmode(alpha_blend_mode)) {
+    return JXL_FAILURE(
+        "Unsupported --alpha-blend-mode: %u (must be in {4, 5, 6, 7})",
+        alpha_blend_mode);
   }
   JxlMemoryManager* memory_manager = jpegxl::tools::NoMemoryManager();
   jpegxl::tools::ThreadPoolInternal pool(4);
@@ -2283,6 +2314,23 @@ Status RunEncodeAlpha(const std::string& ref_state_path,
         /*y=*/0,
         /*blend_mode=*/alpha_blend_mode,
     });
+  }
+  if (patch_entries.size() != 1) {
+    return JXL_FAILURE(
+        "--encode-alpha requires exactly 1 full-frame patch (got %zu)",
+        patch_entries.size());
+  }
+  {
+    const auto& p = patch_entries[0];
+    const uint32_t bmode =
+        (p.blend_mode == 0) ? alpha_blend_mode : p.blend_mode;
+    if (p.ref != 0 || p.x0 != 0 || p.y0 != 0 || p.x != 0 || p.y != 0 ||
+        p.xsize != full_w || p.ysize != full_h || !is_valid_alpha_bmode(bmode)) {
+      return JXL_FAILURE(
+          "--encode-alpha requires a single full-frame (0, 0, %zu, %zu) alpha "
+          "patch in {4, 5, 6, 7} (got ref=%u, (%u,%u)->(%u,%u) %ux%u, mode=%u)",
+          full_w, full_h, p.ref, p.x0, p.y0, p.x, p.y, p.xsize, p.ysize, bmode);
+    }
   }
 
   CodecMetadata metadata;
@@ -2435,7 +2483,7 @@ Status RunEncodeAlpha(const std::string& ref_state_path,
                  static_cast<uint64_t>(p.y) + p.ysize <= full_h);
       const uint32_t bmode =
           (p.blend_mode == 0) ? alpha_blend_mode : p.blend_mode;
-      JXL_ENSURE(bmode >= 1 && bmode <= 7);
+      JXL_ENSURE(is_valid_alpha_bmode(bmode));
 
       size_t ref_idx = ref_positions.size();
       if (!ref_positions.empty() && ref_positions.back().ref == p.ref &&
@@ -3028,10 +3076,10 @@ int main(int argc, char** argv) {
                                   noise_lut_str, json_out_path);
   } else if (mode == "--encode-patches") {
     if (ref_state_path.empty() || main_state_path.empty() ||
-        patches_path.empty() || output_jxl_path.empty()) {
+        output_jxl_path.empty()) {
       fprintf(stderr,
               "Usage: %s --encode-patches --ref-state <ref.bin> --main-state "
-              "<main.bin> --upsampling <2|4|8> --patches <patches.bin> "
+              "<main.bin> --upsampling <2|4|8> [--patches <patches.bin>] "
               "--output-jxl <out.jxl> [--effort <e>] [--noise-lut <f0,..,f7>] "
               "[--json-out <stats.json>]\n",
               argv[0]);

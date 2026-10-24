@@ -22,7 +22,10 @@ from jxl_wasserstein.benchmark import (
 )
 from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ALPHA_ABOVE,
+    PATCH_BLEND_ALPHA_BELOW,
+    PATCH_BLEND_MUL_ADD_ABOVE,
+    PATCH_BLEND_MUL_ADD_BELOW,
     compute_psnr,
     decode_with_djxl,
     inspect_jxl,
@@ -68,12 +71,39 @@ def _parse_patch_blend_mode(val: str | int) -> int | str:
   s = str(val).strip().lower()
   if s == "auto":
     return "auto"
-  if s in ("replace", "1"):
-    return PATCH_BLEND_REPLACE
-  if s in ("add", "2"):
+  if s in ("add", "kadd", "2"):
     return PATCH_BLEND_ADD
   raise argparse.ArgumentTypeError(
-      f"--patch-blend-mode must be auto, replace, add, 1, or 2 (got {val!r})"
+      f"--patch-blend-mode must be auto, add, or 2 (got {val!r})"
+  )
+
+
+def _parse_cli_alpha_blend_mode(val: str | int) -> int | str:
+  s = str(val).strip().lower()
+  if s == "auto":
+    return "auto"
+  if s in ("blend_above", "kblendabove", "alpha_above", "4"):
+    return PATCH_BLEND_ALPHA_ABOVE
+  if s in ("blend_below", "kblendbelow", "alpha_below", "blend", "5"):
+    return PATCH_BLEND_ALPHA_BELOW
+  if s in (
+      "alpha_weighted_add_above",
+      "kalphaweightedaddabove",
+      "mul_add_above",
+      "6",
+  ):
+    return PATCH_BLEND_MUL_ADD_ABOVE
+  if s in (
+      "alpha_weighted_add_below",
+      "kalphaweightedaddbelow",
+      "mul_add_below",
+      "alphamuladd",
+      "7",
+  ):
+    return PATCH_BLEND_MUL_ADD_BELOW
+  raise argparse.ArgumentTypeError(
+      "--alpha-blend-mode must be auto, blend_below (5), blend_above (4),"
+      f" mul_add_below (7), or mul_add_above (6) (got {val!r})"
   )
 
 
@@ -134,7 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument(
       "--mode",
-      choices=("single", "patches", "alpha", "auto"),
+      choices=("single", "patches", "add", "alpha", "alphamuladd", "auto"),
       default="single",
       help="Encoding topology mode (default: single).",
   )
@@ -153,8 +183,17 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument(
       "--patch-blend-mode",
       type=_parse_patch_blend_mode,
-      default="replace",
-      help="Patch blend mode for patches mode: auto, replace (1), or add (2).",
+      default="add",
+      help="Patch blend mode for patches/add mode: auto or add (2).",
+  )
+  parser.add_argument(
+      "--alpha-blend-mode",
+      type=_parse_cli_alpha_blend_mode,
+      default=None,
+      help=(
+          "Alpha patch blend mode: auto, blend_below (5), blend_above (4),"
+          " mul_add_below (7), or mul_add_above (6)."
+      ),
   )
   parser.add_argument(
       "--enable-noise",
@@ -381,6 +420,7 @@ def _encode_single_image_cli(args: argparse.Namespace) -> dict[str, Any]:
         mode=mode,
         upsampling=u_val,
         patch_blend_mode=args.patch_blend_mode,
+        alpha_blend_mode=getattr(args, "alpha_blend_mode", None),
         dim_shift=ds_val,
         distance=distance,
         lambda_rd=explicit_lam,

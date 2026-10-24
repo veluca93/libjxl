@@ -15,7 +15,6 @@ from scipy.stats import spearmanr
 from jxl_wasserstein.cli import main as cli_main
 from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -89,7 +88,7 @@ def test_tier3_single_frame_multiblock_cfl_epf_noise_combo(
 
 
 # =============================================================================
-# Group 2: Multi-Res ReferenceOnly (U in {2,4,8}) + XYB PatchDictionary (kReplace & kAdd)
+# Group 2: Multi-Res ReferenceOnly (U in {2,4,8}) + Single Full-Frame XYB PatchDictionary (kAdd)
 #          + NoiseParams + Cross-Decoder Verification (6 tests)
 # =============================================================================
 
@@ -97,12 +96,12 @@ def test_tier3_single_frame_multiblock_cfl_epf_noise_combo(
 @pytest.mark.parametrize(
     "upsampling,blend_mode,enable_noise",
     [
-        (2, PATCH_BLEND_REPLACE, False),
+        (2, PATCH_BLEND_ADD, False),
         (2, PATCH_BLEND_ADD, True),
-        (4, PATCH_BLEND_REPLACE, False),
         (4, PATCH_BLEND_ADD, False),
-        (8, PATCH_BLEND_REPLACE, True),
+        (4, PATCH_BLEND_ADD, True),
         (8, PATCH_BLEND_ADD, False),
+        (8, PATCH_BLEND_ADD, True),
     ],
 )
 def test_tier3_patch_composite_upsampling_blend_noise_combo(
@@ -112,7 +111,7 @@ def test_tier3_patch_composite_upsampling_blend_noise_combo(
     composite_smooth_sharp_64_01: np.ndarray,
     vgg_params_session: Any,
 ) -> None:
-  """Verifies ReferenceOnly (U in {2,4,8}) + PatchDictionary (kReplace/kAdd) + NoiseParams + decoders."""
+  """Verifies ReferenceOnly (U in {2,4,8}) + single full-frame PatchDictionary (kAdd) + NoiseParams + decoders."""
   from jxl_wasserstein.compositing import optimize_patch_composite
 
   res = optimize_patch_composite(
@@ -221,11 +220,11 @@ def test_tier3_entropy_proxy_spearman_across_modes(
       proxy_rates.append(float(soft_jxl_rate_proxy(st)))
       true_rates.append(float(stats["total_bits"]))
   elif stream_mode == "patches":
-    ref_crop = kodim01_crop_64_01[::2, ::2]
-    patches = [PatchEntry(0, 0, 0, 32, 32, 0, 0, PATCH_BLEND_REPLACE)]
+    ref_crop = kodim01_crop_64_01[::2, ::2] * 0.6
+    patches = [PatchEntry(0, 0, 0, 64, 64, 0, 0, PATCH_BLEND_ADD)]
     for d in distances:
       ref_st = init_state_from_rgb_jax(ref_crop, distance=d * 1.2)
-      main_st = init_state_from_rgb_jax(kodim01_crop_64_01, distance=d)
+      main_st = init_state_from_rgb_jax(kodim01_crop_64_01 * 0.4, distance=d)
       jb, _ = encode_patches_composite(
           ref_st, main_st, upsampling=2, patches=patches
       )

@@ -26,7 +26,6 @@ from jxl_wasserstein.cpp_bridge import (
     ACS_COVERED_BLOCKS_X,
     ACS_COVERED_BLOCKS_Y,
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -825,7 +824,7 @@ def test_f10_boundary_stage2_discrete_decisions(
     res_p = comp_mod.optimize_patch_composite(
         flat,
         upsampling=2,
-        blend_mode=PATCH_BLEND_REPLACE,
+        blend_mode=PATCH_BLEND_ADD,
         num_steps=1,
         verify_decoders=False,
         vgg_params=vgg_params_session,
@@ -834,6 +833,7 @@ def test_f10_boundary_stage2_discrete_decisions(
     assert len(jb) > 0
     info = inspect_jxl(jb)
     assert info["frames"][1]["has_patches"] is True
+    assert info["frames"][1]["num_patches"] == 1
   elif case_name == "invalid_mode_rejected_cleanly":
     img = _make_pattern_image(16, 16, "gradient")
     with pytest.raises(ValueError):

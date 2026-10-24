@@ -1,20 +1,19 @@
-"""Tests for M4 multi-resolution XYB patches, sRGB alpha blending, and RD selector (`compositing.py`).
+"""Tests for multi-resolution single-patch XYB kAdd, XYB alpha/alphamuladd, and RD selector (`compositing.py`).
 
 Verifies:
-1. `extract_patch_rectangles` decomposes a boolean block mask into minimal
-   non-overlapping 8x8-aligned `PatchEntry` rectangles.
-2. `optimize_patch_composite` across `upsampling in {2, 4, 8}` and
-   `blend_mode in {PATCH_BLEND_REPLACE (1), PATCH_BLEND_ADD (2)}` produces valid
-   2-frame JXL codestreams verified by both `djxl` and `jxl_cli` (`PSNR >= 45 dB`),
-   with finite gradients and JAX vs `djxl` parity `>= 45 dB`.
+1. Single-patch validation rejects color `kReplace` (`1`) and sub-frame/multi-patch configurations.
+2. `optimize_patch_composite` across `upsampling in {2, 4, 8}` with single full-frame
+   `PATCH_BLEND_ADD (2)` produces valid 2-frame JXL codestreams (`num_patches == 1`)
+   verified by both `djxl` and `jxl_cli` (`PSNR >= 45 dB`), with finite gradients
+   and JAX vs `djxl` parity `>= 45 dB`.
 3. `optimize_alpha_composite` across `upsampling in {2, 4, 8}` and
-   `dim_shift in {0, 1, 2, 3}` produces valid 2-frame JXL codestreams with
-   `extra_channel_bits=[8]`, non-zero `alpha_logit` gradient norm, and JAX vs
+   `dim_shift in {0, 1, 2, 3}` produces valid 2-frame JXL codestreams (`num_patches == 1`)
+   with `extra_channel_bits=[8]`, non-zero `alpha_logit` gradient norm, and JAX vs
    `djxl` parity `>= 45 dB`.
 4. `select_best_mode` and `encode_image_to_jxl` automatically evaluate candidate
    topologies by true RD Lagrangian `J = WD + lambda_rd * bpp_true`, and on a
-   synthetic mixed smooth-background + sharp-foreground image both `"patches"`
-   and `"alpha"` strictly beat `"single"`.
+   synthetic mixed smooth-background + sharp-foreground image both `"patches"` (`kAdd`)
+   and `"alpha"` (`kBlendBelow` / `kAlphaWeightedAddBelow`) strictly beat `"single"`.
 5. Constraint R2 compliance: `dump_init_state` is monkeypatched to raise an error
    throughout all tests.
 """
@@ -32,14 +31,15 @@ from jxl_wasserstein.compositing import (
     compute_detail_mask_jax,
     downsample_rgb_jax,
     encode_image_to_jxl,
-    extract_patch_rectangles,
     optimize_alpha_composite,
     optimize_patch_composite,
     select_best_mode,
 )
 from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ALPHA_BELOW,
+    PATCH_BLEND_MUL_ADD_BELOW,
+    PatchEntry,
     compute_psnr,
     inspect_jxl,
     verify_jxl_codestream,
@@ -91,8 +91,8 @@ def _make_smooth_bg_sharp_fg_image(h: int = 64, w: int = 64) -> np.ndarray:
   return np.clip(img, 0.02, 0.98)
 
 
-def test_downsample_and_extract_patch_rectangles():
-  """Tests area-average downsampling and greedy rectangle merging."""
+def test_downsample_and_single_patch_validation(vgg_params):
+  """Tests area-average downsampling, detail mask diagnostic, and single-patch validation."""
   img = _make_smooth_bg_sharp_fg_image(64, 64)
   for u, expected_hw in ((1, (64, 64)), (2, (32, 32)), (4, (16, 16)), (8, (8, 8))):
     down = downsample_rgb_jax(img, u)
@@ -101,33 +101,34 @@ def test_downsample_and_extract_patch_rectangles():
   with pytest.raises(ValueError):
     downsample_rgb_jax(img, 3)
 
-  mask = np.ones((8, 8), dtype=bool)
-  mask[2:6, 2:6] = False
-  rects = extract_patch_rectangles(mask, 64, 64, PATCH_BLEND_REPLACE)
-  assert len(rects) == 4
-  covered = np.zeros((64, 64), dtype=int)
-  for r in rects:
-    assert r.x0 % 8 == 0 and r.y0 % 8 == 0
-    covered[r.y : r.y + r.ysize, r.x : r.x + r.xsize] += 1
-  assert np.all(covered[16:48, 16:48] == 0)
-  assert int(np.sum(covered == 1)) == 64 * 64 - 32 * 32
-
   detail = compute_detail_mask_jax(img, upsampling=2, distance=0.5)
   assert detail["fg_mask_blocks"].shape == (8, 8)
   assert np.any(detail["fg_mask_blocks"][3:5, 3:5])
 
+  # Color kReplace (1) and sub-frame / multi-patch inputs must raise ValueError
+  with pytest.raises(ValueError):
+    optimize_patch_composite(img, upsampling=2, blend_mode=1, num_steps=1, vgg_params=vgg_params)
+  with pytest.raises(ValueError):
+    optimize_alpha_composite(
+        img,
+        upsampling=2,
+        dim_shift=1,
+        patches=[PatchEntry(0, 8, 8, 32, 32, 8, 8, PATCH_BLEND_ALPHA_BELOW)],
+        num_steps=1,
+        vgg_params=vgg_params,
+    )
+
 
 @pytest.mark.parametrize("upsampling", [2, 4, 8])
-@pytest.mark.parametrize("blend_mode", [PATCH_BLEND_REPLACE, PATCH_BLEND_ADD])
 def test_optimize_patch_composite_all_upsamplings_and_blend_modes(
-    upsampling, blend_mode, vgg_params
+    upsampling, vgg_params
 ):
-  """Tests `optimize_patch_composite` across U in {2, 4, 8} and blend_mode in {1, 2}."""
+  """Tests `optimize_patch_composite` across U in {2, 4, 8} with single full-frame kAdd (2)."""
   img64 = _make_smooth_bg_sharp_fg_image(64, 64)
   res = optimize_patch_composite(
       img64,
       upsampling=upsampling,
-      blend_mode=blend_mode,
+      blend_mode=PATCH_BLEND_ADD,
       distance=0.35,
       lambda_rd=0.05,
       num_steps=3,
@@ -136,11 +137,15 @@ def test_optimize_patch_composite_all_upsamplings_and_blend_modes(
   assert isinstance(res, EncodeResult)
   assert res.mode_selected == "patches"
   assert res.upsampling == upsampling
-  assert res.num_patches >= 1
+  assert res.num_patches == 1
+  assert len(res.patches) == 1
+  assert res.patches[0] == PatchEntry(0, 0, 0, 64, 64, 0, 0, PATCH_BLEND_ADD)
   assert res.psnr_djxl_vs_jxlrs >= 45.0
   assert res.psnr_vs_djxl >= 45.0
 
   ver = verify_jxl_codestream(res["jxl_bytes"], min_cross_decoder_psnr=45.0)
+  assert ver["inspect"]["frames"][1]["num_patches"] == 1
+  assert ver["inspect"]["frames"][1]["patch_blend_modes"] == [PATCH_BLEND_ADD]
   djxl_rgb = ver["rgb_djxl"].astype(np.float32) / 255.0
   psnr_parity = compute_psnr(res["recon_rgb"], djxl_rgb, peak=1.0)
   assert psnr_parity >= 45.0
@@ -188,7 +193,7 @@ def test_select_best_mode_and_encode_image_to_jxl(vgg_params):
       candidate_modes=("single", "patches", "alpha"),
       upsampling_candidates=(2, 4),
       dim_shift_candidates=(1,),
-      blend_mode_candidates=(PATCH_BLEND_REPLACE,),
+      blend_mode_candidates=(PATCH_BLEND_ADD,),
       distance=0.35,
       lambda_rd=0.18,
       num_steps=3,
@@ -213,17 +218,18 @@ def test_select_best_mode_and_encode_image_to_jxl(vgg_params):
       f"single ({c_single['rd_cost']:.5f})"
   )
   assert best_all.mode_selected in ("patches", "alpha")
+  assert best_all.num_patches == 1
   assert best_all.psnr_djxl_vs_jxlrs >= 45.0
 
-  # Verify high-level encode_image_to_jxl entry point with uint8 input and noise synthesis
+  # Verify high-level encode_image_to_jxl entry point with uint8 input, mode="add" and mode="alphamuladd"
   img64_u8 = np.round(img64 * 255.0).astype(np.uint8)
   enc_res = encode_image_to_jxl(
       img64_u8,
       rd_lambda=0.12,
       distance=0.5,
-      mode="patches",
+      mode="add",
       upsampling=2,
-      patch_blend_mode="replace",
+      patch_blend_mode="add",
       enable_noise=True,
       num_steps=2,
       verify_decoders=True,
@@ -231,8 +237,25 @@ def test_select_best_mode_and_encode_image_to_jxl(vgg_params):
   )
   assert isinstance(enc_res, EncodeResult)
   assert enc_res.mode_selected == "patches"
+  assert enc_res.num_patches == 1
   assert enc_res.has_noise is True
   assert enc_res.psnr_djxl_vs_jxlrs >= 45.0
+
+  enc_muladd = encode_image_to_jxl(
+      img64_u8,
+      rd_lambda=0.12,
+      distance=0.5,
+      mode="alphamuladd",
+      upsampling=2,
+      dim_shift=1,
+      num_steps=2,
+      verify_decoders=True,
+      vgg_params=vgg_params,
+  )
+  assert enc_muladd.mode_selected == "alpha"
+  assert enc_muladd.alpha_blend_mode == PATCH_BLEND_MUL_ADD_BELOW
+  assert enc_muladd.num_patches == 1
+  assert enc_muladd.psnr_djxl_vs_jxlrs >= 45.0
 
 
 def test_f3_no_static_mse_heuristic_and_stage1_rate_wd_maps(
@@ -253,7 +276,7 @@ def test_f3_no_static_mse_heuristic_and_stage1_rate_wd_maps(
   res_p = optimize_patch_composite(
       img64,
       upsampling=2,
-      blend_mode="replace",
+      blend_mode="add",
       distance=0.35,
       lambda_rd=0.05,
       num_steps=2,
@@ -333,7 +356,7 @@ def test_f9_f10_f11_stage3_strictly_improves_j_and_custom_dequant(vgg_params):
   res_p_custom = optimize_patch_composite(
       img64,
       upsampling=2,
-      blend_mode="replace",
+      blend_mode="add",
       custom_dequant=True,
       distance=0.35,
       lambda_rd=0.05,
@@ -346,7 +369,7 @@ def test_f9_f10_f11_stage3_strictly_improves_j_and_custom_dequant(vgg_params):
   res_p_def = optimize_patch_composite(
       img64,
       upsampling=2,
-      blend_mode="replace",
+      blend_mode="add",
       custom_dequant=False,
       distance=0.35,
       lambda_rd=0.05,
@@ -390,7 +413,7 @@ def test_stage2_auto_scaling_and_zero_random_init(vgg_params):
   res_patch_auto = optimize_patch_composite(
       img64,
       upsampling="auto",
-      blend_mode=PATCH_BLEND_REPLACE,
+      blend_mode=PATCH_BLEND_ADD,
       distance=0.5,
       lambda_rd=0.06,
       num_steps=3,

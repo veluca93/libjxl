@@ -13,7 +13,6 @@ from jxl_wasserstein.cpp_bridge import (
     ACS_COVERED_BLOCKS_X,
     ACS_COVERED_BLOCKS_Y,
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -257,10 +256,10 @@ def test_upsample_jxl_2x_4x_8x_with_5x5_min_max_clamping() -> None:
 
 
 @pytest.mark.parametrize("upsampling", [2, 4, 8])
-@pytest.mark.parametrize("blend_mode", [PATCH_BLEND_REPLACE, PATCH_BLEND_ADD])
+@pytest.mark.parametrize("explicit_patch", [False, True])
 def test_reconstruct_patch_composite_matches_djxl_all_upsampling_and_blend_modes(
     upsampling: int,
-    blend_mode: int,
+    explicit_patch: bool,
 ) -> None:
   rgb_01 = _load_kodak_crop("kodim02.png", w=128, h=128)
   h_low = (128 + upsampling - 1) // upsampling
@@ -272,12 +271,13 @@ def test_reconstruct_patch_composite_matches_djxl_all_upsampling_and_blend_modes
       dtype=np.float32,
   ) / 255.0
 
-  ref_state = init_state_from_rgb_jax(rgb_low, distance=2.0)
-  main_state = init_state_from_rgb_jax(rgb_01 * (0.4 if blend_mode == PATCH_BLEND_ADD else 1.0), distance=1.5)
-  patches = [
-      PatchEntry(ref=0, x0=8, y0=8, xsize=40, ysize=32, x=16, y=16, blend_mode=blend_mode),
-      PatchEntry(ref=0, x0=48, y0=48, xsize=32, ysize=40, x=64, y=56, blend_mode=blend_mode),
-  ]
+  ref_state = init_state_from_rgb_jax(rgb_low * 0.6, distance=2.0)
+  main_state = init_state_from_rgb_jax(rgb_01 * 0.4, distance=1.5)
+  patches = (
+      [PatchEntry(ref=0, x0=0, y0=0, xsize=128, ysize=128, x=0, y=0, blend_mode=PATCH_BLEND_ADD)]
+      if explicit_patch
+      else None
+  )
 
   jxl_bytes, _ = encode_patches_composite(ref_state, main_state, upsampling=upsampling, patches=patches)
   ver = verify_jxl_codestream(jxl_bytes, min_cross_decoder_psnr=45.0)
@@ -289,8 +289,24 @@ def test_reconstruct_patch_composite_matches_djxl_all_upsampling_and_blend_modes
   assert jax_srgb.shape == (128, 128, 3)
   psnr_val = compute_psnr(jax_srgb, djxl_srgb, peak=1.0)
   assert psnr_val >= 48.0, (
-      f"Patch composite PSNR {psnr_val:.2f} dB < 48 dB for U={upsampling} blend={blend_mode}"
+      f"Patch composite PSNR {psnr_val:.2f} dB < 48 dB for U={upsampling} explicit={explicit_patch}"
   )
+
+  if upsampling == 2 and explicit_patch:
+    with pytest.raises(ValueError):
+      reconstruct_patch_composite(
+          ref_state,
+          main_state,
+          upsampling=2,
+          patches=[PatchEntry(ref=0, x0=8, y0=8, xsize=40, ysize=32, x=8, y=8, blend_mode=PATCH_BLEND_ADD)],
+      )
+    with pytest.raises(ValueError):
+      reconstruct_patch_composite(
+          ref_state,
+          main_state,
+          upsampling=2,
+          patches=[PatchEntry(ref=0, x0=0, y0=0, xsize=128, ysize=128, x=0, y=0, blend_mode=1)],
+      )
 
 
 @pytest.mark.parametrize("upsampling", [2, 4, 8])

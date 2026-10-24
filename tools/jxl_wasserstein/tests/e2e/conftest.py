@@ -41,7 +41,7 @@ from PIL import Image
 import pytest
 
 from jxl_wasserstein.cpp_bridge import (
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ADD,
     compute_psnr,
     decode_with_djxl,
     verify_jxl_codestream,
@@ -566,13 +566,13 @@ def cached_patch_composite_u2(
     composite_smooth_sharp_64_01: np.ndarray,
     vgg_params_session: Any,
 ) -> Any:
-  """Cached session-scoped U=2 kReplace patch composite optimization result."""
+  """Cached session-scoped U=2 single full-frame kAdd patch composite optimization result."""
   from jxl_wasserstein.compositing import optimize_patch_composite
 
   return optimize_patch_composite(
       composite_smooth_sharp_64_01,
       upsampling=2,
-      blend_mode=PATCH_BLEND_REPLACE,
+      blend_mode=PATCH_BLEND_ADD,
       distance=0.35,
       lambda_rd=0.05,
       num_steps=1,
@@ -614,7 +614,7 @@ def cached_auto_mode_selection(
       candidate_modes=("single", "patches", "alpha"),
       upsampling_candidates=(2,),
       dim_shift_candidates=(0,),
-      blend_mode_candidates=(PATCH_BLEND_REPLACE,),
+      blend_mode_candidates=(PATCH_BLEND_ADD,),
       distance=0.35,
       lambda_rd=0.18,
       num_steps=1,

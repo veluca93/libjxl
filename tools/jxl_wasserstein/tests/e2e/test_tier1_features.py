@@ -31,7 +31,6 @@ from jxl_wasserstein.cpp_bridge import (
     JXL_CLI_BIN,
     JXLINFO_BIN,
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -413,14 +412,14 @@ def test_f3_no_static_heuristics_or_hardcoded_acs0(
     res_p = comp_mod.optimize_patch_composite(
         composite_smooth_sharp_64_01[:32, :32],
         upsampling=2,
-        blend_mode=PATCH_BLEND_REPLACE,
+        blend_mode=PATCH_BLEND_ADD,
         distance=0.5,
         lambda_rd=0.05,
         num_steps=1,
         verify_decoders=False,
         vgg_params=vgg_params_session,
     )
-    assert len(get_field(res_p, "patches") or []) >= 1
+    assert len(get_field(res_p, "patches") or []) == 1
     res_a = comp_mod.optimize_alpha_composite(
         composite_smooth_sharp_64_01[:32, :32],
         upsampling=2,
@@ -749,14 +748,16 @@ def test_f7_differentiable_custom_dequant_forward_and_rate(
     assert float(np.linalg.norm(grad_cust)) > 0.0
   elif check_name == "multires_composite_with_custom_dequant_vs_djxl":
     ref_st = _make_custom_ac_state(
-        init_state_from_rgb_jax(crop32[::2, ::2], distance=1.5, epf_iters=0), 1.20
+        init_state_from_rgb_jax(crop32[::2, ::2] * 0.6, distance=1.5, epf_iters=0), 1.20
     )
-    main_st = _make_custom_ac_state(base_state, 1.25)
+    main_st = _make_custom_ac_state(
+        init_state_from_rgb_jax(crop32 * 0.4, distance=1.5, epf_iters=0), 1.25
+    )
     proj_fn = getattr(fm_mod, "project_custom_dequant_matrices", None)
     if proj_fn is not None:
       ref_st.dequant_matrices, _ = proj_fn(ref_st.dequant_matrices)
       main_st.dequant_matrices, _ = proj_fn(main_st.dequant_matrices)
-    patches = [PatchEntry(0, 0, 0, 16, 16, 0, 0, PATCH_BLEND_REPLACE)]
+    patches = [PatchEntry(0, 0, 0, 32, 32, 0, 0, PATCH_BLEND_ADD)]
     jb, _ = encode_patches_composite(ref_st, main_st, upsampling=2, patches=patches)
     djxl_rgb = decode_with_djxl(jb).astype(np.float32) / 255.0
     jax_rgb = np.asarray(
@@ -915,7 +916,7 @@ def test_f9_stage1_candidate_exploration(
         composite_smooth_sharp_64_01,
         candidate_modes=("patches",),
         upsampling_candidates=(2, 4, 8),
-        blend_mode_candidates=(PATCH_BLEND_REPLACE,),
+        blend_mode_candidates=(PATCH_BLEND_ADD,),
         distance=0.5,
         lambda_rd=0.12,
         num_steps=1,
@@ -930,7 +931,7 @@ def test_f9_stage1_candidate_exploration(
         candidate_modes=("single", "patches", "alpha"),
         upsampling_candidates=(2,),
         dim_shift_candidates=(0,),
-        blend_mode_candidates=(PATCH_BLEND_REPLACE,),
+        blend_mode_candidates=(PATCH_BLEND_ADD,),
         distance=0.45,
         lambda_rd=0.15,
         num_steps=1,
@@ -1000,7 +1001,7 @@ def test_f10_stage2_discrete_decisions(
     res_p = comp_mod.optimize_patch_composite(
         composite_smooth_sharp_64_01,
         upsampling=2,
-        blend_mode=PATCH_BLEND_REPLACE,
+        blend_mode=PATCH_BLEND_ADD,
         distance=0.45,
         lambda_rd=0.08,
         num_steps=1,
@@ -1008,9 +1009,9 @@ def test_f10_stage2_discrete_decisions(
         vgg_params=vgg_params_session,
     )
     patches = get_field(res_p, "patches")
-    assert patches is not None and len(patches) >= 1
+    assert patches is not None and len(patches) == 1
     for p in patches:
-      assert p.blend_mode in (PATCH_BLEND_REPLACE, PATCH_BLEND_ADD)
+      assert p.blend_mode == PATCH_BLEND_ADD
   elif check_name == "stage2_initializes_xyb_alpha_from_rate_wd_advantage_map":
     res_a = comp_mod.optimize_alpha_composite(
         composite_smooth_sharp_64_01,
@@ -1073,7 +1074,7 @@ def test_f11_stage3_continuous_refinement_and_custom_dequant(
     res_p = comp_mod.optimize_patch_composite(
         composite_smooth_sharp_64_01,
         upsampling=2,
-        blend_mode=PATCH_BLEND_REPLACE,
+        blend_mode=PATCH_BLEND_ADD,
         distance=0.45,
         lambda_rd=0.06,
         num_steps=3,
@@ -1212,7 +1213,7 @@ def test_f12_entropy_proxy_correlation_and_lambda_monotonicity(
   elif check_name == "patch_and_alpha_composite_rate_proxies":
     ref_st = init_state_from_rgb_jax(crop32[::2, ::2], distance=1.8)
     main_st = init_state_from_rgb_jax(crop32, distance=1.2)
-    patches = [PatchEntry(0, 0, 0, 16, 16, 0, 0, PATCH_BLEND_REPLACE)]
+    patches = [PatchEntry(0, 0, 0, 32, 32, 0, 0, PATCH_BLEND_ADD)]
     p_bits = float(
         soft_patch_composite_rate_proxy(ref_st, main_st, patches=patches, upsampling=2)
     )

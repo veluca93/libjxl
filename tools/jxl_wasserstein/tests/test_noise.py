@@ -10,7 +10,7 @@ from PIL import Image
 import pytest
 
 from jxl_wasserstein.cpp_bridge import (
-    PATCH_BLEND_REPLACE,
+    PATCH_BLEND_ADD,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -239,13 +239,13 @@ def test_synthesize_jxl_noise_matches_djxl_multiframe_patches_and_alpha() -> Non
       dtype=np.float32,
   ) / 255.0
 
-  ref_state = init_state_from_rgb_jax(rgb_low, distance=2.0)
-  main_state = init_state_from_rgb_jax(rgb_01, distance=1.5)
+  ref_state = init_state_from_rgb_jax(rgb_low * 0.65, distance=2.0)
+  main_state = init_state_from_rgb_jax(rgb_01 * 0.35, distance=1.5)
   noise_lut = [float(k) / 1024.0 for k in (32, 40, 48, 56, 64, 72, 80, 88)]
 
-  # 1. Patch composite with noise
+  # 1. Single full-frame kAdd patch composite with noise
   patches = [
-      PatchEntry(ref=0, x0=16, y0=16, xsize=48, ysize=48, x=16, y=16, blend_mode=PATCH_BLEND_REPLACE)
+      PatchEntry(ref=0, x0=0, y0=0, xsize=128, ysize=128, x=0, y=0, blend_mode=PATCH_BLEND_ADD)
   ]
   jxl_p_clean, _ = encode_patches_composite(ref_state, main_state, upsampling=2, patches=patches)
   jxl_p_noisy, _ = encode_patches_composite(

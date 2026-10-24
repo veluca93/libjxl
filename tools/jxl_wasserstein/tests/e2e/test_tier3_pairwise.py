@@ -16,7 +16,6 @@ from scipy.stats import spearmanr
 from jxl_wasserstein.cli import main as cli_main
 from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ADD,
-    PATCH_BLEND_REPLACE,
     PatchEntry,
     compute_psnr,
     encode_alpha_composite,
@@ -206,7 +205,7 @@ def test_tier3_xyb_patch_alpha_upsampling_dimshift_blend_dequant_noise_combo(
 
 
 # =============================================================================
-# Group 3: Discrete XYB PatchDictionary (kReplace & kAdd) Across U in {2,4,8}
+# Group 3: Single Full-Frame XYB PatchDictionary (kAdd) Across U in {2,4,8}
 #          x 3-Stage Rate-WD Selection x Custom DequantMatrices x NoiseParams (4 test cases)
 # =============================================================================
 
@@ -214,9 +213,9 @@ def test_tier3_xyb_patch_alpha_upsampling_dimshift_blend_dequant_noise_combo(
 @pytest.mark.parametrize(
     "upsampling,blend_mode,custom_dequant,enable_noise",
     [
-        (2, PATCH_BLEND_REPLACE, True, False),
+        (2, PATCH_BLEND_ADD, True, False),
         (2, PATCH_BLEND_ADD, True, True),
-        (4, PATCH_BLEND_REPLACE, True, False),
+        (4, PATCH_BLEND_ADD, True, False),
         (8, PATCH_BLEND_ADD, False, False),
     ],
 )
@@ -229,7 +228,7 @@ def test_tier3_patch_composite_upsampling_blend_dequant_noise_combo(
     vgg_params_session: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-  """Verifies ReferenceOnly (U in {2,4,8}) + PatchDictionary (kReplace/kAdd) + custom DequantMatrices + NoiseParams."""
+  """Verifies ReferenceOnly (U in {2,4,8}) + single full-frame PatchDictionary (kAdd) + custom DequantMatrices + NoiseParams."""
   from jxl_wasserstein.compositing import optimize_patch_composite
 
   extra_kw = _with_custom_dequant_kw(optimize_patch_composite, custom_dequant)
@@ -258,7 +257,7 @@ def test_tier3_patch_composite_upsampling_blend_dequant_noise_combo(
   assert info["frames"][0]["upsampling"] == upsampling
   assert info["frames"][0]["save_before_color_transform"] is True
   assert info["frames"][1]["has_patches"] is True
-  assert info["frames"][1]["num_patches"] >= 1
+  assert info["frames"][1]["num_patches"] == 1
   assert info["all_default"] is (not custom_dequant)
 
   if enable_noise:
@@ -297,11 +296,11 @@ def test_tier3_entropy_proxy_spearman_across_modes_with_custom_dequant(
       proxy_rates.append(float(soft_jxl_rate_proxy(st)))
       true_rates.append(float(stats["total_bits"]))
   elif stream_mode == "patches":
-    ref_crop = kodim01_crop_64_01[::2, ::2]
-    patches = [PatchEntry(0, 0, 0, 32, 32, 0, 0, PATCH_BLEND_REPLACE)]
+    ref_crop = kodim01_crop_64_01[::2, ::2] * 0.6
+    patches = [PatchEntry(0, 0, 0, 64, 64, 0, 0, PATCH_BLEND_ADD)]
     for d in distances:
       ref_st = init_state_from_rgb_jax(ref_crop, distance=d * 1.2)
-      main_st = init_state_from_rgb_jax(kodim01_crop_64_01, distance=d)
+      main_st = init_state_from_rgb_jax(kodim01_crop_64_01 * 0.4, distance=d)
       main_st.dequant_matrices = {k: v.copy() for k, v in custom_dq.items()}
       jb, _ = encode_patches_composite(
           ref_st, main_st, upsampling=2, patches=patches

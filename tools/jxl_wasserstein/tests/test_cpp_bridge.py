@@ -21,7 +21,6 @@ from jxl_wasserstein.cpp_bridge import (
     PATCH_BLEND_ALPHA_BELOW,
     PATCH_BLEND_MUL_ADD_ABOVE,
     PATCH_BLEND_MUL_ADD_BELOW,
-    PATCH_BLEND_REPLACE,
     PatchEntry,
     compute_psnr,
     decode_with_djxl,
@@ -183,41 +182,35 @@ def composite_states_128(
 
 
 @pytest.mark.parametrize("upsampling", [2, 4, 8])
-@pytest.mark.parametrize("blend_mode", [PATCH_BLEND_REPLACE, PATCH_BLEND_ADD])
+@pytest.mark.parametrize("explicit_patch", [False, True])
 def test_encode_patches_all_upsampling_and_blend_modes(
     composite_states_128: tuple[dict[int, object], object],
     upsampling: int,
-    blend_mode: int,
+    explicit_patch: bool,
 ) -> None:
-  """Verifies --encode-patches across U in {2, 4, 8} and kReplace/kAdd in djxl and jxl-rs."""
+  """Verifies --encode-patches across U in {2, 4, 8} with single full-frame kAdd in djxl and jxl-rs."""
   ref_states, main_state = composite_states_128
   ref_state = ref_states[upsampling]
 
-  patches = [
-      PatchEntry(
-          ref=0,
-          x0=8,
-          y0=8,
-          xsize=32,
-          ysize=24,
-          x=8,
-          y=8,
-          blend_mode=blend_mode,
-      ),
-      PatchEntry(
-          ref=0,
-          x0=64,
-          y0=48,
-          xsize=24,
-          ysize=32,
-          x=64,
-          y=48,
-          blend_mode=blend_mode,
-      ),
-  ]
+  patches = (
+      [
+          PatchEntry(
+              ref=0,
+              x0=0,
+              y0=0,
+              xsize=128,
+              ysize=128,
+              x=0,
+              y=0,
+              blend_mode=PATCH_BLEND_ADD,
+          )
+      ]
+      if explicit_patch
+      else None
+  )
   noise_lut = (
       [0.01, 0.02, 0.02, 0.03, 0.03, 0.03, 0.03, 0.03]
-      if upsampling == 2 and blend_mode == PATCH_BLEND_ADD
+      if upsampling == 2 and explicit_patch
       else None
   )
 
@@ -245,10 +238,37 @@ def test_encode_patches_all_upsampling_and_blend_modes(
   assert f1["upsampling"] == 1
   assert f1["is_last"] is True
   assert f1["has_patches"] is True
-  assert f1["num_patches"] == 2
-  assert f1["patch_blend_modes"] == [blend_mode, blend_mode]
+  assert f1["num_patches"] == 1
+  assert f1["patch_blend_modes"] == [PATCH_BLEND_ADD]
   if noise_lut is not None:
     assert f1["has_noise"] is True
+
+  if upsampling == 2 and explicit_patch:
+    # Reject color kReplace (1), sub-frame patches, and multi-patch lists
+    with pytest.raises(ValueError):
+      encode_patches_composite(
+          ref_state,  # type: ignore[arg-type]
+          main_state,  # type: ignore[arg-type]
+          upsampling=2,
+          patches=[PatchEntry(0, 0, 0, 128, 128, 0, 0, 1)],
+      )
+    with pytest.raises(ValueError):
+      encode_patches_composite(
+          ref_state,  # type: ignore[arg-type]
+          main_state,  # type: ignore[arg-type]
+          upsampling=2,
+          patches=[PatchEntry(0, 8, 8, 64, 64, 8, 8, PATCH_BLEND_ADD)],
+      )
+    with pytest.raises(ValueError):
+      encode_patches_composite(
+          ref_state,  # type: ignore[arg-type]
+          main_state,  # type: ignore[arg-type]
+          upsampling=2,
+          patches=[
+              PatchEntry(0, 0, 0, 128, 128, 0, 0, PATCH_BLEND_ADD),
+              PatchEntry(0, 0, 0, 128, 128, 0, 0, PATCH_BLEND_ADD),
+          ],
+      )
 
 
 @pytest.mark.parametrize("upsampling", [2, 4, 8])
@@ -307,7 +327,7 @@ def test_encode_alpha_all_upsampling_and_dim_shifts(
   assert f1["has_patches"] is True
   assert f1["num_patches"] == 1
   assert f1["patch_blend_modes"] == [PATCH_BLEND_ALPHA_BELOW]
-  assert f1["patch_ec_blend_modes"] == [PATCH_BLEND_REPLACE]
+  assert f1["patch_ec_blend_modes"] == [1]  # EC kReplace restores opaque alpha
   assert f1["is_last"] is True
 
 
@@ -380,37 +400,58 @@ def test_encode_alpha_xyb_patch_blend_modes_and_regional_patches(
   f0, f1 = ver["inspect"]["frames"]
   assert f0["save_before_color_transform"] is True
   assert f1["has_patches"] is True
+  assert f1["num_patches"] == 1
   assert f1["patch_blend_modes"] == [alpha_blend_mode]
-  assert f1["patch_ec_blend_modes"] == [PATCH_BLEND_REPLACE]
+  assert f1["patch_ec_blend_modes"] == [1]  # EC kReplace restores opaque alpha
 
   if alpha_blend_mode == PATCH_BLEND_ALPHA_BELOW:
-    regional_patches = [
+    full_frame_patches = [
         PatchEntry(
             ref=0,
-            x0=16,
-            y0=16,
-            xsize=48,
-            ysize=48,
-            x=16,
-            y=16,
+            x0=0,
+            y0=0,
+            xsize=128,
+            ysize=128,
+            x=0,
+            y=0,
             blend_mode=PATCH_BLEND_ALPHA_BELOW,
         )
     ]
     alpha_reg = np.full((64, 64), 255, dtype=np.uint8)
     alpha_reg[12:28, 12:28] = 96
-    jxl_reg, _ = encode_alpha_composite(
+    jxl_full, _ = encode_alpha_composite(
         ref_state,  # type: ignore[arg-type]
         main_state,  # type: ignore[arg-type]
         upsampling=2,
         dim_shift=1,
         alpha_u8=alpha_reg,
-        patches=regional_patches,
+        patches=full_frame_patches,
     )
-    ver_reg = verify_jxl_codestream(jxl_reg, min_cross_decoder_psnr=45.0)
-    assert ver_reg["inspect"]["frames"][1]["num_patches"] == 1
-    assert ver_reg["inspect"]["frames"][1]["patch_blend_modes"] == [
+    ver_full = verify_jxl_codestream(jxl_full, min_cross_decoder_psnr=45.0)
+    assert ver_full["inspect"]["frames"][1]["num_patches"] == 1
+    assert ver_full["inspect"]["frames"][1]["patch_blend_modes"] == [
         PATCH_BLEND_ALPHA_BELOW
     ]
+
+    # Sub-frame regional patches and color kReplace (1) must be rejected
+    with pytest.raises(ValueError):
+      encode_alpha_composite(
+          ref_state,  # type: ignore[arg-type]
+          main_state,  # type: ignore[arg-type]
+          upsampling=2,
+          dim_shift=1,
+          alpha_u8=alpha_reg,
+          patches=[PatchEntry(0, 16, 16, 48, 48, 16, 16, PATCH_BLEND_ALPHA_BELOW)],
+      )
+    with pytest.raises(ValueError):
+      encode_alpha_composite(
+          ref_state,  # type: ignore[arg-type]
+          main_state,  # type: ignore[arg-type]
+          upsampling=2,
+          dim_shift=1,
+          alpha_u8=alpha_reg,
+          alpha_blend_mode=1,
+      )
 
 
 def test_custom_dequant_matrices_and_dc_quant_bitstream_serialization(
