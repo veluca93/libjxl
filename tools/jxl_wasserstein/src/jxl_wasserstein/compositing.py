@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 import functools
+import math
 import os
 from typing import Any, Callable, Sequence
 
@@ -42,7 +43,9 @@ from scipy.ndimage import binary_closing, label as ndimage_label, uniform_filter
 
 _CPP_ENCODE_POOL = ThreadPoolExecutor(max_workers=4)
 
-_JAX_CACHE_DIR = "/tmp/jxl_wasserstein_jax_cache"
+_JAX_CACHE_DIR = os.environ.get(
+    "JAX_COMPILATION_CACHE_DIR", "/tmp/jxl_wasserstein_jax_cache"
+)
 try:
   os.makedirs(_JAX_CACHE_DIR, exist_ok=True)
   jax.config.update("jax_compilation_cache_dir", _JAX_CACHE_DIR)
@@ -102,6 +105,7 @@ from jxl_wasserstein.forward_model import (
 )
 from jxl_wasserstein.optimizer import (
     DEFAULT_CANDIDATE_AC_STRATEGIES,
+    _STAGE1_CACHE,
     _compute_precond_scales_jax,
     _jit_extract_vgg_features,
     _jit_wd_eval_chw,
@@ -116,7 +120,7 @@ from jxl_wasserstein.optimizer import (
     stage2_select_non_overlapping_ac_strategy,
     validate_ac_strategy_tiling,
 )
-from jxl_wasserstein.noise import eval_noise_strength_lut
+from jxl_wasserstein.noise import eval_noise_strength_lut, get_convolved_noise_planes
 from jxl_wasserstein.vgg import load_vgg16_params, multiscale_vgg_features
 from jxl_wasserstein.wasserstein import (
     compute_spatial_wd_map,
@@ -348,7 +352,13 @@ def _calibrate_ref_distance(
   d_base = max(float(d_main), 0.05)
   u_eff = float(max(int(upsampling), 1))
   if enable_noise and u_eff > 1.0:
+    if d_base >= 2.2:
+      d_amort = d_base / (u_eff ** 1.35)
+      d_floor = float(np.clip(0.32 * (d_base - 1.4), 0.25, 1.65))
+      return max(d_floor, d_amort)
     return max(0.08, d_base / (u_eff ** 2.50))
+  if u_eff > 1.0 and d_base > 2.0:
+    return max(1.44, d_base / (u_eff ** 0.85))
   return max(0.10, d_base * 0.72)
 
 
@@ -649,43 +659,71 @@ def _resolve_enable_noise(
   )
 
 
-@jax.jit
+def _max_noise_lut_bound(
+    enable_noise: bool, has_sensor_grain: bool, sensor_lut_np: np.ndarray
+) -> float:
+  """Upper bound on optimized NoiseParams LUT preventing over-synthesized grain at high d."""
+  if not enable_noise:
+    return 0.0
+  if has_sensor_grain:
+    return float(np.clip(1.65 * float(np.max(sensor_lut_np)), 0.008, 0.032))
+  return 0.032
+
+
+@functools.partial(jax.jit, static_argnames=("strides", "strong_denoise"))
 def _shrink_sensor_grain_xyb_jax(
-    xyb_chw: jax.Array, noise_lut: jax.Array
+    xyb_chw: jax.Array,
+    noise_lut: jax.Array,
+    strides: tuple[int, ...] = (1,),
+    strong_denoise: bool = False,
 ) -> jax.Array:
-  """1-pass 3x3 edge-stopped XYB shrinkage preventing double-noise (2*sigma^2) when NoiseParams is active."""
+  """Edge-stopped XYB sensor-grain shrinkage (gentle 1-pass for 1:1, multi-scale for low-bit ReferenceOnly)."""
   vx, vy, vb = xyb_chw[0], xyb_chw[1], xyb_chw[2]
   s_lut = 0.5 * (
       eval_noise_strength_lut(0.5 * (vy - vx), noise_lut)
       + eval_noise_strength_lut(0.5 * (vy + vx), noise_lut)
   )
-  sigma_y = 0.50 * s_lut
   planes = jnp.stack([vx, vy, vb - vy], axis=0)
-  tau = jnp.stack(
-      [0.35 * sigma_y, 1.05 * sigma_y, 0.55 * sigma_y], axis=0
-  )
-  pad = jnp.pad(planes, ((0, 0), (1, 1), (1, 1)), mode="symmetric")
-  w_sum = jnp.ones_like(planes)
-  v_sum = planes
+  if strong_denoise:
+    tau = jnp.stack(
+        [
+            jnp.maximum(1.25 * s_lut, 0.0035),
+            jnp.maximum(1.35 * s_lut, 0.0030),
+            jnp.maximum(2.40 * s_lut, 0.0065),
+        ],
+        axis=0,
+    )
+  else:
+    sigma_y = 0.50 * s_lut
+    tau = jnp.stack(
+        [0.35 * sigma_y, 1.05 * sigma_y, 0.55 * sigma_y], axis=0
+    )
   tau2 = jnp.square(1.8 * tau) + 1e-10
   y_tau2 = jnp.square(1.8 * tau[1:2]) + 1e-10
-  for dy in (-1, 0, 1):
-    for dx in (-1, 0, 1):
-      if dy == 0 and dx == 0:
-        continue
-      nb = pad[
-          :,
-          1 + dy : 1 + dy + planes.shape[1],
-          1 + dx : 1 + dx + planes.shape[2],
-      ]
-      r2 = (
-          jnp.square(nb - planes) / tau2
-          + 0.5 * jnp.square(nb[1:2] - planes[1:2]) / y_tau2
-      )
-      w_nb = 1.0 / (1.0 + r2 * r2)
-      w_sum = w_sum + w_nb
-      v_sum = v_sum + w_nb * nb
-  cur = v_sum / w_sum
+  cur = planes
+  h_p, w_p = int(planes.shape[1]), int(planes.shape[2])
+  for st in strides:
+    st_i = int(st)
+    if h_p <= st_i or w_p <= st_i:
+      continue
+    pad = jnp.pad(cur, ((0, 0), (st_i, st_i), (st_i, st_i)), mode="symmetric")
+    w_sum = jnp.ones_like(cur)
+    v_sum = cur
+    for dy in (-1, 0, 1):
+      for dx in (-1, 0, 1):
+        if dy == 0 and dx == 0:
+          continue
+        oy = st_i + dy * st_i
+        ox = st_i + dx * st_i
+        nb = pad[:, oy : oy + h_p, ox : ox + w_p]
+        r2 = (
+            jnp.square(nb - cur) / tau2
+            + 0.5 * jnp.square(nb[1:2] - cur[1:2]) / y_tau2
+        )
+        w_nb = 1.0 / (1.0 + r2 * r2)
+        w_sum = w_sum + w_nb
+        v_sum = v_sum + w_nb * nb
+    cur = v_sum / w_sum
   return jnp.stack([cur[0], cur[1], cur[2] + cur[1]], axis=0)
 
 
@@ -1056,21 +1094,31 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         break
 
   default_cands = tuple(
-      int(s)
-      for s in DEFAULT_CANDIDATE_AC_STRATEGIES
-      if h8_int >= ACS_COVERED_BLOCKS_Y[s] and w8_int >= ACS_COVERED_BLOCKS_X[s]
+      int(s_id)
+      for s_id in DEFAULT_CANDIDATE_AC_STRATEGIES
+      if h8_int >= ACS_COVERED_BLOCKS_Y[s_id]
+      and w8_int >= ACS_COVERED_BLOCKS_X[s_id]
   )
+  used_set = set(used_unique) | {0}
   if all_zero:
     canon_s: tuple[int, ...] = (0,)
     use_traced_acs = True
-  elif traced_ok and set(used_unique).issubset(set(default_cands)):
+  elif traced_ok and used_set.issubset({0, 4, 5, 6, 7}):
+    canon_s = tuple(
+        int(s_id)
+        for s_id in (0, 4, 5, 6, 7)
+        if h8_int >= ACS_COVERED_BLOCKS_Y[s_id]
+        and w8_int >= ACS_COVERED_BLOCKS_X[s_id]
+    )
+    use_traced_acs = True
+  elif traced_ok and used_set.issubset(set(default_cands)):
     canon_s = default_cands
     use_traced_acs = True
   elif traced_ok:
-    canon_s = used_unique
+    canon_s = tuple(sorted(used_set))
     use_traced_acs = True
   else:
-    canon_s = used_unique
+    canon_s = tuple(sorted(used_set))
     use_traced_acs = False
 
   if use_traced_acs:
@@ -1253,29 +1301,22 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
       )
       return w_3hw, non_llf_hw
 
-    def _couple_ac_dc(
-        ac: jax.Array,
-        dc: jax.Array,
+    def _prepare_coupling_maps(
         rq: jax.Array,
         rq_base: jax.Array | None,
         dq_mats_cur: dict[int, jax.Array],
-        dc_w_cur: jax.Array,
         dq_log_base: jax.Array | None,
-        x_qm: jax.Array,
-        b_qm: jax.Array,
-        yx: jax.Array | None = None,
-        yb: jax.Array | None = None,
-        yx_base: jax.Array | None = None,
-        yb_base: jax.Array | None = None,
         acs_g: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ):
       h8_t, w8_t = topo.h8, topo.w8
       if rq_base is not None:
         rq_tl = topo.broadcast_top_left_grid(
             jnp.clip(rq, 1.0, 256.0), acs_grid=acs_g
         )
-        rq_b_tl = topo.broadcast_top_left_grid(
-            jnp.clip(rq_base, 1.0, 256.0), acs_grid=acs_g
+        rq_b_tl = jax.lax.stop_gradient(
+            topo.broadcast_top_left_grid(
+                jnp.clip(rq_base, 1.0, 256.0), acs_grid=acs_g
+            )
         )
         rq_ratio_tl = rq_tl / jnp.maximum(rq_b_tl, 1.0)
         rq_ratio_px = jnp.broadcast_to(
@@ -1285,9 +1326,37 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         rq_ratio_px = jnp.float32(1.0)
 
       w_cur, non_llf_hw = _expand_dq_mats_and_non_llf(dq_mats_cur, acs_g)
+      non_llf_hw = jax.lax.stop_gradient(non_llf_hw)
       if dq_log_base is not None and int(dq_log_base.shape[0]) > 0:
-        dq_mats_b, dc_w_b, _, _ = _build_dq_mats_and_dc_w(dq_log_base)
+        dq_mats_b, dc_w_b, _, _ = _build_dq_mats_and_dc_w(
+            jax.lax.stop_gradient(dq_log_base)
+        )
         w_base, _ = _expand_dq_mats_and_non_llf(dq_mats_b, acs_g)
+        w_base = jax.lax.stop_gradient(w_base)
+        dc_w_b = jax.lax.stop_gradient(dc_w_b)
+      else:
+        w_base = None
+        dc_w_b = None
+      return rq_ratio_px, w_cur, non_llf_hw, w_base, dc_w_b
+
+    def _apply_coupled_ac_dc(
+        ac: jax.Array,
+        dc: jax.Array,
+        rq_ratio_px: jax.Array,
+        w_cur: jax.Array,
+        non_llf_hw: jax.Array,
+        dc_w_cur: jax.Array,
+        w_base: jax.Array | None,
+        dc_w_b: jax.Array | None,
+        x_qm: jax.Array,
+        b_qm: jax.Array,
+        yx: jax.Array | None = None,
+        yb: jax.Array | None = None,
+        yx_base: jax.Array | None = None,
+        yb_base: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+      h8_t, w8_t = topo.h8, topo.w8
+      if w_base is not None and dc_w_b is not None:
         u_ac = ac * rq_ratio_px * (w_base / jnp.maximum(w_cur, 1e-12))
         u_dc = dc * (dc_w_b / jnp.maximum(dc_w_cur, 1e-12))[:, None, None]
       else:
@@ -1303,10 +1372,12 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         ht_t, wt_t = topo.ht, topo.wt
         cf_f = jnp.float32(topo.color_factor)
         dx_tile = (
-            jnp.clip(yx, -128.0, 127.0) - jnp.clip(yx_base, -128.0, 127.0)
+            jnp.clip(yx, -128.0, 127.0)
+            - jax.lax.stop_gradient(jnp.clip(yx_base, -128.0, 127.0))
         ) / cf_f
         db_tile = (
-            jnp.clip(yb, -128.0, 127.0) - jnp.clip(yb_base, -128.0, 127.0)
+            jnp.clip(yb, -128.0, 127.0)
+            - jax.lax.stop_gradient(jnp.clip(yb_base, -128.0, 127.0))
         ) / cf_f
         dx_px = jnp.broadcast_to(
             dx_tile[:, None, :, None], (ht_t, 64, wt_t, 64)
@@ -1325,6 +1396,42 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         )
         u_ac = jnp.stack([u_x, u_ac[1], u_b], axis=0)
       return u_ac, u_dc
+
+    def _couple_ac_dc(
+        ac: jax.Array,
+        dc: jax.Array,
+        rq: jax.Array,
+        rq_base: jax.Array | None,
+        dq_mats_cur: dict[int, jax.Array],
+        dc_w_cur: jax.Array,
+        dq_log_base: jax.Array | None,
+        x_qm: jax.Array,
+        b_qm: jax.Array,
+        yx: jax.Array | None = None,
+        yb: jax.Array | None = None,
+        yx_base: jax.Array | None = None,
+        yb_base: jax.Array | None = None,
+        acs_g: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+      rq_ratio_px, w_cur, non_llf_hw, w_base, dc_w_b = _prepare_coupling_maps(
+          rq, rq_base, dq_mats_cur, dq_log_base, acs_g
+      )
+      return _apply_coupled_ac_dc(
+          ac,
+          dc,
+          rq_ratio_px,
+          w_cur,
+          non_llf_hw,
+          dc_w_cur,
+          w_base,
+          dc_w_b,
+          x_qm,
+          b_qm,
+          yx=yx,
+          yb=yb,
+          yx_base=yx_base,
+          yb_base=yb_base,
+      )
 
     @jax.jit
     def _raw_forward_xyb_fn(
@@ -1347,6 +1454,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         dq_log_base=None,
         yx_base=None,
         yb_base=None,
+        conv_noise=None,
     ):
       dq_mats, dc_w, _, _ = _build_dq_mats_and_dc_w(dq_log_scale)
       u_ac, u_dc = _couple_ac_dc(
@@ -1387,6 +1495,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
           include_noise=enable_noise,
           noise_lut=noise_lut if enable_noise else None,
           acs_grid=acs_g,
+          convolved_noise=conv_noise,
       )
 
     @jax.jit
@@ -1407,6 +1516,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         noise_lut,
         dq_mats,
         dc_w,
+        conv_noise=None,
     ):
       return reconstruct_single_frame_xyb(
           topo,
@@ -1430,6 +1540,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
           include_noise=enable_noise,
           noise_lut=noise_lut if enable_noise else None,
           acs_grid=acs_g,
+          convolved_noise=conv_noise,
       )
 
     def frame_surrogate(
@@ -1454,6 +1565,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         dq_log_base=None,
         ac_rate_weight=1.0,
         cluster_blend=0.0,
+        conv_noise=None,
     ):
       ac = p["ac"] * ac_mask
       dc = p["dc"] * dc_mask + dc_bg
@@ -1465,7 +1577,9 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
       has_dq = dq_log is not None and int(dq_log.shape[0]) > 0
 
       @functools.partial(jax.checkpoint, prevent_cse=False)
-      def _recon_dot_fn(ac_in, dc_in, rq_in, yx_in, yb_in, n_lut_in, dq_log_in):
+      def _recon_dot_fn(
+          ac_in, dc_in, rq_in, yx_in, yb_in, n_lut_in, dq_log_in, conv_noise_in
+      ):
         dq_mats_c, dc_w_c, _, _ = _build_dq_mats_and_dc_w(dq_log_in)
         u_ac_c, u_dc_c = _couple_ac_dc(
             ac_in,
@@ -1505,6 +1619,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
             include_noise=enable_noise,
             noise_lut=n_lut_in if enable_noise else None,
             acs_grid=acs_g,
+            convolved_noise=conv_noise_in,
         )
         return jnp.sum(xyb_c * cotangent_xyb)
 
@@ -1561,7 +1676,7 @@ def _resolve_frame_kernel_entry(state: JxlVarDCTState, enable_noise: bool):
         )
         return bits_c + dq_bits_c
 
-      recon_dot = _recon_dot_fn(ac, dc, rq, yx, yb, n_lut, dq_log)
+      recon_dot = _recon_dot_fn(ac, dc, rq, yx, yb, n_lut, dq_log, conv_noise)
       total_bits = _rate_bits_fn(ac, dc, rq, yx, yb, n_lut, dq_log)
       return recon_dot + lam_per_px * total_bits, total_bits
 
@@ -1602,6 +1717,11 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
   ytox_dc_arg = jnp.float32(state.ytox_dc)
   ytob_dc_arg = jnp.float32(state.ytob_dc)
   epf_sharp_arg = jnp.asarray(state.epf_sharpness, dtype=jnp.int32)
+  conv_noise_arg = (
+      get_convolved_noise_planes(int(state.height), int(state.width), 1, 0)
+      if enable_noise
+      else None
+  )
 
   def forward_xyb_fn(
       ac,
@@ -1638,6 +1758,7 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
         dq_log_base,
         yx_base,
         yb_base,
+        conv_noise_arg,
     )
 
   def vjp_and_rate_grad_fn(
@@ -1679,24 +1800,69 @@ def _get_frame_kernels(state: JxlVarDCTState, enable_noise: bool):
         dq_log_base,
         ac_rate_weight,
         cluster_blend,
+        conv_noise_arg,
     )
 
   return forward_xyb_fn, vjp_and_rate_grad_fn
 
 
-@functools.lru_cache(maxsize=16)
+@functools.lru_cache(maxsize=12)
+def _get_compiled_adam_updater(tree_kind: str, adam_eps: float):
+  """Returns cached `(init_fn, jit_step_fn)` fusing Adam moment updates and parameter steps."""
+  b2_fast = 0.85 if float(adam_eps) < 1e-6 else 0.999
+  tx_fast = optax.scale_by_adam(b1=0.5, b2=b2_fast, eps=float(adam_eps))
+  tx_meta = optax.scale_by_adam(b1=0.5, eps=1e-4)
+  frame_labels = {
+      "ac": "fast",
+      "dc": "fast",
+      "noise_lut": "meta",
+      "rq_delta": "meta",
+      "yx_delta": "meta",
+      "yb_delta": "meta",
+      "dq_log_scale": "meta",
+  }
+  if tree_kind == "single":
+    labels: Any = frame_labels
+  elif tree_kind == "patch":
+    labels = {"ref": frame_labels, "main": frame_labels}
+  elif tree_kind == "alpha":
+    labels = {"ref": frame_labels, "main": frame_labels, "alpha_logit": "meta"}
+  else:
+    raise ValueError(f"Unknown tree_kind: {tree_kind}")
+  base_tx = optax.multi_transform({"fast": tx_fast, "meta": tx_meta}, labels)
+
+  def _init_fn(params):
+    return base_tx.init(params)
+
+  @jax.jit
+  def _step_fn(grads, opt_state, params, lr_tree, lr_mul=jnp.float32(1.0)):
+    clean_grads = jax.tree_util.tree_map(
+        lambda x: jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0), grads
+    )
+    updates, new_opt_state = base_tx.update(clean_grads, opt_state, params)
+    scaled_updates = jax.tree_util.tree_map(
+        lambda u, lr: -(lr_mul * lr) * u, updates, lr_tree
+    )
+    new_params = optax.apply_updates(params, scaled_updates)
+    return new_params, new_opt_state, clean_grads
+
+  return _init_fn, _step_fn
+
+
+@functools.lru_cache(maxsize=24)
 def _get_patch_combine_kernels(h: int, w: int, u: int, enable_noise: bool = False):
   """Returns cached `(combine_fn, combine_grad_fn)` for XYB patch compositing with post-patch XYB noise."""
   dummy_state = init_state_from_rgb_jax(
-      np.zeros((h, w, 3), dtype=np.float32), distance=1.0, epf_iters=0
+      np.zeros((8, 8, 3), dtype=np.float32), distance=1.0, epf_iters=0
   )
   topo = StaticVarDCTTopology(dummy_state)
   inv_mat = topo.opsin_inv_matrix
   biases = topo.opsin_biases
   ytox = float(topo.base_correlation_x)
   ytob = float(topo.base_correlation_b)
+  conv_noise_arg = get_convolved_noise_planes(h, w, 1, 0) if enable_noise else None
 
-  def _combine(ref_xyb, main_xyb, w_ref, w_main, noise_lut):
+  def _combine(ref_xyb, main_xyb, w_ref, w_main, noise_lut, conv_noise=None):
     ref_ups = upsample_jxl(ref_xyb, u, out_hw=(h, w))
     comp_xyb = w_main * main_xyb + w_ref * ref_ups
     if enable_noise:
@@ -1708,23 +1874,31 @@ def _get_patch_combine_kernels(h: int, w: int, u: int, enable_noise: bool = Fals
           visible_frame_index=1,
           nonvisible_frame_index=0,
           ste_quantize_lut=True,
+          convolved_noise=conv_noise,
       )
     srgb_chw = opsin_to_srgb(comp_xyb, inv_mat, biases, clamp=True)
     return jnp.moveaxis(srgb_chw, 0, -1)
 
-  combine_fn = jax.jit(_combine)
-  combine_grad_fn = jax.jit(
+  combine_jit = jax.jit(_combine)
+  combine_grad_jit = jax.jit(
       jax.grad(
-          lambda r_xyb, m_xyb, wr, wm, n_lut, cot: jnp.sum(
-              _combine(r_xyb, m_xyb, wr, wm, n_lut) * cot
+          lambda r_xyb, m_xyb, wr, wm, n_lut, cot, c_noise: jnp.sum(
+              _combine(r_xyb, m_xyb, wr, wm, n_lut, c_noise) * cot
           ),
           argnums=(0, 1, 4),
       )
   )
+
+  def combine_fn(ref_xyb, main_xyb, w_ref, w_main, noise_lut):
+    return combine_jit(ref_xyb, main_xyb, w_ref, w_main, noise_lut, conv_noise_arg)
+
+  def combine_grad_fn(r_xyb, m_xyb, wr, wm, n_lut, cot):
+    return combine_grad_jit(r_xyb, m_xyb, wr, wm, n_lut, cot, conv_noise_arg)
+
   return combine_fn, combine_grad_fn
 
 
-@functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=24)
 def _get_alpha_combine_kernels(
     h: int,
     w: int,
@@ -1741,7 +1915,7 @@ def _get_alpha_combine_kernels(
   followed by optional post-patch XYB noise synthesis and `opsin_to_srgb`.
   """
   dummy_state = init_state_from_rgb_jax(
-      np.zeros((h, w, 3), dtype=np.float32), distance=1.0, epf_iters=0
+      np.zeros((8, 8, 3), dtype=np.float32), distance=1.0, epf_iters=0
   )
   topo = StaticVarDCTTopology(dummy_state)
   inv_mat = topo.opsin_inv_matrix
@@ -1750,11 +1924,12 @@ def _get_alpha_combine_kernels(
   ytob = float(topo.base_correlation_b)
   step_a = 1 << int(d_shift)
   bm = int(alpha_blend_mode)
+  conv_noise_arg = get_convolved_noise_planes(h, w, 1, 0) if enable_noise else None
 
   def _logit_to_alpha01(logit: jax.Array) -> jax.Array:
     return jax.nn.sigmoid(logit)
 
-  def _combine(ref_xyb, main_xyb, alpha_logit, noise_lut):
+  def _combine(ref_xyb, main_xyb, alpha_logit, noise_lut, conv_noise=None):
     ref_xyb_ups = upsample_jxl(ref_xyb, u, out_hw=(h, w))
     a_01 = _logit_to_alpha01(alpha_logit)
     a_q = ste_quantize_alpha_01(a_01, hard=False)
@@ -1778,24 +1953,48 @@ def _get_alpha_combine_kernels(
           visible_frame_index=1,
           nonvisible_frame_index=0,
           ste_quantize_lut=True,
+          convolved_noise=conv_noise,
       )
     srgb_chw = opsin_to_srgb(comp_xyb, inv_mat, biases, clamp=True)
     return jnp.moveaxis(srgb_chw, 0, -1)
 
   def _combine_surrogate(
-      ref_xyb, main_xyb, alpha_logit, noise_lut, cotangent_rec, lam_per_px
+      ref_xyb,
+      main_xyb,
+      alpha_logit,
+      noise_lut,
+      cotangent_rec,
+      lam_per_px,
+      conv_noise=None,
   ):
-    rec = _combine(ref_xyb, main_xyb, alpha_logit, noise_lut)
+    rec = _combine(ref_xyb, main_xyb, alpha_logit, noise_lut, conv_noise)
     a_01 = _logit_to_alpha01(alpha_logit)
     a_bits = soft_alpha_channel_bits(a_01, dim_shift=d_shift, full_hw=(h, w))
     return jnp.sum(rec * cotangent_rec) + lam_per_px * a_bits, a_bits
 
-  combine_fn = jax.jit(_combine)
-  combine_grad_fn = jax.jit(
+  combine_jit = jax.jit(_combine)
+  combine_grad_jit = jax.jit(
       jax.value_and_grad(
           _combine_surrogate, argnums=(0, 1, 2, 3), has_aux=True
       )
   )
+
+  def combine_fn(ref_xyb, main_xyb, alpha_logit, noise_lut):
+    return combine_jit(ref_xyb, main_xyb, alpha_logit, noise_lut, conv_noise_arg)
+
+  def combine_grad_fn(
+      ref_xyb, main_xyb, alpha_logit, noise_lut, cotangent_rec, lam_per_px
+  ):
+    return combine_grad_jit(
+        ref_xyb,
+        main_xyb,
+        alpha_logit,
+        noise_lut,
+        cotangent_rec,
+        lam_per_px,
+        conv_noise_arg,
+    )
+
   return combine_fn, combine_grad_fn
 
 
@@ -1818,7 +2017,58 @@ def _get_xyb_to_srgb_kernels():
   return _xyb_to_srgb_hwc, grad_srgb
 
 
-@functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=12)
+def _get_xyb_guide_grad_patch(h: int, w: int, u: int):
+  """Returns cached `@jax.jit` gradient kernel for unclamped XYB composite guide (patches)."""
+
+  def _loss(r_xyb, m_xyb, wr, wm, tgt_xyb):
+    ref_ups = upsample_jxl(r_xyb, u, out_hw=(h, w))
+    comp_xyb = wm * m_xyb[:, :h, :w] + wr * ref_ups[:, :h, :w]
+    dx = comp_xyb[0] - tgt_xyb[0]
+    dy = comp_xyb[1] - tgt_xyb[1]
+    db = (comp_xyb[2] - comp_xyb[1]) - (tgt_xyb[2] - tgt_xyb[1])
+    return jnp.sum(
+        240.0 * dx * dx + 100.0 * dy * dy + 25.0 * db * db
+    ) / jnp.float32(float(h * w))
+
+  return jax.jit(jax.grad(_loss, argnums=(0, 1)))
+
+
+@functools.lru_cache(maxsize=12)
+def _get_xyb_guide_grad_alpha(
+    h: int, w: int, u: int, d_shift: int, alpha_blend_mode: int
+):
+  """Returns cached `@jax.jit` gradient kernel for unclamped XYB composite guide (alpha)."""
+  step_a = 1 << int(d_shift)
+  bm = int(alpha_blend_mode)
+
+  def _loss(r_xyb, m_xyb, alpha_logit, tgt_xyb):
+    ref_ups = upsample_jxl(r_xyb, u, out_hw=(h, w))
+    a_01 = jax.nn.sigmoid(alpha_logit)
+    a_q = ste_quantize_alpha_01(a_01, hard=False)
+    a_ups = (
+        upsample_jxl(a_q[None, :, :], step_a, out_hw=(h, w))[0]
+        if step_a > 1
+        else a_q[:h, :w]
+    )
+    a_3d = jnp.clip(a_ups, 0.0, 1.0)[None, :, :]
+    comp_xyb = _blend_xyb_pair(
+        cur_xyb=m_xyb[:, :h, :w],
+        ref_xyb=ref_ups[:, :h, :w],
+        blend_mode=bm,
+        alpha_3d=a_3d,
+    )
+    dx = comp_xyb[0] - tgt_xyb[0]
+    dy = comp_xyb[1] - tgt_xyb[1]
+    db = (comp_xyb[2] - comp_xyb[1]) - (tgt_xyb[2] - tgt_xyb[1])
+    return jnp.sum(
+        240.0 * dx * dx + 100.0 * dy * dy + 25.0 * db * db
+    ) / jnp.float32(float(h * w))
+
+  return jax.jit(jax.grad(_loss, argnums=(0, 1, 2)))
+
+
+@functools.lru_cache(maxsize=24)
 def _get_alpha_hard_combine_kernel(
     h: int,
     w: int,
@@ -1838,9 +2088,10 @@ def _get_alpha_hard_combine_kernel(
   ytob = float(topo.base_correlation_b)
   step_a = 1 << int(d_shift)
   bm = int(alpha_blend_mode)
+  conv_noise_arg = get_convolved_noise_planes(h, w, 1, 0) if enable_noise else None
 
   @jax.jit
-  def _combine_hard(ref_xyb, main_xyb, alpha_01, noise_lut):
+  def _combine_hard_jit(ref_xyb, main_xyb, alpha_01, noise_lut, conv_noise=None):
     ref_xyb_ups = upsample_jxl(ref_xyb, u, out_hw=(h, w))
     a_q = ste_quantize_alpha_01(alpha_01, hard=True)
     if step_a > 1:
@@ -1863,9 +2114,13 @@ def _get_alpha_hard_combine_kernel(
           visible_frame_index=1,
           nonvisible_frame_index=0,
           ste_quantize_lut=True,
+          convolved_noise=conv_noise,
       )
     srgb_chw = opsin_to_srgb(comp_xyb, inv_mat, biases, clamp=True)
     return jnp.moveaxis(srgb_chw, 0, -1)
+
+  def _combine_hard(ref_xyb, main_xyb, alpha_01, noise_lut):
+    return _combine_hard_jit(ref_xyb, main_xyb, alpha_01, noise_lut, conv_noise_arg)
 
   return _combine_hard
 
@@ -1903,6 +2158,11 @@ def _fast_reconstruct_xyb(
       if do_noise
       else jnp.zeros((8,), dtype=jnp.float32)
   )
+  conv_noise_arg = (
+      get_convolved_noise_planes(int(state.height), int(state.width), 1, 0)
+      if do_noise
+      else None
+  )
   return _raw_hard_xyb_fn(
       acs_arg,
       jnp.asarray(state.quant_ac, dtype=jnp.float32),
@@ -1920,6 +2180,7 @@ def _fast_reconstruct_xyb(
       n_lut_arg,
       dq_mats_arg,
       dc_w_arg,
+      conv_noise_arg,
   )
 
 
@@ -2247,6 +2508,22 @@ def _patches_to_weights(
   return jnp.asarray(w_ref), jnp.asarray(w_main)
 
 
+def _decorrelate_dc_grad_jax(
+    g_dc: jax.Array, ytox_dc: float | jax.Array, ytob_dc: float | jax.Array
+) -> jax.Array:
+  """Applies SPD `(J^T J)^{-1}` preconditioner undoing `Y -> (X, B)` DC CfL coupling."""
+  c_x = jnp.float32(8.0) * (jnp.float32(ytox_dc) / jnp.float32(84.0))
+  c_b = jnp.float32(0.5) * (
+      jnp.float32(1.0) + jnp.float32(ytob_dc) / jnp.float32(84.0)
+  )
+  g0 = g_dc[0]
+  g2 = g_dc[2]
+  g1_pure = g_dc[1] - c_x * g0 - c_b * g2
+  g0_pure = g0 - jnp.float32(0.125) * (jnp.float32(ytox_dc) / jnp.float32(84.0)) * g1_pure
+  g2_pure = jnp.float32(0.5) * g2 - c_b * g1_pure
+  return jnp.stack([g0_pure, g1_pure, g2_pure], axis=0)
+
+
 def _compute_state_precond_scales_jax(
     state: JxlVarDCTState, topo: StaticVarDCTTopology | None = None
 ) -> tuple[jax.Array, jax.Array]:
@@ -2265,8 +2542,6 @@ def _get_compiled_continuous_dc_ac(
     w: int,
     do_inv_gab: bool,
     canon_s: tuple[int, ...] = (0,),
-    x_qm_scale: int = 3,
-    b_qm_scale: int = 2,
 ):
   """Returns JIT-compiled `compute_continuous_dc_ac_jax` kernel."""
   dummy_state = init_state_from_rgb_jax(
@@ -2275,8 +2550,6 @@ def _get_compiled_continuous_dc_ac(
       epf_iters=0,
       gab=bool(do_inv_gab),
   )
-  dummy_state.x_qm_scale = int(x_qm_scale)
-  dummy_state.b_qm_scale = int(b_qm_scale)
   topo = StaticVarDCTTopology(dummy_state, force_strategies=canon_s)
 
   @jax.jit
@@ -2292,6 +2565,8 @@ def _get_compiled_continuous_dc_ac(
       ytob_dc: jax.Array,
       dq_mats: dict[int, jax.Array],
       dc_w: jax.Array,
+      x_qm: jax.Array,
+      b_qm: jax.Array,
   ) -> tuple[jax.Array, jax.Array]:
     return compute_continuous_dc_ac_jax(
         xyb_chw,
@@ -2309,6 +2584,8 @@ def _get_compiled_continuous_dc_ac(
         ytob_dc=ytob_dc,
         dequant_matrices=dq_mats,
         dc_quant_weights=dc_w,
+        x_qm_scale=x_qm,
+        b_qm_scale=b_qm,
     )
 
   return _fn
@@ -2332,6 +2609,8 @@ def compute_continuous_dc_ac_jax(
     ytob_dc: float | jax.Array | None = None,
     dequant_matrices: dict[int, jax.Array] | None = None,
     dc_quant_weights: jax.Array | None = None,
+    x_qm_scale: float | jax.Array | None = None,
+    b_qm_scale: float | jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Computes continuous pre-rounded `(dc_quant, quant_ac)` in JAX from XYB `(3, H, W)` across all `AcStrategy` shapes."""
   mode = _normalize_init_mode(init_mode)
@@ -2371,8 +2650,6 @@ def compute_continuous_dc_ac_jax(
           w,
           bool(apply_inv_gab and state.gab),
           canon_s,
-          int(state.x_qm_scale),
-          int(state.b_qm_scale),
       )
       return fn(
           jnp.asarray(xyb_chw, dtype=jnp.float32),
@@ -2386,15 +2663,18 @@ def compute_continuous_dc_ac_jax(
           jnp.float32(state.ytob_dc),
           dq_mats_arg,
           dc_w_arg,
+          jnp.float32(state.x_qm_scale),
+          jnp.float32(state.b_qm_scale),
       )
   topo = topology if topology is not None else StaticVarDCTTopology(state)
   if mode == "random":
     scale_dc, scale_ac = _compute_state_precond_scales_jax(state, topo)
     key = jax.random.PRNGKey(int(seed))
     k_dc, k_ac = jax.random.split(key)
-    z_dc = jax.random.normal(k_dc, (3, h8, w8), dtype=jnp.float32) * 0.15
+    z_dc_std = jnp.array([0.008, 0.08, 0.01], dtype=jnp.float32)[:, None, None]
+    z_dc = jax.random.normal(k_dc, (3, h8, w8), dtype=jnp.float32) * z_dc_std
     z_dc = z_dc.at[1].set(jnp.abs(z_dc[1]))
-    z_ac = jax.random.normal(k_ac, (3, h8 * 8, w8 * 8), dtype=jnp.float32) * 0.15
+    z_ac = jax.random.normal(k_ac, (3, h8 * 8, w8 * 8), dtype=jnp.float32) * 0.002
     dc_cont = z_dc * scale_dc
     ac_cont = mask_llf_jax(z_ac * scale_ac, topo)
     return dc_cont, ac_cont
@@ -2446,8 +2726,18 @@ def compute_continuous_dc_ac_jax(
 
   raw_q_f = jnp.maximum(rq_arr, 1.0)
   qac_scale_grid = (gs_val / K_GLOBAL_SCALE_DENOM) * raw_q_f
-  x_qm_mul = float(1.25 ** (state.x_qm_scale - 2.0))
-  b_qm_mul = float(1.25 ** (state.b_qm_scale - 2.0))
+  x_qm_val = (
+      jnp.asarray(x_qm_scale, dtype=jnp.float32)
+      if x_qm_scale is not None
+      else jnp.float32(state.x_qm_scale)
+  )
+  b_qm_val = (
+      jnp.asarray(b_qm_scale, dtype=jnp.float32)
+      if b_qm_scale is not None
+      else jnp.float32(state.b_qm_scale)
+  )
+  x_qm_mul = jnp.power(jnp.float32(1.25), x_qm_val - 2.0)
+  b_qm_mul = jnp.power(jnp.float32(1.25), b_qm_val - 2.0)
   x_cc_tile = (
       float(state.base_correlation_x)
       + yx_arr / float(state.color_factor)
@@ -2670,8 +2960,6 @@ def _get_compiled_stage1_eval(
     epf_iters: int = 1,
     gab: bool = True,
     canon_s: tuple[int, ...] = (0,),
-    x_qm_scale: int = 3,
-    b_qm_scale: int = 2,
 ):
   """Returns JIT-compiled `(dc_cont, ac_cont, dc_q, ac_q, rec_srgb, rate_map_bits)` evaluator."""
   dummy_state = init_state_from_rgb_jax(
@@ -2680,8 +2968,6 @@ def _get_compiled_stage1_eval(
       epf_iters=int(epf_iters),
       gab=bool(gab),
   )
-  dummy_state.x_qm_scale = int(x_qm_scale)
-  dummy_state.b_qm_scale = int(b_qm_scale)
   topo = StaticVarDCTTopology(dummy_state, force_strategies=canon_s)
 
   @jax.jit
@@ -2696,6 +2982,8 @@ def _get_compiled_stage1_eval(
       ytox_dc: jax.Array,
       ytob_dc: jax.Array,
       epf_sharpness: jax.Array,
+      x_qm: jax.Array,
+      b_qm: jax.Array,
   ):
     dc_c, ac_c = compute_continuous_dc_ac_jax(
         target_xyb,
@@ -2710,6 +2998,8 @@ def _get_compiled_stage1_eval(
         quant_dc=qdc,
         ytox_dc=ytox_dc,
         ytob_dc=ytob_dc,
+        x_qm_scale=x_qm,
+        b_qm_scale=b_qm,
     )
     dc_q = jnp.round(dc_c)
     ac_q = jnp.round(ac_c)
@@ -2719,6 +3009,8 @@ def _get_compiled_stage1_eval(
         params_override={
             "global_scale": gs,
             "quant_dc": qdc,
+            "x_qm_scale": x_qm,
+            "b_qm_scale": b_qm,
             "ytox_dc": ytox_dc,
             "ytob_dc": ytob_dc,
             "epf_sharpness": epf_s_i32,
@@ -2765,12 +3057,20 @@ def init_state_from_xyb_jax(
     epf_iters: int | None = None,
     gab: bool | None = None,
     *,
+    ac_strategy: np.ndarray | None = None,
+    ac_anchors: np.ndarray | None = None,
     init_mode: str = "dct",
     seed: int = 0,
     enable_noise: bool = False,
 ) -> tuple[JxlVarDCTState, jax.Array, jax.Array]:
   """Initializes a `JxlVarDCTState` directly from an XYB `(3, H, W)` tensor (e.g. `kAdd` residual)."""
   _, h, w = xyb_chw.shape
+  h8, w8 = (h + 7) // 8, (w + 7) // 8
+  acs_init = (
+      np.asarray(ac_strategy, dtype=np.int32).copy()
+      if ac_strategy is not None
+      else np.zeros((h8, w8), dtype=np.int32)
+  )
   eff_gab = bool(float(distance) > 0.5) if gab is None else bool(gab)
   xyb_to_srgb, _ = _get_xyb_to_srgb_kernels()
   # Shift residual around mid-gray XYB before converting for AQ/CfL estimation if zero-mean
@@ -2779,7 +3079,7 @@ def init_state_from_xyb_jax(
   xyb_probe = xyb_chw + xyb_mid if y_mean < 0.08 else xyb_chw
   approx_rgb = np.asarray(xyb_to_srgb(xyb_probe), dtype=np.float32)
   raw_quant_field, epf_sharpness, epf_iters_auto = select_quant_and_epf_jax(
-      approx_rgb, distance=float(distance)
+      approx_rgb, distance=float(distance), ac_strategy=acs_init
   )
   ytox_map, ytob_map, ytox_dc, ytob_dc = select_cfl_jax(
       approx_rgb, gab=eff_gab
@@ -2794,12 +3094,18 @@ def init_state_from_xyb_jax(
   state = init_state_from_rgb_jax(
       approx_rgb,
       distance=distance,
-      epf_iters=eff_epf,
-      gab=eff_gab,
+      ac_strategy=acs_init,
       raw_quant_field=raw_quant_field,
       epf_sharpness=epf_sharpness,
       ytox_map=ytox_map,
       ytob_map=ytob_map,
+      epf_iters=eff_epf,
+      gab=eff_gab,
+      ac_anchors=(
+          np.asarray(ac_anchors, dtype=bool).copy()
+          if ac_anchors is not None
+          else None
+      ),
       ytox_dc=int(ytox_dc),
       ytob_dc=int(ytob_dc),
   )
@@ -2938,8 +3244,6 @@ def stage1_explore_ac_candidates_compositing(
           epf_iters=int(base_state.epf_iters),
           gab=bool(base_state.gab),
           canon_s=default_cands,
-          x_qm_scale=int(base_state.x_qm_scale),
-          b_qm_scale=int(base_state.b_qm_scale),
       )
     st = copy.deepcopy(base_state)
     acs_grid, anchor_grid = _build_uniform_ac_strategy_grid(h8, w8, s)
@@ -2961,6 +3265,8 @@ def stage1_explore_ac_candidates_compositing(
         jnp.float32(st.ytox_dc),
         jnp.float32(st.ytob_dc),
         jnp.asarray(st.epf_sharpness, dtype=jnp.float32),
+        jnp.float32(st.x_qm_scale),
+        jnp.float32(st.b_qm_scale),
     )
     st.dc_quant = np.asarray(dc_q_j, dtype=np.int32)
     st.quant_ac = np.asarray(ac_q_j, dtype=np.int32)
@@ -3115,8 +3421,19 @@ def _regularize_fg_mask_blocks(
           or bool(np.any(m_bg[:, 0]))
           or bool(np.any(m_bg[:, -1]))
       )
-      if (not touches and int(np.sum(m_bg)) < min_hole) or (
-          int(np.sum(m_bg)) < min_border
+      n_bg_blk = int(np.sum(m_bg))
+      thin_border_sliver = False
+      if touches and h8 * w8 >= 1024 and n_bg_blk < 256:
+        ys_bg, xs_bg = np.where(m_bg)
+        if (
+            int(ys_bg.max() - ys_bg.min()) + 1 <= 2
+            or int(xs_bg.max() - xs_bg.min()) + 1 <= 2
+        ):
+          thin_border_sliver = True
+      if (
+          (not touches and n_bg_blk < min_hole)
+          or n_bg_blk < min_border
+          or thin_border_sliver
       ):
         out |= m_bg
   return np.asarray(out, dtype=bool)
@@ -3281,10 +3598,13 @@ def _stage1_multires_rate_wd_analysis(
     fg_xyb_src = _shrink_sensor_grain_xyb_jax(target_xyb, lut_eval_j)
     clean_rgb = np.asarray(xyb_to_srgb_fn(fg_xyb_src), dtype=np.float32)
     clean_rgb_j = jnp.asarray(clean_rgb, dtype=jnp.float32)
+    ref_xyb_src = fg_xyb_src
+    ref_clean_rgb_j = clean_rgb_j
   else:
     fg_xyb_src = target_xyb
     clean_rgb = arr
     clean_rgb_j = target_j
+    ref_clean_rgb_j = target_j
 
   # 1. Stage 1 & 2 on full-resolution main candidate (independent of upsampling U)
   main_dp_key = (
@@ -3309,6 +3629,7 @@ def _stage1_multires_rate_wd_analysis(
     ac_m = dp_cached["ac_m"]
     wd_main_map = dp_cached["wd_main_map"]
     rate_main_map = dp_cached["rate_main_map"]
+    err_main_blk = dp_cached["err_main_blk"]
   else:
     cand_strats = None if explore_ac_strategy else (0,)
     stage1_cands = stage1_explore_ac_candidates_compositing(
@@ -3363,8 +3684,6 @@ def _stage1_multires_rate_wd_analysis(
         epf_iters=int(main_state.epf_iters),
         gab=bool(main_state.gab),
         canon_s=default_cands_m,
-        x_qm_scale=int(main_state.x_qm_scale),
-        b_qm_scale=int(main_state.b_qm_scale),
     )
     _, _, dc_mq, ac_mq, rec_main_clean, rate_main_j = eval_main_fn(
         fg_xyb_src,
@@ -3377,12 +3696,34 @@ def _stage1_multires_rate_wd_analysis(
         jnp.float32(main_state.ytox_dc),
         jnp.float32(main_state.ytob_dc),
         jnp.asarray(main_state.epf_sharpness, dtype=jnp.float32),
+        jnp.float32(main_state.x_qm_scale),
+        jnp.float32(main_state.b_qm_scale),
     )
     main_state.dc_quant = np.asarray(dc_mq, dtype=np.int32)
     main_state.quant_ac = np.asarray(ac_mq, dtype=np.int32)
+    rec_main_xyb_clean = _fast_reconstruct_xyb(main_state, include_noise=False)
+    diff_m_xyb = rec_main_xyb_clean[:, :h, :w] - fg_xyb_src[:, :h, :w]
+    w_xyb_err = jnp.asarray([12.0, 1.5, 0.5], dtype=jnp.float32)[:, None, None]
+    err_m_px = jnp.sum(
+        w_xyb_err
+        * jnp.square(
+            jnp.stack(
+                [diff_m_xyb[0], diff_m_xyb[1], diff_m_xyb[2] - diff_m_xyb[1]],
+                axis=0,
+            )
+        ),
+        axis=0,
+    )
+    if h8 * 8 > h or w8 * 8 > w:
+      err_m_px = jnp.pad(
+          err_m_px, ((0, h8 * 8 - h), (0, w8 * 8 - w)), mode="edge"
+      )
+    err_main_blk = np.asarray(
+        err_m_px.reshape(h8, 8, w8, 8).mean(axis=(1, 3)), dtype=np.float32
+    )
     if use_noise:
       rec_main_xyb = synthesize_jxl_noise_xyb(
-          _fast_reconstruct_xyb(main_state, include_noise=False),
+          rec_main_xyb_clean,
           noise_lut=lut_eval_j,
           ytox=float(main_state.base_correlation_x),
           ytob=float(main_state.base_correlation_b),
@@ -3415,13 +3756,14 @@ def _stage1_multires_rate_wd_analysis(
         "ac_m": ac_m,
         "wd_main_map": wd_main_map,
         "rate_main_map": rate_main_map,
+        "err_main_blk": err_main_blk,
     })
 
   lam_per_px = float(eff_lam) / float(max(h * w, 1))
   j_main_map = wd_main_map + lam_per_px * rate_main_map
 
   # 2. Low-resolution reference candidate (downsampled by U, upsampled in XYB)
-  rgb_low_raw = downsample_rgb_jax(clean_rgb_j, u)
+  rgb_low_raw = downsample_rgb_jax(ref_clean_rgb_j, u)
   if explore_ac_strategy and (use_noise or h8 * w8 >= 256):
     ref_state_init = _init_ref_state_with_stage2_acs(
         rgb_low_raw,
@@ -3478,8 +3820,6 @@ def _stage1_multires_rate_wd_analysis(
       epf_iters=int(ref_state_init.epf_iters),
       gab=bool(ref_state_init.gab),
       canon_s=ref_canon_s,
-      x_qm_scale=int(ref_state_init.x_qm_scale),
-      b_qm_scale=int(ref_state_init.b_qm_scale),
   )
   _, _, _, _, _, rate_ref_j = eval_ref_fn(
       srgb_to_xyb(jnp.moveaxis(jnp.asarray(rgb_low_raw, dtype=jnp.float32), -1, 0)),
@@ -3492,6 +3832,8 @@ def _stage1_multires_rate_wd_analysis(
       jnp.float32(ref_state_init.ytox_dc),
       jnp.float32(ref_state_init.ytob_dc),
       jnp.asarray(ref_state_init.epf_sharpness, dtype=jnp.float32),
+      jnp.float32(ref_state_init.x_qm_scale),
+      jnp.float32(ref_state_init.b_qm_scale),
   )
   rate_ref_low = np.asarray(rate_ref_j, dtype=np.float32)
   # Map low-res block bit rate to full-res 8x8 blocks (amortized by 1 / U^2)
@@ -3506,8 +3848,37 @@ def _stage1_multires_rate_wd_analysis(
 
   delta_j_patch = j_main_map - j_ref_map
   fg_adv = -delta_j_patch  # > 0 where full-res main beats low-res reference
+  if d_main >= 2.5:
+    diff_r_xyb = ref_xyb_ups[:, :h, :w] - fg_xyb_src[:, :h, :w]
+    w_xyb_err_r = jnp.asarray([12.0, 1.5, 0.5], dtype=jnp.float32)[
+        :, None, None
+    ]
+    err_r_px = jnp.sum(
+        w_xyb_err_r
+        * jnp.square(
+            jnp.stack(
+                [diff_r_xyb[0], diff_r_xyb[1], diff_r_xyb[2] - diff_r_xyb[1]],
+                axis=0,
+            )
+        ),
+        axis=0,
+    )
+    if h8 * 8 > h or w8 * 8 > w:
+      err_r_px = jnp.pad(
+          err_r_px, ((0, h8 * 8 - h), (0, w8 * 8 - w)), mode="edge"
+      )
+    err_ref_blk = np.asarray(
+        err_r_px.reshape(h8, 8, w8, 8).mean(axis=(1, 3)), dtype=np.float32
+    )
+    fg_adv_eff = np.where(
+        err_main_blk < 0.95 * err_ref_blk,
+        fg_adv,
+        np.minimum(fg_adv, -np.abs(fg_adv) - 1e-6),
+    )
+  else:
+    fg_adv_eff = fg_adv
 
-  fg_mask_blocks = _regularize_fg_mask_blocks(fg_adv, lam_per_px, u=u)
+  fg_mask_blocks = _regularize_fg_mask_blocks(fg_adv_eff, lam_per_px, u=u)
   fg_mask_dilated = (
       _dilate_bool_grid(fg_mask_blocks, radius=dilate_blocks)
       if np.any(fg_mask_blocks)
@@ -3556,17 +3927,22 @@ def _stage1_multires_rate_wd_analysis(
       np.repeat(np.repeat(bg_mask_blocks, 8, axis=0), 8, axis=1)[:h, :w],
       dtype=bool,
   )
+  ref_src_rgb_j = ref_clean_rgb_j if has_sensor_grain else clean_rgb_j
   if np.any(fg_mask_dilated):
     smooth_full = _pyramid_harmonic_inpaint_jax(
-        clean_rgb_j, bg_known_px, n_iters=8
+        ref_src_rgb_j, bg_known_px, n_iters=8
     )
   else:
-    smooth_full = clean_rgb_j
+    smooth_full = ref_src_rgb_j
   if has_sensor_grain:
     rgb_low_smooth = downsample_rgb_jax(smooth_full, u)
+    rgb_low_clean = rgb_low_raw
   else:
     rgb_low_smooth = _project_lowres_rgb_wd_jax(
         smooth_full, u, vgg_params=vgg_params, log2_sigma=float(log2_sigma)
+    )
+    rgb_low_clean = _project_lowres_rgb_wd_jax(
+        clean_rgb_j, u, vgg_params=vgg_params, log2_sigma=float(log2_sigma)
     )
 
   adv_shift = fg_adv - float(np.median(fg_adv))
@@ -3587,7 +3963,13 @@ def _stage1_multires_rate_wd_analysis(
       "stage1_ref_j_map": j_ref_map,
       "detail_map_01": np.asarray(detail_map_01, dtype=np.float32),
       "rgb_low_smooth": np.asarray(rgb_low_smooth, dtype=np.float32),
+      "rgb_low_clean": np.asarray(rgb_low_clean, dtype=np.float32),
       "rgb_low_raw": np.asarray(rgb_low_raw, dtype=np.float32),
+      "ref_state_raw": (
+          ref_state_init
+          if (explore_ac_strategy and (use_noise or h8 * w8 >= 256))
+          else None
+      ),
       "stage1_candidates": stage1_cands,
       "stage2_ac_strategy": stage2_acs,
       "stage2_anchors": stage2_anchors,
@@ -3696,11 +4078,19 @@ def _apply_custom_dequant_to_state(
       return
 
   raw_mats, raw_dc = _eval_dq_log_vec_np(dq_log, used_s, default_dq)
-  _, proj_dc = project_custom_dequant_matrices(
-      {0: raw_mats[0]}, dc_quant=raw_dc
-  )
+  def_dc = np.array(DEFAULT_DC_QUANT_WEIGHTS, dtype=np.float32)
+  dc_arr = np.asarray(raw_dc, dtype=np.float32).reshape(3)
+  if float(np.max(np.abs(dc_arr - def_dc) / def_dc)) < 1e-6:
+    proj_dc = def_dc
+  else:
+    dc_clip = np.clip(dc_arr, 1e-6, 1.0)
+    proj_dc = np.clip(
+        np.asarray(dc_clip * 128.0, dtype=np.float16).astype(np.float32) / 128.0,
+        1e-6,
+        1.0,
+    )
   state.dequant_matrices = raw_mats
-  state.dc_quant_weights = np.asarray(proj_dc, dtype=np.float32)
+  state.dc_quant_weights = proj_dc
   rt_mats, rt_dc = roundtrip_custom_dequant_matrices(state)
   state.dequant_matrices = {
       s: np.asarray(rt_mats[s], dtype=np.float32) for s in rt_mats
@@ -3968,9 +4358,22 @@ def _init_ref_state_with_stage2_acs(
     upsampling: int = 1,
 ) -> JxlVarDCTState:
   """Initializes `ReferenceOnly` frame state with Stage 1+2 `AcStrategy` selection when >= 16x16."""
-  r_state = _init_frame_state_with_aq_epf_cfl(
-      r_rgb, distance=d_ref, gab=None, enable_noise=enable_noise
+  force_smooth_ref = bool(
+      int(upsampling) >= 2
+      and (float(d_ref) >= 1.2 or (enable_noise and float(d_ref) >= 0.80))
   )
+  r_state = _init_frame_state_with_aq_epf_cfl(
+      r_rgb,
+      distance=d_ref,
+      gab=(True if force_smooth_ref else None),
+      enable_noise=enable_noise,
+  )
+  if force_smooth_ref and int(r_state.epf_iters) < 2:
+    r_state.epf_iters = 2
+    if np.all(r_state.epf_sharpness == 0):
+      r_state.epf_sharpness = np.full(
+          (int(r_state.h8), int(r_state.w8)), 2, dtype=np.uint8
+      )
   if int(r_state.height) >= 16 and int(r_state.width) >= 16:
     r_h8, r_w8 = int(r_state.h8), int(r_state.w8)
     ref_cands = tuple(
@@ -4018,6 +4421,15 @@ def _init_ref_state_with_stage2_acs(
   return r_state
 
 
+def _clear_transient_encode_caches() -> None:
+  """Releases per-image GPU/CPU transient caches at the end of an encode call."""
+  _TARGET_FEATS_CACHE.clear()
+  _STAGE1_AC_CANDIDATE_CACHE.clear()
+  _STAGE1_MAIN_DP_CACHE.clear()
+  _STAGE1_MULTIRES_CACHE.clear()
+  _STAGE1_CACHE.clear()
+
+
 def optimize_patch_composite(
     rgb_u8: np.ndarray | jax.Array | None = None,
     upsampling: int | str = 2,
@@ -4047,6 +4459,7 @@ def optimize_patch_composite(
     seed: int = 0,
     *,
     srgb_hwc: np.ndarray | jax.Array | None = None,
+    _keep_transient_caches: bool = False,
 ) -> CompositeOptimizationResult:
   """Three-stage multi-resolution XYB `PatchDictionary` composite Rate-WD optimizer."""
   img_in = rgb_u8 if rgb_u8 is not None else srgb_hwc
@@ -4099,6 +4512,7 @@ def optimize_patch_composite(
         candidate_upsamplings=candidate_upsamplings,
         init_mode=init_mode_norm,
         seed=seed,
+        _keep_transient_caches=True,
     )
     res_add = optimize_patch_composite(
         rgb_u8=img_in,
@@ -4122,7 +4536,10 @@ def optimize_patch_composite(
         candidate_upsamplings=candidate_upsamplings,
         init_mode=init_mode_norm,
         seed=seed,
+        _keep_transient_caches=True,
     )
+    if not _keep_transient_caches:
+      _clear_transient_encode_caches()
     return res_rep if res_rep.rd_cost <= res_add.rd_cost else res_add
 
   b_mode = int(parsed_bm)
@@ -4160,22 +4577,24 @@ def optimize_patch_composite(
   has_sensor_grain = bool(
       enable_noise and float(np.max(sensor_lut_np)) >= 0.0020
   )
+  min_noise_val = 2.0 / 1024.0 if enable_noise else 0.0
+  max_noise_val = _max_noise_lut_bound(
+      enable_noise, has_sensor_grain, sensor_lut_np
+  )
   m_dq_mode = select_dequant_mode_for_frame(
       h, w, d_main, dq_spec, is_reference=False
   )
   m_use_dq = m_dq_mode != "none"
   dq_log_init = _init_dq_log_vec(m_dq_mode, is_reference=False)
   noise_lut_init = (
-      estimate_noise_lut_jax(target_xyb)
+      jnp.clip(
+          estimate_noise_lut_jax(target_xyb), min_noise_val, max_noise_val
+      )
       if enable_noise
       else jnp.zeros((8,), dtype=jnp.float32)
   )
   s2_noise_lut = (
-      np.clip(
-          np.asarray(noise_lut_init, dtype=np.float32), 2.0 / 1024.0, 0.5
-      )
-      if enable_noise
-      else None
+      np.asarray(noise_lut_init, dtype=np.float32) if enable_noise else None
   )
   fg_xyb_main = (
       _shrink_sensor_grain_xyb_jax(target_xyb, noise_lut_init)
@@ -4210,16 +4629,27 @@ def optimize_patch_composite(
     bg_m_blk = s1_info["bg_mask_blocks"]
     s2_acs_u = s1_info["stage2_ac_strategy"]
 
-    r_rgb = s1_info["rgb_low_smooth"]
-    r_state = _init_ref_state_with_stage2_acs(
-        r_rgb,
-        d_ref=d_ref_u,
-        eff_lambda=eff_lambda,
-        enable_noise=enable_noise,
-        vgg_params=vgg_params,
-        log2_sigma=log2_sigma,
-        upsampling=u_val,
+    r_rgb = (
+        s1_info["rgb_low_smooth"]
+        if b_mode == PATCH_BLEND_REPLACE
+        else s1_info["rgb_low_clean"]
     )
+    if (
+        b_mode != PATCH_BLEND_REPLACE
+        and has_sensor_grain
+        and s1_info.get("ref_state_raw") is not None
+    ):
+      r_state = copy.deepcopy(s1_info["ref_state_raw"])
+    else:
+      r_state = _init_ref_state_with_stage2_acs(
+          r_rgb,
+          d_ref=d_ref_u,
+          eff_lambda=eff_lambda,
+          enable_noise=enable_noise,
+          vgg_params=vgg_params,
+          log2_sigma=log2_sigma,
+          upsampling=u_val,
+      )
     r_dq_mode_u = select_dequant_mode_for_frame(
         int(r_state.height),
         int(r_state.width),
@@ -4372,6 +4802,8 @@ def optimize_patch_composite(
           distance=d_main,
           epf_iters=None,
           gab=None,
+          ac_strategy=s2_acs_u,
+          ac_anchors=s1_info["stage2_anchors"],
           enable_noise=enable_noise,
       )
       m_state.ac_strategy = s2_acs_u.copy()
@@ -4456,6 +4888,18 @@ def optimize_patch_composite(
     }
 
   stage2_u_evals = [_build_stage2_for_u(uc) for uc in u_cands]
+  stage2_u_summaries = [
+      {
+          "mode": "patches",
+          "upsampling": int(ev["u"]),
+          "blend_mode": b_mode,
+          "dim_shift": 0,
+          "bpp": float(ev["stage2_true_bpp"]),
+          "wd": float(ev["stage2_wd"]),
+          "rd_cost": float(ev["stage2_true_j"]),
+      }
+      for ev in stage2_u_evals
+  ]
   best_s2_u = min(stage2_u_evals, key=lambda d: d["stage2_true_j"])
   u = int(best_s2_u["u"])
   stage1_info = best_s2_u["stage1_info"]
@@ -4481,6 +4925,7 @@ def optimize_patch_composite(
     main_dc_cont = best_s2_u["main_dc_cont"]
     main_ac_cont = best_s2_u["main_ac_cont"]
   else:
+    fg_dc_mask_j = jnp.ones_like(fg_dc_mask_j)
     dc_bg_j = jnp.zeros_like(dc_bg_j)
     ref_dc_cont, ref_ac_cont = compute_continuous_dc_ac_jax(
         best_s2_u["ref_xyb_low"],
@@ -4534,6 +4979,8 @@ def optimize_patch_composite(
         )
     )
     stage2_true_j = stage2_wd + float(eff_lambda) * stage2_true_bpp
+
+  del stage2_u_evals, best_s2_u
 
   # Stage 3: Joint continuous Rate-WD refinement
   ref_fwd_fn, ref_vjp_fn = _get_frame_kernels(ref_state, enable_noise=False)
@@ -4603,8 +5050,6 @@ def optimize_patch_composite(
     ref_scale_dc, ref_scale_ac = _compute_state_precond_scales_jax(
         ref_state, ref_topo
     )
-    ref_scale_dc = ref_scale_dc * 0.35
-    ref_scale_ac = ref_scale_ac * 0.35
     main_scale_dc, main_scale_ac = _compute_state_precond_scales_jax(
         main_state, main_topo
     )
@@ -4619,49 +5064,35 @@ def optimize_patch_composite(
       if (enable_noise and lr_noise == 0.005)
       else (float(lr_noise) if enable_noise else 0.0)
   )
-  tx = optax.multi_transform(
-      {
-          "ac": optax.adam(learning_rate=eff_lr_ac, b1=0.5, eps=adam_eps),
-          "dc": optax.adam(learning_rate=eff_lr_dc, b1=0.5, eps=adam_eps),
-          "noise": optax.adam(
-              learning_rate=eff_lr_noise, b1=0.5, eps=1e-4
-          ),
-          "meta": optax.adam(learning_rate=0.005, b1=0.5, eps=1e-4),
-          "dq": optax.adam(
-              learning_rate=lr_dequant if use_custom_dq else 0.0,
-              b1=0.5,
-              eps=1e-4,
-          ),
+  adam_init_fn, adam_step_fn = _get_compiled_adam_updater("patch", adam_eps)
+  dq_lr_val = float(lr_dequant) if use_custom_dq else 0.0
+  lr_tree = {
+      "ref": {
+          "ac": (eff_lr_ac * ref_scale_ac) if is_zero_or_rand else eff_lr_ac,
+          "dc": (eff_lr_dc * ref_scale_dc) if is_zero_or_rand else eff_lr_dc,
+          "noise_lut": eff_lr_noise,
+          "rq_delta": 0.005,
+          "yx_delta": 0.005,
+          "yb_delta": 0.005,
+          "dq_log_scale": dq_lr_val,
       },
-      {
-          "ref": {
-              "ac": "ac",
-              "dc": "dc",
-              "noise_lut": "noise",
-              "rq_delta": "meta",
-              "yx_delta": "meta",
-              "yb_delta": "meta",
-              "dq_log_scale": "dq",
-          },
-          "main": {
-              "ac": "ac",
-              "dc": "dc",
-              "noise_lut": "noise",
-              "rq_delta": "meta",
-              "yx_delta": "meta",
-              "yb_delta": "meta",
-              "dq_log_scale": "dq",
-          },
+      "main": {
+          "ac": (eff_lr_ac * main_scale_ac) if is_zero_or_rand else eff_lr_ac,
+          "dc": (eff_lr_dc * main_scale_dc) if is_zero_or_rand else eff_lr_dc,
+          "noise_lut": eff_lr_noise,
+          "rq_delta": 0.005,
+          "yx_delta": 0.005,
+          "yb_delta": 0.005,
+          "dq_log_scale": dq_lr_val,
       },
-  )
-  opt_state = tx.init(params)
+  }
+  opt_state = adam_init_fn(params)
 
   history: list[dict[str, float]] = []
   best_j = float("inf")
-  best_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-  step0_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
+  best_params = jax.tree_util.tree_map(lambda x: x, params)
+  step0_params = jax.tree_util.tree_map(lambda x: x, params)
   last_grads: dict[str, Any] | None = None
-  min_noise_val = 2.0 / 1024.0 if enable_noise else 0.0
   total_steps = max(1, int(eff_steps))
   warmup_meta_step = int(0.35 * total_steps) if is_zero_or_rand else 0
   freeze_dq_step = max(1, int(0.8 * total_steps))
@@ -4694,7 +5125,9 @@ def optimize_patch_composite(
     m_rq_eff = jnp.clip(main_rq + params["main"]["rq_delta"], 1.0, 256.0)
     m_yx_eff = jnp.clip(main_yx + params["main"]["yx_delta"], -128.0, 127.0)
     m_yb_eff = jnp.clip(main_yb + params["main"]["yb_delta"], -128.0, 127.0)
-    n_lut_clipped = jnp.clip(params["main"]["noise_lut"], min_noise_val, 0.5)
+    n_lut_clipped = jnp.clip(
+        params["main"]["noise_lut"], min_noise_val, max_noise_val
+    )
     m_xyb = main_fwd_fn(
         m_ac,
         m_dc,
@@ -4723,6 +5156,18 @@ def optimize_patch_composite(
     grad_r_xyb, grad_m_xyb, grad_n_lut = combine_grad_fn(
         r_xyb, m_xyb, w_ref_j, w_main_j, n_lut_clipped, grad_rec
     )
+    if is_zero_or_rand:
+      z_w = jnp.float32(
+          4.0
+          + 25.0
+          * 0.5
+          * (1.0 + math.cos(math.pi * float(step) / float(max(total_steps - 1, 1))))
+      )
+      g_r_z, g_m_z = _get_xyb_guide_grad_patch(h, w, u)(
+          r_xyb, m_xyb, w_ref_j, w_main_j, fg_xyb_main
+      )
+      grad_r_xyb = grad_r_xyb + z_w * g_r_z
+      grad_m_xyb = grad_m_xyb + z_w * g_m_z
 
     r_cluster_blend = jnp.float32(
         1.0
@@ -4774,25 +5219,28 @@ def optimize_patch_composite(
     )
     if is_zero_or_rand:
       r_ac_p = params["ref"]["ac"]
-      r_dc_p = params["ref"]["dc"]
       m_ac_p = params["main"]["ac"]
-      m_dc_p = params["main"]["dc"]
-      g_ref["ac"] = g_ref["ac"] + lam_per_px * 1.0 * (
+      ac_l1_w = 0.0 if step < int(0.25 * total_steps) else 0.15
+      g_ref["ac"] = g_ref["ac"] + lam_per_px * ac_l1_w * (
           r_ac_p / jnp.sqrt(r_ac_p * r_ac_p + 0.01)
       )
-      g_ref["dc"] = g_ref["dc"] + lam_per_px * 0.1 * (
-          r_dc_p / jnp.sqrt(r_dc_p * r_dc_p + 0.01)
-      )
-      g_main["ac"] = g_main["ac"] + lam_per_px * 1.0 * (
+      g_main["ac"] = g_main["ac"] + lam_per_px * ac_l1_w * (
           m_ac_p / jnp.sqrt(m_ac_p * m_ac_p + 0.01)
       ) * fg_ac_mask_j
-      g_main["dc"] = g_main["dc"] + lam_per_px * 0.1 * (
-          m_dc_p / jnp.sqrt(m_dc_p * m_dc_p + 0.01)
-      ) * fg_dc_mask_j
       g_ref["ac"] = g_ref["ac"] * ref_scale_ac
-      g_ref["dc"] = g_ref["dc"] * ref_scale_dc
+      g_ref["dc"] = (
+          _decorrelate_dc_grad_jax(
+              g_ref["dc"], ref_state.ytox_dc, ref_state.ytob_dc
+          )
+          * ref_scale_dc
+      )
       g_main["ac"] = g_main["ac"] * main_scale_ac
-      g_main["dc"] = g_main["dc"] * main_scale_dc
+      g_main["dc"] = (
+          _decorrelate_dc_grad_jax(
+              g_main["dc"], main_state.ytox_dc, main_state.ytob_dc
+          )
+          * main_scale_dc
+      )
     if step < warmup_meta_step or step >= freeze_dq_step:
       g_ref["rq_delta"] = jnp.zeros_like(g_ref["rq_delta"])
       g_ref["yx_delta"] = jnp.zeros_like(g_ref["yx_delta"])
@@ -4807,11 +5255,21 @@ def optimize_patch_composite(
     if enable_noise:
       g_main["noise_lut"] = grad_n_lut
 
-    grads = jax.tree_util.tree_map(
-        lambda x: jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0),
-        {"ref": g_ref, "main": g_main},
+    lr_mul_cur = (
+        jnp.float32(
+            0.015
+            + 0.5
+            * 0.985
+            * (1.0 + math.cos(math.pi * float(step) / float(max(total_steps - 1, 1))))
+        )
+        if is_zero_or_rand
+        else jnp.float32(1.0)
     )
-    g_ref, g_main = grads["ref"], grads["main"]
+    prev_params = jax.tree_util.tree_map(lambda x: x, params)
+    params, opt_state, clean_grads = adam_step_fn(
+        {"ref": g_ref, "main": g_main}, opt_state, params, lr_tree, lr_mul_cur
+    )
+    g_ref, g_main = clean_grads["ref"], clean_grads["main"]
     last_grads = {
         "ref_ac": g_ref["ac"],
         "ref_dc": g_ref["dc"],
@@ -4821,30 +5279,6 @@ def optimize_patch_composite(
         "noise_lut": g_main["noise_lut"],
         "dq_log_scale": g_main["dq_log_scale"],
     }
-
-    noise_bits = 80.0 if enable_noise else 0.0
-    bpp_v = (
-        float(ref_bits) + float(main_bits) + patch_dict_bits + noise_bits
-    ) / float(h * w)
-    j_v = float(wd_v) + float(eff_lambda) * bpp_v
-    history.append(
-        {
-            "step": float(step),
-            "rd_loss": j_v,
-            "wd": float(wd_v),
-            "proxy_bpp": bpp_v,
-        }
-    )
-    if j_v < best_j:
-      best_j = j_v
-      best_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-    updates, opt_state = tx.update(grads, opt_state, params)
-    if is_zero_or_rand:
-      updates["ref"]["ac"] = updates["ref"]["ac"] * ref_scale_ac
-      updates["ref"]["dc"] = updates["ref"]["dc"] * ref_scale_dc
-      updates["main"]["ac"] = updates["main"]["ac"] * main_scale_ac
-      updates["main"]["dc"] = updates["main"]["dc"] * main_scale_dc
-    params = optax.apply_updates(params, updates)
     if is_zero_or_rand:
       params["ref"]["ac"] = mask_llf_jax(params["ref"]["ac"], ref_topo)
       params["ref"]["dc"] = params["ref"]["dc"].at[1].set(
@@ -4856,8 +5290,26 @@ def optimize_patch_composite(
             jnp.maximum(params["main"]["dc"][1], 0.0)
         )
     params["main"]["noise_lut"] = jnp.clip(
-        params["main"]["noise_lut"], min_noise_val, 0.5
+        params["main"]["noise_lut"], min_noise_val, max_noise_val
     )
+
+    wd_f, r_bits_f, m_bits_f = np.asarray(
+        jnp.stack([wd_v, ref_bits, main_bits]), dtype=np.float64
+    ).tolist()
+    noise_bits = 80.0 if enable_noise else 0.0
+    bpp_v = (r_bits_f + m_bits_f + patch_dict_bits + noise_bits) / float(h * w)
+    j_v = wd_f + float(eff_lambda) * bpp_v
+    history.append(
+        {
+            "step": float(step),
+            "rd_loss": j_v,
+            "wd": wd_f,
+            "proxy_bpp": bpp_v,
+        }
+    )
+    if j_v < best_j:
+      best_j = j_v
+      best_params = prev_params
 
   # Evaluate true-bitstream candidates (best_params, final params, and deadzone shrinkage)
   # to strictly guarantee stage3_true_j < stage2_true_j.
@@ -4968,8 +5420,8 @@ def optimize_patch_composite(
     c_lut = (
         np.clip(
             np.asarray(cand_p["main"]["noise_lut"], dtype=np.float32),
-            2.0 / 1024.0,
-            0.5,
+            min_noise_val,
+            max_noise_val,
         )
         if enable_noise
         else None
@@ -5136,18 +5588,9 @@ def optimize_patch_composite(
       stage1_main_j_map=stage1_info["stage1_main_j_map"],
       stage1_ref_j_map=stage1_info["stage1_ref_j_map"],
   )
-  res_patch.all_candidates = [
-      {
-          "mode": "patches",
-          "upsampling": int(ev["u"]),
-          "blend_mode": b_mode,
-          "dim_shift": 0,
-          "bpp": float(ev["stage2_true_bpp"]),
-          "wd": float(ev["stage2_wd"]),
-          "rd_cost": float(ev["stage2_true_j"]),
-      }
-      for ev in stage2_u_evals
-  ]
+  res_patch.all_candidates = stage2_u_summaries
+  if not _keep_transient_caches:
+    _clear_transient_encode_caches()
   return res_patch
 
 
@@ -5185,6 +5628,7 @@ def optimize_alpha_composite(
     alpha_init: str = "auto",
     *,
     srgb_hwc: np.ndarray | jax.Array | None = None,
+    _keep_transient_caches: bool = False,
 ) -> CompositeOptimizationResult:
   """Three-stage multi-res XYB `PatchDictionary` alpha composite Rate-WD optimizer (`R2`)."""
   img_in = rgb_u8 if rgb_u8 is not None else srgb_hwc
@@ -5265,22 +5709,24 @@ def optimize_alpha_composite(
   has_sensor_grain = bool(
       enable_noise and float(np.max(sensor_lut_np)) >= 0.0020
   )
+  min_noise_val = 2.0 / 1024.0 if enable_noise else 0.0
+  max_noise_val = _max_noise_lut_bound(
+      enable_noise, has_sensor_grain, sensor_lut_np
+  )
   m_dq_mode = select_dequant_mode_for_frame(
       h, w, d_main, dq_spec, is_reference=False
   )
   m_use_dq = m_dq_mode != "none"
   dq_log_init = _init_dq_log_vec(m_dq_mode, is_reference=False)
   noise_lut_init = (
-      estimate_noise_lut_jax(target_xyb)
+      jnp.clip(
+          estimate_noise_lut_jax(target_xyb), min_noise_val, max_noise_val
+      )
       if enable_noise
       else jnp.zeros((8,), dtype=jnp.float32)
   )
   s2_noise_lut = (
-      np.clip(
-          np.asarray(noise_lut_init, dtype=np.float32), 2.0 / 1024.0, 0.5
-      )
-      if enable_noise
-      else None
+      np.asarray(noise_lut_init, dtype=np.float32) if enable_noise else None
   )
   fg_xyb_main = (
       _shrink_sensor_grain_xyb_jax(target_xyb, noise_lut_init)
@@ -5306,8 +5752,6 @@ def optimize_alpha_composite(
   # Stage 1 & Stage 2: Evaluate candidate (upsampling U, dim_shift D) and
   # make discrete decision based on Stage 2 Rate-WD Lagrangian.
   stage2_alpha_evals: list[dict[str, Any]] = []
-  max_st_a = max((1 << int(ds)) for ds in ds_cands)
-  max_rad_ups = (max_st_a * 2 + 6) // 8 if max_st_a > 1 else 0
   for u_val in u_cands:
     d_ref_u = _calibrate_ref_distance(
         d_main,
@@ -5329,19 +5773,50 @@ def optimize_alpha_composite(
         enable_noise=enable_noise,
         noise_lut=s2_noise_lut,
     )
+    fg_m_raw = np.asarray(s1_info["fg_mask_blocks"], dtype=bool)
     fg_m_dil = s1_info["fg_mask_dilated"]
+    fg_core_blk = (
+        fg_m_raw
+        if (h8 * w8 >= 256 and a_bm == PATCH_BLEND_ALPHA_BELOW)
+        else fg_m_dil
+    )
+    max_rad_ac = max(
+        (
+            max(dilate, (2 * (1 << int(ds)) + 7) // 8)
+            if (
+                int(ds) > 0
+                and h8 * w8 >= 256
+                and a_bm == PATCH_BLEND_ALPHA_BELOW
+            )
+            else dilate
+        )
+        for ds in ds_cands
+    )
+    fg_m_ac_max = (
+        _dilate_bool_grid(fg_core_blk, radius=max_rad_ac)
+        if np.any(fg_core_blk)
+        else fg_core_blk.copy()
+    )
+    fg_m_ac_base = (
+        _dilate_bool_grid(fg_core_blk, radius=dilate)
+        if np.any(fg_core_blk)
+        else fg_core_blk.copy()
+    )
     s2_acs_u = s1_info["stage2_ac_strategy"]
 
-    r_rgb = s1_info["rgb_low_smooth"]
-    r_state = _init_ref_state_with_stage2_acs(
-        r_rgb,
-        d_ref=d_ref_u,
-        eff_lambda=eff_lambda,
-        enable_noise=enable_noise,
-        vgg_params=vgg_params,
-        log2_sigma=log2_sigma,
-        upsampling=u_val,
-    )
+    r_rgb = s1_info["rgb_low_clean"]
+    if has_sensor_grain and s1_info.get("ref_state_raw") is not None:
+      r_state = copy.deepcopy(s1_info["ref_state_raw"])
+    else:
+      r_state = _init_ref_state_with_stage2_acs(
+          r_rgb,
+          d_ref=d_ref_u,
+          eff_lambda=eff_lambda,
+          enable_noise=enable_noise,
+          vgg_params=vgg_params,
+          log2_sigma=log2_sigma,
+          upsampling=u_val,
+      )
     r_dq_mode_u = select_dequant_mode_for_frame(
         int(r_state.height),
         int(r_state.width),
@@ -5361,17 +5836,22 @@ def optimize_alpha_composite(
     r_dc_dct, r_ac_dct = compute_continuous_dc_ac_jax(
         r_xyb_low, r_state, apply_inv_gab=True, init_mode="dct"
     )
+    s2_r = copy.deepcopy(r_state)
+    s2_r.quant_ac = np.round(np.asarray(r_ac_dct)).astype(np.int32)
+    s2_r.dc_quant = np.round(np.asarray(r_dc_dct)).astype(np.int32)
+    s2_r_xyb = _fast_reconstruct_xyb(s2_r, include_noise=False)
+    s2_r_ups = upsample_jxl(s2_r_xyb, u_val, out_hw=(h, w))
 
     if a_bm in (PATCH_BLEND_MUL_ADD_ABOVE, PATCH_BLEND_MUL_ADD_BELOW):
-      r_xyb_rec = _fast_reconstruct_xyb(r_state, include_noise=False)
-      r_xyb_ups = upsample_jxl(r_xyb_rec, u_val, out_hw=(h, w))
-      res_xyb_u = fg_xyb_main - r_xyb_ups
+      res_xyb_u = fg_xyb_main - s2_r_ups
       xyb_dc_src = res_xyb_u
       m_state, m_dc_dct, m_ac_dct = init_state_from_xyb_jax(
           res_xyb_u,
           distance=d_main,
           epf_iters=None,
           gab=None,
+          ac_strategy=s2_acs_u,
+          ac_anchors=s1_info["stage2_anchors"],
           enable_noise=enable_noise,
       )
       m_state.ac_strategy = s2_acs_u.copy()
@@ -5389,75 +5869,85 @@ def optimize_alpha_composite(
           res_xyb_u, m_state, apply_inv_gab=True, init_mode="dct"
       )
     else:
-      res_xyb_u = fg_xyb_main
       m_state = copy.deepcopy(s1_info["main_state"])
       rad_flt_a = 1 if (int(m_state.epf_iters) > 0 or bool(m_state.gab)) else 0
-      dc_halo_max = _dilate_bool_grid(fg_m_dil, radius=max(max_rad_ups, rad_flt_a))
+      dc_halo_max = (
+          _dilate_bool_grid(fg_m_ac_max, radius=rad_flt_a)
+          if np.any(fg_m_ac_max)
+          else fg_m_ac_max.copy()
+      )
       if a_bm == PATCH_BLEND_ALPHA_BELOW:
-        _pack_background_acs_and_cfl(m_state, fg_m_dil, dc_halo_max)
+        _pack_background_acs_and_cfl(m_state, fg_m_ac_max, dc_halo_max)
       if enable_noise:
         m_state.ytox_dc = 0
         m_state.ytob_dc = 0
       rq_fg_med_a = int(
           np.median(
-              m_state.raw_quant_field[fg_m_dil]
-              if np.any(fg_m_dil)
+              m_state.raw_quant_field[fg_m_ac_max]
+              if np.any(fg_m_ac_max)
               else m_state.raw_quant_field
           )
       )
-      m_state.raw_quant_field[~fg_m_dil] = rq_fg_med_a
+      m_state.raw_quant_field[~fg_m_ac_max] = rq_fg_med_a
       m_state.raw_quant_field = broadcast_quant_field_to_ac_strategy(
           m_state.raw_quant_field, m_state.ac_strategy
       )
       epf_fg_med_a = np.uint8(
           np.median(
-              m_state.epf_sharpness[fg_m_dil]
-              if np.any(fg_m_dil)
+              m_state.epf_sharpness[fg_m_ac_max]
+              if np.any(fg_m_ac_max)
               else m_state.epf_sharpness
           )
       )
-      m_state.epf_sharpness[~fg_m_dil] = epf_fg_med_a
+      m_state.epf_sharpness[~fg_m_ac_max] = epf_fg_med_a
       _apply_custom_dequant_to_state(
           m_state, dq_log_init, custom_dequant=m_dq_mode
       )
       if (
           h8 * w8 >= 256
           and a_bm == PATCH_BLEND_ALPHA_BELOW
-          and np.any(dc_halo_max)
-          and not np.all(dc_halo_max)
+          and np.any(fg_m_ac_base)
+          and not np.all(fg_m_ac_base)
       ):
-        halo_px_a = np.repeat(np.repeat(dc_halo_max, 8, axis=0), 8, axis=1)[
-            :h, :w
-        ]
-        xyb_smooth_a = _pyramid_harmonic_inpaint_jax(
-            jnp.moveaxis(fg_xyb_main, 0, -1),
-            jnp.asarray(halo_px_a, dtype=bool),
-            n_iters=6,
+        fg_px_ac_base = np.repeat(
+            np.repeat(fg_m_ac_base.astype(np.float32), 8, axis=0), 8, axis=1
+        )[:h, :w]
+        xyb_dc_src = jnp.where(
+            jnp.asarray(fg_px_ac_base[None] > 0.5),
+            fg_xyb_main,
+            s2_r_ups,
         )
-        xyb_dc_src = jnp.moveaxis(xyb_smooth_a, -1, 0)
       else:
         xyb_dc_src = fg_xyb_main
+      res_xyb_u = xyb_dc_src
       m_dc_dct, m_ac_dct = compute_continuous_dc_ac_jax(
           xyb_dc_src, m_state, apply_inv_gab=True, init_mode="dct"
       )
 
     fg_px_full = np.repeat(
-        np.repeat(fg_m_dil.astype(np.float32), 8, axis=0), 8, axis=1
+        np.repeat(fg_core_blk.astype(np.float32), 8, axis=0), 8, axis=1
     )[:h, :w]
     if a_bm in (PATCH_BLEND_ALPHA_ABOVE, PATCH_BLEND_MUL_ADD_ABOVE):
       fg_px_full = np.ones((h, w), dtype=np.float32)
 
-    fg_ac_m_j, _ = _build_ac_mask_from_block_mask(fg_m_dil, m_state)
-    def _compute_alpha_dc_mask_and_bg(st_a_cur: int) -> tuple[jax.Array, jax.Array]:
+    fg_ac_base_j, _ = _build_ac_mask_from_block_mask(fg_m_ac_base, m_state)
+
+    def _compute_alpha_dc_mask_and_bg(
+        fg_m_ac_cur: np.ndarray,
+        m_dc_ref: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
       if a_bm != PATCH_BLEND_ALPHA_BELOW:
         return (
             jnp.ones((3, h8, w8), dtype=jnp.float32),
             jnp.zeros((3, h8, w8), dtype=jnp.float32),
         )
-      rad_ups = (st_a_cur * 2 + 6) // 8 if st_a_cur > 1 else 0
+      dc_src_cur = m_dc_dct if m_dc_ref is None else m_dc_ref
       rad_flt = 1 if (int(m_state.epf_iters) > 0 or bool(m_state.gab)) else 0
-      halo_rad_a = max(rad_ups, rad_flt)
-      dc_halo_a = _dilate_bool_grid(fg_m_dil, radius=halo_rad_a)
+      dc_halo_a = (
+          _dilate_bool_grid(fg_m_ac_cur, radius=rad_flt)
+          if np.any(fg_m_ac_cur)
+          else fg_m_ac_cur.copy()
+      )
       for by_h in range(h8):
         for bx_h in range(w8):
           if m_state.ac_strategy_Anchor[by_h, bx_h]:
@@ -5471,9 +5961,9 @@ def optimize_alpha_composite(
             jnp.asarray(dc_halo_a, dtype=jnp.float32)[None, :, :], (3, h8, w8)
         )
         if h8 * w8 >= 256:
-          dc_bg_cur = (1.0 - fg_dc_cur) * jnp.round(m_dc_dct)
+          dc_bg_cur = (1.0 - fg_dc_cur) * jnp.round(dc_src_cur)
         else:
-          dc_np_a = np.asarray(m_dc_dct, dtype=np.float32)
+          dc_np_a = np.asarray(dc_src_cur, dtype=np.float32)
           dct8_halo_a = dc_halo_a & (m_state.ac_strategy == 0)
           ref_dc_mask_a = (
               dct8_halo_a
@@ -5495,25 +5985,27 @@ def optimize_alpha_composite(
           jnp.zeros((3, h8, w8), dtype=jnp.float32),
       )
 
-    fg_dc_m_j, dc_bg_u = _compute_alpha_dc_mask_and_bg(1)
-    s2_r = copy.deepcopy(r_state)
+    fg_dc_base_j, dc_bg_base_u = _compute_alpha_dc_mask_and_bg(
+        fg_m_ac_base, m_dc_dct
+    )
     s2_m = copy.deepcopy(m_state)
-    s2_r.quant_ac = np.round(np.asarray(r_ac_dct)).astype(np.int32)
-    s2_r.dc_quant = np.round(np.asarray(r_dc_dct)).astype(np.int32)
-    s2_m.quant_ac = np.round(np.asarray(m_ac_dct * fg_ac_m_j)).astype(np.int32)
-    s2_m.dc_quant = np.round(
-        np.asarray(m_dc_dct * fg_dc_m_j + dc_bg_u)
+    s2_m.quant_ac = np.round(
+        np.asarray(m_ac_dct * fg_ac_base_j)
     ).astype(np.int32)
-    s2_r_xyb = _fast_reconstruct_xyb(s2_r, include_noise=False)
+    s2_m.dc_quant = np.round(
+        np.asarray(m_dc_dct * fg_dc_base_j + dc_bg_base_u)
+    ).astype(np.int32)
     s2_m_xyb = _fast_reconstruct_xyb(s2_m, include_noise=False)
-    s2_r_ups = upsample_jxl(s2_r_xyb, u_val, out_hw=(h, w))
+    min_a_div = 0.85 if d_main >= 2.0 else 0.78
 
     ds_preps: list[
         tuple[
             int,
             jax.Array,
+            jax.Array,
             np.ndarray,
             JxlVarDCTState,
+            jax.Array,
             jax.Array,
             jax.Array,
             jax.Array,
@@ -5524,7 +6016,17 @@ def optimize_alpha_composite(
     ] = []
     for ds_val in ds_cands:
       st_a = 1 << int(ds_val)
-      fg_dc_ds, dc_bg_ds = _compute_alpha_dc_mask_and_bg(st_a)
+      rad_ac_ds = (
+          max(dilate, (2 * st_a + 7) // 8)
+          if (st_a > 1 and h8 * w8 >= 256 and a_bm == PATCH_BLEND_ALPHA_BELOW)
+          else dilate
+      )
+      fg_m_ac_ds = (
+          _dilate_bool_grid(fg_core_blk, radius=rad_ac_ds)
+          if np.any(fg_core_blk)
+          else fg_core_blk.copy()
+      )
+      fg_ac_ds_j, _ = _build_ac_mask_from_block_mask(fg_m_ac_ds, m_state)
       ha_cur = (h + st_a - 1) // st_a
       wa_cur = (w + st_a - 1) // st_a
       if st_a > 1:
@@ -5534,6 +6036,7 @@ def optimize_alpha_composite(
         a_init_01 = fg_pad.reshape(ha_cur, st_a, wa_cur, st_a).mean(axis=(1, 3))
       else:
         a_init_01 = fg_px_full
+      alpha_allowed_ds_j = jnp.asarray(a_init_01 > 1e-4, dtype=bool)
       a_logit_init = jnp.asarray(
           (a_init_01 * 2.0 - 1.0) * 8.0, dtype=jnp.float32
       )
@@ -5542,24 +6045,29 @@ def optimize_alpha_composite(
       if (
           st_a > 1
           and a_bm == PATCH_BLEND_ALPHA_BELOW
-          and np.any(fg_m_dil)
-          and not np.all(fg_m_dil)
+          and np.any(fg_m_ac_ds)
+          and not np.all(fg_m_ac_ds)
       ):
         a_up_ds = upsample_jxl(
             jnp.asarray(s2_au8, dtype=jnp.float32)[None] / 255.0,
             st_a,
             out_hw=(h, w),
         )
+        fg_px_ac_ds = np.repeat(
+            np.repeat(fg_m_ac_ds.astype(np.float32), 8, axis=0), 8, axis=1
+        )[:h, :w]
         res_xyb_ds = jnp.where(
-            jnp.asarray(fg_px_full[None] > 0.5),
-            s2_r_ups + (fg_xyb_main - s2_r_ups) / jnp.maximum(a_up_ds, 0.72),
-            xyb_dc_src,
+            jnp.asarray(fg_px_ac_ds[None] > 0.5),
+            s2_r_ups
+            + (fg_xyb_main - s2_r_ups) / jnp.maximum(a_up_ds, min_a_div),
+            s2_r_ups,
         )
         m_dc_ds, m_ac_ds = compute_continuous_dc_ac_jax(
             res_xyb_ds, m_state, apply_inv_gab=True, init_mode="dct"
         )
+        fg_dc_ds, dc_bg_ds = _compute_alpha_dc_mask_and_bg(fg_m_ac_ds, m_dc_ds)
         s2_m_ds = copy.deepcopy(m_state)
-        s2_m_ds.quant_ac = np.round(np.asarray(m_ac_ds * fg_ac_m_j)).astype(
+        s2_m_ds.quant_ac = np.round(np.asarray(m_ac_ds * fg_ac_ds_j)).astype(
             np.int32
         )
         s2_m_ds.dc_quant = np.round(
@@ -5567,6 +6075,9 @@ def optimize_alpha_composite(
         ).astype(np.int32)
         s2_m_xyb_ds = _fast_reconstruct_xyb(s2_m_ds, include_noise=False)
       else:
+        fg_dc_ds, dc_bg_ds = _compute_alpha_dc_mask_and_bg(
+            fg_m_ac_ds, m_dc_dct
+        )
         res_xyb_ds = res_xyb_u
         m_dc_ds = m_dc_dct
         m_ac_ds = m_ac_dct
@@ -5576,19 +6087,21 @@ def optimize_alpha_composite(
           (
               int(ds_val),
               a_logit_init,
+              alpha_allowed_ds_j,
               s2_au8,
               s2_m_ds,
               s2_m_xyb_ds,
               res_xyb_ds,
               m_dc_ds,
               m_ac_ds,
+              fg_ac_ds_j,
               fg_dc_ds,
               dc_bg_ds,
           )
       )
 
     def _enc_ds(item):
-      ds_v, _, au8_v, s2_m_cur, _, _, _, _, _, _ = item
+      ds_v, _, _, au8_v, s2_m_cur, _, _, _, _, _, _, _ = item
       return encode_alpha_composite(
           ref_state=s2_r,
           main_state=s2_m_cur,
@@ -5605,12 +6118,14 @@ def optimize_alpha_composite(
     for (
         ds_val,
         a_logit_init,
+        alpha_allowed_ds_j,
         s2_au8,
         s2_m_ds,
         s2_m_xyb_ds,
         res_xyb_ds,
         m_dc_ds,
         m_ac_ds,
+        fg_ac_ds_j,
         fg_dc_ds,
         dc_bg_ds,
     ), (s2_jb, _) in zip(ds_preps, enc_ds_results):
@@ -5655,7 +6170,8 @@ def optimize_alpha_composite(
           "main_dc_cont": m_dc_ds,
           "main_ac_cont": m_ac_ds,
           "alpha_logit_init": a_logit_init,
-          "fg_ac_mask_j": fg_ac_m_j,
+          "alpha_allowed_j": alpha_allowed_ds_j,
+          "fg_ac_mask_j": fg_ac_ds_j,
           "fg_dc_mask_j": fg_dc_ds,
           "dc_bg_j": dc_bg_ds,
           "stage2_true_bpp": s2_bpp_cur,
@@ -5663,7 +6179,22 @@ def optimize_alpha_composite(
           "stage2_true_j": s2_j_cur,
       })
 
-  best_s2_a = min(stage2_alpha_evals, key=lambda d: d["stage2_true_j"])
+  stage2_alpha_summaries = [
+      {
+          "mode": "alpha",
+          "upsampling": int(ev["u"]),
+          "blend_mode": a_bm,
+          "dim_shift": int(ev["d_shift"]),
+          "bpp": float(ev["stage2_true_bpp"]),
+          "wd": float(ev["stage2_wd"]),
+          "rd_cost": float(ev["stage2_true_j"]),
+      }
+      for ev in stage2_alpha_evals
+  ]
+  best_s2_a = min(
+      stage2_alpha_evals,
+      key=lambda d: (round(float(d["stage2_true_j"]), 7), int(d["d_shift"])),
+  )
   u = int(best_s2_a["u"])
   d_shift = int(best_s2_a["d_shift"])
   stage1_info = best_s2_a["stage1_info"]
@@ -5676,6 +6207,7 @@ def optimize_alpha_composite(
   dq_log_init_ref = best_s2_a["r_dq_init"]
   use_custom_dq = bool(m_use_dq or r_use_dq)
   alpha_logit_init = best_s2_a["alpha_logit_init"]
+  alpha_allowed_j = best_s2_a["alpha_allowed_j"]
   fg_ac_mask_j = best_s2_a["fg_ac_mask_j"]
   fg_dc_mask_j = best_s2_a["fg_dc_mask_j"]
   dc_bg_j = best_s2_a["dc_bg_j"]
@@ -5684,13 +6216,10 @@ def optimize_alpha_composite(
   stage2_true_j = best_s2_a["stage2_true_j"]
 
   alpha_init_norm = str(alpha_init).strip().lower()
-  learn_decomp = (
-      alpha_init_norm == "uniform"
-      or (
-          alpha_init_norm == "auto"
-          and (init_mode_norm in ("zero", "random") or eff_steps >= 80)
-      )
-  ) and a_bm not in (PATCH_BLEND_ALPHA_ABOVE, PATCH_BLEND_MUL_ADD_ABOVE)
+  learn_decomp = (alpha_init_norm == "uniform") and a_bm not in (
+      PATCH_BLEND_ALPHA_ABOVE,
+      PATCH_BLEND_MUL_ADD_ABOVE,
+  )
 
   if learn_decomp:
     # Ensure 1:1 main_state uses 8x8-localized transforms so each 8x8 block can
@@ -5722,6 +6251,7 @@ def optimize_alpha_composite(
     main_ac_cont = best_s2_a["main_ac_cont"]
   else:
     if init_mode_norm != "dct":
+      fg_dc_mask_j = jnp.ones_like(fg_dc_mask_j)
       dc_bg_j = jnp.zeros_like(dc_bg_j)
     ref_dc_cont, ref_ac_cont = compute_continuous_dc_ac_jax(
         best_s2_a["ref_xyb_low"],
@@ -5783,6 +6313,8 @@ def optimize_alpha_composite(
         )
     )
     stage2_true_j = stage2_wd + float(eff_lambda) * stage2_true_bpp
+
+  del stage2_alpha_evals, best_s2_a
 
   # Stage 3: Joint continuous Rate-WD refinement in XYB PatchDictionary space
   ref_fwd_fn, ref_vjp_fn = _get_frame_kernels(ref_state, enable_noise=False)
@@ -5852,8 +6384,6 @@ def optimize_alpha_composite(
     ref_scale_dc, ref_scale_ac = _compute_state_precond_scales_jax(
         ref_state, ref_topo
     )
-    ref_scale_dc = ref_scale_dc * 0.35
-    ref_scale_ac = ref_scale_ac * 0.35
     main_scale_dc, main_scale_ac = _compute_state_precond_scales_jax(
         main_state, main_topo
     )
@@ -5868,51 +6398,37 @@ def optimize_alpha_composite(
       if (enable_noise and lr_noise == 0.005)
       else (float(lr_noise) if enable_noise else 0.0)
   )
-  tx = optax.multi_transform(
-      {
-          "ac": optax.adam(learning_rate=eff_lr_ac, b1=0.5, eps=adam_eps),
-          "dc": optax.adam(learning_rate=eff_lr_dc, b1=0.5, eps=adam_eps),
-          "alpha": optax.adam(learning_rate=lr_alpha, b1=0.5, eps=1e-4),
-          "noise": optax.adam(
-              learning_rate=eff_lr_noise, b1=0.5, eps=1e-4
-          ),
-          "meta": optax.adam(learning_rate=0.005, b1=0.5, eps=1e-4),
-          "dq": optax.adam(
-              learning_rate=lr_dequant if use_custom_dq else 0.0,
-              b1=0.5,
-              eps=1e-4,
-          ),
+  adam_init_fn, adam_step_fn = _get_compiled_adam_updater("alpha", adam_eps)
+  dq_lr_val = float(lr_dequant) if use_custom_dq else 0.0
+  lr_tree = {
+      "ref": {
+          "ac": (eff_lr_ac * ref_scale_ac) if is_zero_or_rand else eff_lr_ac,
+          "dc": (eff_lr_dc * ref_scale_dc) if is_zero_or_rand else eff_lr_dc,
+          "noise_lut": eff_lr_noise,
+          "rq_delta": 0.005,
+          "yx_delta": 0.005,
+          "yb_delta": 0.005,
+          "dq_log_scale": dq_lr_val,
       },
-      {
-          "ref": {
-              "ac": "ac",
-              "dc": "dc",
-              "noise_lut": "noise",
-              "rq_delta": "meta",
-              "yx_delta": "meta",
-              "yb_delta": "meta",
-              "dq_log_scale": "dq",
-          },
-          "main": {
-              "ac": "ac",
-              "dc": "dc",
-              "noise_lut": "noise",
-              "rq_delta": "meta",
-              "yx_delta": "meta",
-              "yb_delta": "meta",
-              "dq_log_scale": "dq",
-          },
-          "alpha_logit": "alpha",
+      "main": {
+          "ac": (eff_lr_ac * main_scale_ac) if is_zero_or_rand else eff_lr_ac,
+          "dc": (eff_lr_dc * main_scale_dc) if is_zero_or_rand else eff_lr_dc,
+          "noise_lut": eff_lr_noise,
+          "rq_delta": 0.005,
+          "yx_delta": 0.005,
+          "yb_delta": 0.005,
+          "dq_log_scale": dq_lr_val,
       },
-  )
-  opt_state = tx.init(params)
+      "alpha_logit": float(lr_alpha),
+  }
+  opt_state = adam_init_fn(params)
 
   history: list[dict[str, float]] = []
   best_j = float("inf")
-  best_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-  step0_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
+  best_params = jax.tree_util.tree_map(lambda x: x, params)
+  step0_params = jax.tree_util.tree_map(lambda x: x, params)
   last_grads: dict[str, Any] | None = None
-  min_noise_val = 2.0 / 1024.0 if enable_noise else 0.0
+  alpha_allowed_np = np.asarray(alpha_allowed_j, dtype=bool)
   total_steps = max(1, int(eff_steps))
   warmup_meta_step = int(0.35 * total_steps) if is_zero_or_rand else 0
   freeze_dq_step = max(1, int(0.8 * total_steps))
@@ -5945,7 +6461,9 @@ def optimize_alpha_composite(
     m_rq_eff = jnp.clip(main_rq + params["main"]["rq_delta"], 1.0, 256.0)
     m_yx_eff = jnp.clip(main_yx + params["main"]["yx_delta"], -128.0, 127.0)
     m_yb_eff = jnp.clip(main_yb + params["main"]["yb_delta"], -128.0, 127.0)
-    n_lut_clipped = jnp.clip(params["main"]["noise_lut"], min_noise_val, 0.5)
+    n_lut_clipped = jnp.clip(
+        params["main"]["noise_lut"], min_noise_val, max_noise_val
+    )
     m_xyb = main_fwd_fn(
         m_ac,
         m_dc,
@@ -5983,6 +6501,19 @@ def optimize_alpha_composite(
             lam_per_px,
         )
     )
+    if is_zero_or_rand:
+      z_w = jnp.float32(
+          4.0
+          + 25.0
+          * 0.5
+          * (1.0 + math.cos(math.pi * float(step) / float(max(total_steps - 1, 1))))
+      )
+      g_r_z, g_m_z, g_a_z = _get_xyb_guide_grad_alpha(h, w, u, d_shift, a_bm)(
+          r_xyb, m_xyb, params["alpha_logit"], fg_xyb_main
+      )
+      grad_r_xyb = grad_r_xyb + z_w * g_r_z
+      grad_m_xyb = grad_m_xyb + z_w * g_m_z
+      grad_alpha = grad_alpha + z_w * g_a_z
 
     r_cluster_blend = jnp.float32(
         1.0
@@ -6051,7 +6582,6 @@ def optimize_alpha_composite(
       a_px_cur = jnp.repeat(jnp.repeat(a_blk_cur, 8, axis=0), 8, axis=1)[
           None, :, :
       ]
-      r_up_cur = upsample_jxl(r_xyb, u, out_hw=(h, w))
       h_u = (h // u) * u
       w_u = (w // u) * u
       mx_low_cur = (
@@ -6073,7 +6603,7 @@ def optimize_alpha_composite(
           hf_mx_px.reshape(h8, 8, w8, 8).mean(axis=(1, 3))
       )
       thr_hf = 0.25 * jnp.mean(hf_mx_blk) + 1e-5
-      phi_blk = (1.0 - hf_mx_blk / thr_hf) * 800.0
+      phi_blk = jnp.maximum(0.0, 1.0 - hf_mx_blk / thr_hf) * 120.0
       phi_px = jnp.repeat(jnp.repeat(phi_blk, 8, axis=0), 8, axis=1)[:h, :w]
       if st_a_cur > 1:
         ha_c, wa_c = a01_cur.shape
@@ -6101,30 +6631,33 @@ def optimize_alpha_composite(
 
     if is_zero_or_rand:
       r_ac_p = params["ref"]["ac"]
-      r_dc_p = params["ref"]["dc"]
       m_ac_p = params["main"]["ac"]
-      m_dc_p = params["main"]["dc"]
+      ac_l1_base = 0.0 if step < int(0.25 * total_steps) else 0.15
       m_ac_w = (
           14.0 * (2.0 - jax.lax.stop_gradient(a_px_cur))
           if learn_decomp
-          else 1.0
+          else ac_l1_base
       )
-      g_ref["ac"] = g_ref["ac"] + lam_per_px * 1.0 * (
+      g_ref["ac"] = g_ref["ac"] + lam_per_px * ac_l1_base * (
           r_ac_p / jnp.sqrt(r_ac_p * r_ac_p + 0.01)
-      )
-      g_ref["dc"] = g_ref["dc"] + lam_per_px * 0.1 * (
-          r_dc_p / jnp.sqrt(r_dc_p * r_dc_p + 0.01)
       )
       g_main["ac"] = g_main["ac"] + lam_per_px * m_ac_w * (
           m_ac_p / jnp.sqrt(m_ac_p * m_ac_p + 0.01)
       ) * fg_ac_mask_j
-      g_main["dc"] = g_main["dc"] + lam_per_px * 0.1 * (
-          m_dc_p / jnp.sqrt(m_dc_p * m_dc_p + 0.01)
-      ) * fg_dc_mask_j
       g_ref["ac"] = g_ref["ac"] * ref_scale_ac
-      g_ref["dc"] = g_ref["dc"] * ref_scale_dc
+      g_ref["dc"] = (
+          _decorrelate_dc_grad_jax(
+              g_ref["dc"], ref_state.ytox_dc, ref_state.ytob_dc
+          )
+          * ref_scale_dc
+      )
       g_main["ac"] = g_main["ac"] * main_scale_ac
-      g_main["dc"] = g_main["dc"] * main_scale_dc
+      g_main["dc"] = (
+          _decorrelate_dc_grad_jax(
+              g_main["dc"], main_state.ytox_dc, main_state.ytob_dc
+          )
+          * main_scale_dc
+      )
     if step < warmup_meta_step or step >= freeze_dq_step:
       g_ref["rq_delta"] = jnp.zeros_like(g_ref["rq_delta"])
       g_ref["yx_delta"] = jnp.zeros_like(g_ref["yx_delta"])
@@ -6139,14 +6672,28 @@ def optimize_alpha_composite(
     if enable_noise:
       g_main["noise_lut"] = grad_n_lut
 
-    grads = jax.tree_util.tree_map(
-        lambda x: jnp.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0),
+    lr_mul_cur = (
+        jnp.float32(
+            0.015
+            + 0.5
+            * 0.985
+            * (1.0 + math.cos(math.pi * float(step) / float(max(total_steps - 1, 1))))
+        )
+        if is_zero_or_rand
+        else jnp.float32(1.0)
+    )
+    prev_params = jax.tree_util.tree_map(lambda x: x, params)
+    params, opt_state, clean_grads = adam_step_fn(
         {"ref": g_ref, "main": g_main, "alpha_logit": grad_alpha},
+        opt_state,
+        params,
+        lr_tree,
+        lr_mul_cur,
     )
     g_ref, g_main, grad_alpha = (
-        grads["ref"],
-        grads["main"],
-        grads["alpha_logit"],
+        clean_grads["ref"],
+        clean_grads["main"],
+        clean_grads["alpha_logit"],
     )
     last_grads = {
         "ref_ac": g_ref["ac"],
@@ -6158,34 +6705,6 @@ def optimize_alpha_composite(
         "noise_lut": g_main["noise_lut"],
         "dq_log_scale": g_main["dq_log_scale"],
     }
-
-    noise_bits = 80.0 if enable_noise else 0.0
-    bpp_v = (
-        float(ref_bits)
-        + float(main_bits)
-        + float(a_bits)
-        + patch_dict_bits
-        + noise_bits
-    ) / float(h * w)
-    j_v = float(wd_v) + float(eff_lambda) * bpp_v
-    history.append(
-        {
-            "step": float(step),
-            "rd_loss": j_v,
-            "wd": float(wd_v),
-            "proxy_bpp": bpp_v,
-        }
-    )
-    if j_v < best_j:
-      best_j = j_v
-      best_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-    updates, opt_state = tx.update(grads, opt_state, params)
-    if is_zero_or_rand:
-      updates["ref"]["ac"] = updates["ref"]["ac"] * ref_scale_ac
-      updates["ref"]["dc"] = updates["ref"]["dc"] * ref_scale_dc
-      updates["main"]["ac"] = updates["main"]["ac"] * main_scale_ac
-      updates["main"]["dc"] = updates["main"]["dc"] * main_scale_dc
-    params = optax.apply_updates(params, updates)
     if is_zero_or_rand:
       params["ref"]["ac"] = mask_llf_jax(params["ref"]["ac"], ref_topo)
       params["ref"]["dc"] = params["ref"]["dc"].at[1].set(
@@ -6197,10 +6716,36 @@ def optimize_alpha_composite(
             jnp.maximum(params["main"]["dc"][1], 0.0)
         )
     params["main"]["noise_lut"] = jnp.clip(
-        params["main"]["noise_lut"], min_noise_val, 0.5
+        params["main"]["noise_lut"], min_noise_val, max_noise_val
     )
     if a_bm in (PATCH_BLEND_ALPHA_ABOVE, PATCH_BLEND_MUL_ADD_ABOVE):
       params["alpha_logit"] = jnp.maximum(params["alpha_logit"], 6.0)
+    elif not learn_decomp and a_bm == PATCH_BLEND_ALPHA_BELOW:
+      params["alpha_logit"] = jnp.where(
+          alpha_allowed_j,
+          jnp.clip(params["alpha_logit"], -10.0, 10.0),
+          jnp.float32(-10.0),
+      )
+
+    wd_f, r_bits_f, m_bits_f, a_bits_f = np.asarray(
+        jnp.stack([wd_v, ref_bits, main_bits, a_bits]), dtype=np.float64
+    ).tolist()
+    noise_bits = 80.0 if enable_noise else 0.0
+    bpp_v = (
+        r_bits_f + m_bits_f + a_bits_f + patch_dict_bits + noise_bits
+    ) / float(h * w)
+    j_v = wd_f + float(eff_lambda) * bpp_v
+    history.append(
+        {
+            "step": float(step),
+            "rd_loss": j_v,
+            "wd": wd_f,
+            "proxy_bpp": bpp_v,
+        }
+    )
+    if j_v < best_j:
+      best_j = j_v
+      best_params = prev_params
 
   def _prep_alpha_candidate(
       cand_p: dict[str, Any],
@@ -6302,6 +6847,8 @@ def optimize_alpha_composite(
     c_a01 = np.asarray(
         jax.nn.sigmoid(cand_p["alpha_logit"]), dtype=np.float32
     )
+    if not learn_decomp and a_bm == PATCH_BLEND_ALPHA_BELOW:
+      c_a01 = np.where(alpha_allowed_np, c_a01, 0.0)
     if learn_decomp:
       st_a_np = 1 << int(d_shift)
       if st_a_np > 1:
@@ -6331,8 +6878,8 @@ def optimize_alpha_composite(
     c_lut = (
         np.clip(
             np.asarray(cand_p["main"]["noise_lut"], dtype=np.float32),
-            2.0 / 1024.0,
-            0.5,
+            min_noise_val,
+            max_noise_val,
         )
         if enable_noise
         else None
@@ -6521,18 +7068,9 @@ def optimize_alpha_composite(
       stage1_main_j_map=stage1_info["stage1_main_j_map"],
       stage1_ref_j_map=stage1_info["stage1_ref_j_map"],
   )
-  res_alpha.all_candidates = [
-      {
-          "mode": "alpha",
-          "upsampling": int(ev["u"]),
-          "blend_mode": a_bm,
-          "dim_shift": int(ev["d_shift"]),
-          "bpp": float(ev["stage2_true_bpp"]),
-          "wd": float(ev["stage2_wd"]),
-          "rd_cost": float(ev["stage2_true_j"]),
-      }
-      for ev in stage2_alpha_evals
-  ]
+  res_alpha.all_candidates = stage2_alpha_summaries
+  if not _keep_transient_caches:
+    _clear_transient_encode_caches()
   return res_alpha
 
 
@@ -6561,6 +7099,7 @@ def optimize_single_frame_baseline(
     seed: int = 0,
     *,
     srgb_hwc: np.ndarray | jax.Array | None = None,
+    _keep_transient_caches: bool = False,
 ) -> CompositeOptimizationResult:
   """Three-stage pure-JAX single-frame VarDCT Rate-WD optimizer."""
   img_in = rgb_u8 if rgb_u8 is not None else srgb_hwc
@@ -6600,8 +7139,14 @@ def optimize_single_frame_baseline(
   has_sensor_grain = bool(
       enable_noise and float(np.max(sensor_lut_np)) >= 0.0020
   )
+  min_noise_val = 2.0 / 1024.0 if enable_noise else 0.0
+  max_noise_val = _max_noise_lut_bound(
+      enable_noise, has_sensor_grain, sensor_lut_np
+  )
   noise_lut_init = (
-      estimate_noise_lut_jax(target_xyb)
+      jnp.clip(
+          estimate_noise_lut_jax(target_xyb), min_noise_val, max_noise_val
+      )
       if enable_noise
       else jnp.zeros((8,), dtype=jnp.float32)
   )
@@ -6666,11 +7211,7 @@ def optimize_single_frame_baseline(
   s2_state.quant_ac = s2_ac_np
   s2_state.dc_quant = np.round(np.asarray(dc_cont)).astype(np.int32)
   s2_noise_lut = (
-      np.clip(
-          np.asarray(noise_lut_init, dtype=np.float32), 2.0 / 1024.0, 0.5
-      )
-      if enable_noise
-      else None
+      np.asarray(noise_lut_init, dtype=np.float32) if enable_noise else None
   )
   s2_jxl_bytes, _ = encode_single_frame(
       s2_state, effort=effort, noise_lut=s2_noise_lut
@@ -6718,7 +7259,7 @@ def optimize_single_frame_baseline(
   }
   is_zero_or_rand = init_mode_norm in ("zero", "random")
   eff_lr_ac = (
-      0.055
+      0.18
       if (is_zero_or_rand and lr_ac == 0.03)
       else (
           float(lr_ac) * min(1.0, 0.45 + 0.85 * float(distance))
@@ -6727,7 +7268,7 @@ def optimize_single_frame_baseline(
       )
   )
   eff_lr_dc = (
-      0.055
+      0.18
       if (is_zero_or_rand and lr_dc == 0.01)
       else (
           float(lr_dc) * (1.0 + 6.0 * float(np.clip(1.0 - float(distance), 0.0, 1.0)))
@@ -6735,8 +7276,10 @@ def optimize_single_frame_baseline(
           else float(lr_dc)
       )
   )
+  adam_eps = 1e-8 if is_zero_or_rand else 1e-4
   if is_zero_or_rand:
     scale_dc, scale_ac = _compute_state_precond_scales_jax(state, topo)
+    _ = mask_llf_jax(ac_cont, topo)
   else:
     scale_dc = scale_ac = None
 
@@ -6745,38 +7288,24 @@ def optimize_single_frame_baseline(
       if (enable_noise and lr_noise == 0.005)
       else (float(lr_noise) if enable_noise else 0.0)
   )
-  tx = optax.multi_transform(
-      {
-          "ac": optax.adam(learning_rate=eff_lr_ac, b1=0.5, eps=1e-4),
-          "dc": optax.adam(learning_rate=eff_lr_dc, b1=0.5, eps=1e-4),
-          "noise": optax.adam(
-              learning_rate=eff_lr_noise, b1=0.5, eps=1e-4
-          ),
-          "meta": optax.adam(learning_rate=0.005, b1=0.5, eps=1e-4),
-          "dq": optax.adam(
-              learning_rate=lr_dequant if use_custom_dq else 0.0,
-              b1=0.5,
-              eps=1e-4,
-          ),
-      },
-      {
-          "ac": "ac",
-          "dc": "dc",
-          "noise_lut": "noise",
-          "rq_delta": "meta",
-          "yx_delta": "meta",
-          "yb_delta": "meta",
-          "dq_log_scale": "dq",
-      },
-  )
-  opt_state = tx.init(params)
+  adam_init_fn, adam_step_fn = _get_compiled_adam_updater("single", adam_eps)
+  dq_lr_val = float(lr_dequant) if use_custom_dq else 0.0
+  lr_tree = {
+      "ac": (eff_lr_ac * scale_ac) if is_zero_or_rand else eff_lr_ac,
+      "dc": (eff_lr_dc * scale_dc) if is_zero_or_rand else eff_lr_dc,
+      "noise_lut": eff_lr_noise,
+      "rq_delta": 0.005,
+      "yx_delta": 0.005,
+      "yb_delta": 0.005,
+      "dq_log_scale": dq_lr_val,
+  }
+  opt_state = adam_init_fn(params)
 
   history: list[dict[str, float]] = []
   best_j = float("inf")
-  best_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-  step0_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
+  best_params = jax.tree_util.tree_map(lambda x: x, params)
+  step0_params = jax.tree_util.tree_map(lambda x: x, params)
   last_grads: dict[str, Any] | None = None
-  min_noise_val = 2.0 / 1024.0 if enable_noise else 0.0
   total_steps = max(1, int(eff_steps))
   warmup_meta_step = int(0.35 * total_steps) if is_zero_or_rand else 0
   freeze_dq_step = max(1, int(0.8 * total_steps))
@@ -6796,7 +7325,7 @@ def optimize_single_frame_baseline(
         yb_eff,
         gs,
         qdc,
-        jnp.clip(params["noise_lut"], min_noise_val, 0.5),
+        jnp.clip(params["noise_lut"], min_noise_val, max_noise_val),
         params["dq_log_scale"] if use_custom_dq else None,
         rq,
         dq_base,
@@ -6817,9 +7346,28 @@ def optimize_single_frame_baseline(
       hq_w = 80.0 * ((0.85 - float(distance)) ** 2)
       grad_rec = grad_rec + (2.0 * hq_w / float(3 * h * w)) * (rec - target_j)
     grad_xyb = grad_srgb(xyb, grad_rec)
-    if (
-        not is_zero_or_rand
-        and not enable_noise
+    if is_zero_or_rand:
+      z_w = jnp.float32(
+          4.0
+          + 25.0
+          * 0.5
+          * (1.0 + math.cos(math.pi * float(step) / float(max(total_steps - 1, 1))))
+      )
+      dx_z = xyb[0, :h, :w] - target_xyb[0, :h, :w]
+      dy_z = xyb[1, :h, :w] - target_xyb[1, :h, :w]
+      db_z = (xyb[2, :h, :w] - xyb[1, :h, :w]) - (
+          target_xyb[2, :h, :w] - target_xyb[1, :h, :w]
+      )
+      s_z = jnp.float32(2.0 / float(h * w)) * z_w
+      g_xyb_z = (
+          jnp.stack(
+              [240.0 * dx_z, 100.0 * dy_z - 25.0 * db_z, 25.0 * db_z], axis=0
+          )
+          * s_z
+      )
+      grad_xyb = grad_xyb.at[:, :h, :w].add(g_xyb_z)
+    elif (
+        not enable_noise
         and total_steps >= 4
         and float(distance) < 0.85
     ):
@@ -6852,44 +7400,60 @@ def optimize_single_frame_baseline(
     )
     if is_zero_or_rand:
       ac_p = params["ac"]
-      dc_p = params["dc"]
+      ac_l1_s = 0.0 if step < int(0.25 * total_steps) else 0.25
       grads["ac"] = (
           grads["ac"]
-          + lam_per_px * 3.0 * (ac_p / jnp.sqrt(ac_p * ac_p + 0.01))
+          + lam_per_px * ac_l1_s * (ac_p / jnp.sqrt(ac_p * ac_p + 0.01))
       ) * scale_ac
       grads["dc"] = (
-          grads["dc"]
-          + lam_per_px * 3.0 * (dc_p / jnp.sqrt(dc_p * dc_p + 0.01))
-      ) * scale_dc
+          _decorrelate_dc_grad_jax(grads["dc"], state.ytox_dc, state.ytob_dc)
+          * scale_dc
+      )
     if step < warmup_meta_step or step >= freeze_dq_step:
       grads["rq_delta"] = jnp.zeros_like(grads["rq_delta"])
       grads["yx_delta"] = jnp.zeros_like(grads["yx_delta"])
       grads["yb_delta"] = jnp.zeros_like(grads["yb_delta"])
     if not use_custom_dq or step < warmup_meta_step or step >= freeze_dq_step:
       grads["dq_log_scale"] = jnp.zeros_like(grads["dq_log_scale"])
-    last_grads = grads
-    bpp_v = float(bits) / float(h * w)
-    j_v = float(wd_v) + float(eff_lambda) * bpp_v
+
+    lr_mul_cur = (
+        jnp.float32(
+            0.015
+            + 0.5
+            * 0.985
+            * (1.0 + math.cos(math.pi * float(step) / float(max(total_steps - 1, 1))))
+        )
+        if is_zero_or_rand
+        else jnp.float32(1.0)
+    )
+    prev_params = jax.tree_util.tree_map(lambda x: x, params)
+    params, opt_state, clean_grads = adam_step_fn(
+        grads, opt_state, params, lr_tree, lr_mul_cur
+    )
+    last_grads = clean_grads
+    if is_zero_or_rand:
+      params["ac"] = mask_llf_jax(params["ac"], topo)
+      params["dc"] = params["dc"].at[1].set(jnp.maximum(params["dc"][1], 0.0))
+    params["noise_lut"] = jnp.clip(
+        params["noise_lut"], min_noise_val, max_noise_val
+    )
+
+    wd_f, bits_f = np.asarray(
+        jnp.stack([wd_v, bits]), dtype=np.float64
+    ).tolist()
+    bpp_v = bits_f / float(h * w)
+    j_v = wd_f + float(eff_lambda) * bpp_v
     history.append(
         {
             "step": float(step),
             "rd_loss": j_v,
-            "wd": float(wd_v),
+            "wd": wd_f,
             "proxy_bpp": bpp_v,
         }
     )
     if j_v < best_j:
       best_j = j_v
-      best_params = jax.tree_util.tree_map(lambda x: x.copy(), params)
-    updates, opt_state = tx.update(grads, opt_state, params)
-    if is_zero_or_rand:
-      updates["ac"] = updates["ac"] * scale_ac
-      updates["dc"] = updates["dc"] * scale_dc
-    params = optax.apply_updates(params, updates)
-    if is_zero_or_rand:
-      params["ac"] = mask_llf_jax(params["ac"], topo)
-      params["dc"] = params["dc"].at[1].set(jnp.maximum(params["dc"][1], 0.0))
-    params["noise_lut"] = jnp.clip(params["noise_lut"], min_noise_val, 0.5)
+      best_params = prev_params
 
   def _prep_single_candidate(
       cand_p: dict[str, Any], deadzone: float = 0.0, rq_shift: float = 0.0
@@ -6935,8 +7499,8 @@ def optimize_single_frame_baseline(
     c_lut = (
         np.clip(
             np.asarray(cand_p["noise_lut"], dtype=np.float32),
-            2.0 / 1024.0,
-            0.5,
+            min_noise_val,
+            max_noise_val,
         )
         if enable_noise
         else None
@@ -7030,7 +7594,7 @@ def optimize_single_frame_baseline(
   if len(history) >= 2 and history[-1]["rd_loss"] > history[0]["rd_loss"]:
     history[-1]["rd_loss"] = min(history[-1]["rd_loss"], best_j)
 
-  return _finalize_encode_result(
+  res_single = _finalize_encode_result(
       mode="single",
       upsampling=1,
       dim_shift=0,
@@ -7063,6 +7627,9 @@ def optimize_single_frame_baseline(
       stage3_true_j=true_rd,
       custom_dequant_enabled=use_custom_dq,
   )
+  if not _keep_transient_caches:
+    _clear_transient_encode_caches()
+  return res_single
 
 
 def select_best_mode(
@@ -7148,6 +7715,14 @@ def select_best_mode(
       if dim_shift_candidates is not None
       else list(candidate_dim_shifts)
   )
+  if (
+      dim_shift_candidates is None
+      and tuple(ds_cands) == (0, 1)
+      and float(distance) >= 2.5
+      and arr.shape[0] >= 256
+      and arr.shape[1] >= 256
+  ):
+    ds_cands = [0, 1, 2, 3]
   if blend_mode_candidates is not None:
     bm_cands = [_parse_blend_mode(b) for b in blend_mode_candidates]
   else:
@@ -7239,6 +7814,7 @@ def select_best_mode(
             effort=effort,
             init_mode=init_mode_norm,
             seed=seed,
+            _keep_transient_caches=True,
         )
         res_s_noise = optimize_single_frame_baseline(
             rgb_u8=arr,
@@ -7253,6 +7829,7 @@ def select_best_mode(
             effort=effort,
             init_mode=init_mode_norm,
             seed=seed,
+            _keep_transient_caches=True,
         )
         res_s = (
             res_s_noise
@@ -7273,6 +7850,7 @@ def select_best_mode(
             effort=effort,
             init_mode=init_mode_norm,
             seed=seed,
+            _keep_transient_caches=True,
         )
       candidates.append(res_s)
     elif m_low == "patches":
@@ -7294,6 +7872,7 @@ def select_best_mode(
             effort=effort,
             init_mode=init_mode_norm,
             seed=seed,
+            _keep_transient_caches=True,
         )
         candidates.append(res_p)
     elif m_low == "alpha":
@@ -7317,6 +7896,7 @@ def select_best_mode(
           effort=effort,
           init_mode=init_mode_norm,
           seed=seed,
+          _keep_transient_caches=True,
       )
       candidates.append(res_a)
     else:
@@ -7386,9 +7966,7 @@ def select_best_mode(
       }
       for c in candidates
   ]
-  _STAGE1_AC_CANDIDATE_CACHE.clear()
-  _STAGE1_MAIN_DP_CACHE.clear()
-  _STAGE1_MULTIRES_CACHE.clear()
+  _clear_transient_encode_caches()
   return best
 
 
@@ -7401,7 +7979,7 @@ def encode_image_to_jxl(
     distance: float = 1.0,
     mode: str = "auto",
     upsampling: int | str = "auto",
-    dim_shift: int | str = 0,
+    dim_shift: int | str | None = None,
     patch_blend_mode: int | str = "auto",
     alpha_blend_mode: int | str = PATCH_BLEND_ALPHA_BELOW,
     enable_noise: bool | str | None = None,
@@ -7460,10 +8038,11 @@ def encode_image_to_jxl(
         u_cands = (2, 4, 8)
     else:
       u_cands = (int(upsampling),)
+    eff_ds_auto = "auto" if dim_shift is None else dim_shift
     ds_cands = (
         (0, 1, 2, 3)
-        if (isinstance(dim_shift, str) and dim_shift.lower() == "auto")
-        else (int(dim_shift),)
+        if (isinstance(eff_ds_auto, str) and eff_ds_auto.lower() == "auto")
+        else (int(eff_ds_auto),)
     )
     return select_best_mode(
         rgb_u8=arr,
@@ -7546,7 +8125,7 @@ def encode_image_to_jxl(
     return optimize_alpha_composite(
         rgb_u8=arr,
         upsampling=upsampling,
-        dim_shift=dim_shift,
+        dim_shift=0 if dim_shift is None else dim_shift,
         distance=distance,
         lambda_rd=eff_lambda,
         steps=eff_steps,

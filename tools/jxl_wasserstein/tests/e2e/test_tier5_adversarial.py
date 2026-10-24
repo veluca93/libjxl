@@ -31,8 +31,11 @@ os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
 import jax
 import jax.numpy as jnp
 
-Path("/tmp/jxl_wasserstein_jax_cache").mkdir(parents=True, exist_ok=True)
-jax.config.update("jax_compilation_cache_dir", "/tmp/jxl_wasserstein_jax_cache")
+_jax_cache_dir = os.environ.get(
+    "JAX_COMPILATION_CACHE_DIR", "/tmp/jxl_wasserstein_jax_cache"
+)
+Path(_jax_cache_dir).mkdir(parents=True, exist_ok=True)
+jax.config.update("jax_compilation_cache_dir", _jax_cache_dir)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 

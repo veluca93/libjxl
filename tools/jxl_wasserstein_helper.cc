@@ -1373,7 +1373,26 @@ Status PopulateEncoderStateFromLoaded(
   if (!extra_channels.empty()) {
     mod_cparams.butteraugli_distance = 0.0f;
     mod_cparams.ec_distance.assign(metadata->m.num_extra_channels, 0.0f);
-    mod_cparams.responsive = 0;
+    // Work around upstream libjxl ModularFrameDecoder::MaybeDropFullImage()
+    // (lib/jxl/dec_modular.cc:278,321), which drops full_image when a single
+    // extra channel has shift >= 3 (ecups >= 8 * frame_upsampling), exceeds
+    // group_dim (256), and has full_image.transform.empty(). Enabling lossless
+    // Squeeze (responsive = 1) populates full_image.transform so unmodified
+    // djxl preserves full_image and decodes exact extra-channel values.
+    bool need_squeeze_for_shift3_ec = false;
+    for (size_t ec = 0; ec < frame_header.extra_channel_upsampling.size();
+         ++ec) {
+      const uint32_t ecups = frame_header.extra_channel_upsampling[ec];
+      if (ecups >= 8 * frame_header.upsampling) {
+        const size_t ec_w = DivCeil(frame_dim.xsize_upsampled, ecups);
+        const size_t ec_h = DivCeil(frame_dim.ysize_upsampled, ecups);
+        if (ec_w > frame_dim.group_dim || ec_h > frame_dim.group_dim) {
+          need_squeeze_for_shift3_ec = true;
+          break;
+        }
+      }
+    }
+    mod_cparams.responsive = need_squeeze_for_shift3_ec ? 1 : 0;
   }
   JXL_ASSIGN_OR_RETURN(
       *out_enc_modular,

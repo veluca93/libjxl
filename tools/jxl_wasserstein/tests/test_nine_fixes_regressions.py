@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import inspect
 from pathlib import Path
 import subprocess
@@ -510,3 +511,179 @@ def test_flower_foveon_auto_selects_multires_and_noise(vgg_params):
       f"Expected selected multi-res rd_cost ({res.rd_cost:.5f}) < "
       f"single rd_cost ({single_cands[0]['rd_cost']:.5f})"
   )
+
+
+def test_large_width_gt_2048_dim_shift_3_alpha_non_black_djxl_decode():
+  """Verifies >2048px (>1 modular group) + dim_shift=3 non-palettized alpha decodes non-black in djxl."""
+  h, w = 256, 2268
+  yy, xx = np.meshgrid(
+      np.linspace(0.0, 1.0, h, dtype=np.float32),
+      np.linspace(0.0, 1.0, w, dtype=np.float32),
+      indexing="ij",
+  )
+  r = 0.55 + 0.30 * np.sin(4.0 * np.pi * xx) * np.cos(2.0 * np.pi * yy)
+  g = 0.35 + 0.22 * np.cos(3.0 * np.pi * xx + yy)
+  b = 0.50 - 0.25 * np.sin(2.0 * np.pi * yy)
+  img_wide = np.round(np.clip(np.stack([r, g, b], axis=-1), 0.04, 0.96) * 255.0).astype(np.uint8)
+
+  ref_s = compositing._init_frame_state_with_aq_epf_cfl(img_wide[::4, ::4], distance=4.2)
+  main_s = compositing._init_frame_state_with_aq_epf_cfl(img_wide, distance=3.0)
+
+  ah, aw = (h + 7) >> 3, (w + 7) >> 3
+  ay, ax = np.meshgrid(
+      np.linspace(0.0, 1.0, ah, dtype=np.float32),
+      np.linspace(0.0, 1.0, aw, dtype=np.float32),
+      indexing="ij",
+  )
+  alpha_01 = np.clip(0.5 + 0.48 * np.sin(5.0 * np.pi * ax) * np.cos(3.0 * np.pi * ay), 0.0, 1.0).astype(np.float32)
+  alpha_u8 = np.rint(alpha_01 * 255.0).astype(np.uint8)
+  # Must have >16 distinct alpha values so Modular Palette does not collapse groups to 1
+  assert len(np.unique(alpha_u8)) >= 32
+
+  jb, _ = encode_alpha_composite(
+      ref_s,
+      main_s,
+      upsampling=4,
+      alpha_u8=alpha_u8,
+      dim_shift=3,
+      alpha_blend_mode=PATCH_BLEND_ALPHA_BELOW,
+  )
+  ver = verify_jxl_codestream(jb, min_cross_decoder_psnr=45.0)
+  rgb_djxl = ver["rgb_djxl"]
+  assert float(rgb_djxl.mean()) > 80.0, f"djxl decoded black/dark frame on w={w}, ds=3: mean={rgb_djxl.mean():.2f}"
+  psnr_vs_orig = float(compute_psnr(img_wide, rgb_djxl, peak=255.0))
+  assert psnr_vs_orig >= 34.0, f"Expected PSNR >= 34 dB on w={w}, ds=3, got {psnr_vs_orig:.2f} dB"
+
+  rec_a = np.asarray(
+      forward_model.reconstruct_alpha_composite(
+          ref_s,
+          main_s,
+          upsampling=4,
+          dim_shift=3,
+          alpha_01=alpha_u8.astype(np.float32) / 255.0,
+          alpha_blend_mode=PATCH_BLEND_ALPHA_BELOW,
+          hard=True,
+      )
+  )
+  assert _max_u8_err(rec_a, jb) <= 2.0
+
+
+def test_multistep_alpha_u4_ds3_no_inpaint_discoloration_and_zero_init_convergence(vgg_params):
+  """Verifies multi-step alpha (U=4, ds=3, noise) has clean petal color & zero-init converges cleanly."""
+  repo_root = Path(CJXL_BIN).resolve().parents[2]
+  flower_img = repo_root / "image-corpus/imagecompression.info.rgb8/flower_foveon.ppm.png"
+  if flower_img.exists():
+    full_u8 = np.asarray(Image.open(flower_img).convert("RGB"), dtype=np.uint8)
+    crop_u8 = np.ascontiguousarray(full_u8[512:768, 1024:1280])
+  else:
+    yy, xx = np.meshgrid(
+        np.linspace(0.0, 1.0, 256, dtype=np.float32),
+        np.linspace(0.0, 1.0, 256, dtype=np.float32),
+        indexing="ij",
+    )
+    petal = ((xx < 0.65) & (yy < 0.70)).astype(np.float32)
+    fg = np.stack([0.74 + 0.08 * np.sin(18.0 * xx), 0.19 + 0.03 * yy, 0.67 + 0.06 * np.cos(16.0 * yy)], axis=-1)
+    bg = np.stack([0.16 + 0.03 * yy, 0.24 + 0.04 * xx, 0.10 + 0.02 * yy], axis=-1)
+    crop_u8 = np.round(np.clip(petal[..., None] * fg + (1.0 - petal[..., None]) * bg, 0.01, 0.99) * 255.0).astype(
+        np.uint8
+    )
+
+  orig_petal_rgb = crop_u8[:64, :64].mean(axis=(0, 1))
+
+  res_dct = compositing.optimize_alpha_composite(
+      crop_u8,
+      upsampling=4,
+      dim_shift=3,
+      distance=6.21,
+      enable_noise=True,
+      steps=32,
+      init_mode="dct",
+      verify_decoders=True,
+      vgg_params=vgg_params,
+  )
+  dec_dct = decode_with_djxl(res_dct.jxl_bytes)
+  assert res_dct.psnr_db >= 31.0, f"Expected DCT-init PSNR >= 31 dB at d=6.21, got {res_dct.psnr_db:.2f} dB"
+  assert res_dct.stage3_true_j < res_dct.stage2_true_j
+  assert res_dct.psnr_djxl_vs_jxlrs >= 45.0
+  dct_petal_err = float(np.max(np.abs(dec_dct[:64, :64].mean(axis=(0, 1)) - orig_petal_rgb)))
+  assert dct_petal_err <= 8.0, f"Harmonic-inpaint discoloration on petal: max channel shift {dct_petal_err:.2f}"
+
+  res_zero = compositing.optimize_alpha_composite(
+      crop_u8,
+      upsampling=4,
+      dim_shift=3,
+      distance=6.21,
+      enable_noise=True,
+      steps=40,
+      init_mode="zero",
+      verify_decoders=True,
+      vgg_params=vgg_params,
+  )
+  dec_zero = decode_with_djxl(res_zero.jxl_bytes)
+  assert res_zero.psnr_db >= 25.0, f"Expected zero-init PSNR >= 25 dB at d=6.21, got {res_zero.psnr_db:.2f} dB"
+  assert res_zero.stage3_true_j < 0.25 * res_zero.stage2_true_j
+  assert res_zero.psnr_djxl_vs_jxlrs >= 45.0
+  zero_petal_err = float(np.max(np.abs(dec_zero[:64, :64].mean(axis=(0, 1)) - orig_petal_rgb)))
+  assert zero_petal_err <= 15.0, f"Zero-init petal chroma failed to converge: max shift {zero_petal_err:.2f}"
+
+
+def test_w8_or_h8_equals_3_quant_ac_shape_disambiguation(vgg_params):
+  """Regression test: h8=3 or w8=3 (including 24x24 and 124x132 U=8 -> 16x17) never mis-transposes 5D quant_ac."""
+  # 1. Direct 5D shape disambiguation for (h8=2, w8=3), (h8=3, w8=2), and (h8=3, w8=3)
+  for h8, w8 in ((2, 3), (3, 2), (3, 3)):
+    img_hw = _make_rich_sdr_test_image(h8 * 8, w8 * 8)
+    acs = np.zeros((h8, w8), dtype=np.uint8)
+    acs[0:2, 0:2] = 4  # DCT16X16 multi-block so resolved_topo.multi_groups is non-empty
+    st = compositing._init_frame_state_with_aq_epf_cfl(img_hw, distance=2.4, ac_strategy=acs)
+    q_3hw = jnp.asarray(st.quant_ac, dtype=jnp.float32)
+    q_5d_chw = q_3hw.reshape(3, h8, 8, w8, 8).transpose(0, 1, 3, 2, 4)
+    bits_3d = float(entropy_proxy.soft_jxl_rate_proxy(st, quant_ac=q_3hw, ac_strategy=acs))
+    bits_5d = float(entropy_proxy.soft_jxl_rate_proxy(st, quant_ac=q_5d_chw, ac_strategy=acs))
+    assert np.isfinite(bits_3d) and abs(bits_3d - bits_5d) <= 1e-4
+    smap_res = entropy_proxy.compute_spatial_rate_map_bits(st, {"quant_ac": q_5d_chw, "ac_strategy": acs})
+    smap = np.asarray(smap_res["block_bits"])
+    assert smap.shape == (h8, w8) and np.all(np.isfinite(smap))
+
+  # 2. Full end-to-end 124x132 auto encode (U=8 reference frame is 16x17 -> h8=2, w8=3)
+  img_124_132 = _make_rich_sdr_test_image(124, 132)
+  res = compositing.encode_image_to_jxl(
+      img_124_132,
+      distance=2.4,
+      mode="auto",
+      upsampling="auto",
+      steps=1,
+      verify_decoders=True,
+      vgg_params=vgg_params,
+  )
+  assert res.psnr_djxl_vs_jxlrs >= 45.0
+
+
+def test_repeated_auto_encodes_release_transient_gpu_caches(vgg_params):
+  """Regression test: repeated `encode_image_to_jxl(..., mode='auto')` calls do not retain Stage 1 / VGG caches."""
+  img = _make_rich_sdr_test_image(128, 128)
+  live_counts = []
+  for d in (4.2, 2.4, 1.3):
+    res = compositing.encode_image_to_jxl(
+        img,
+        distance=d,
+        mode="auto",
+        upsampling="auto",
+        steps=1,
+        verify_decoders=False,
+        vgg_params=vgg_params,
+    )
+    assert len(res.jxl_bytes) > 0
+    del res
+    gc.collect()
+    assert len(optimizer._STAGE1_CACHE) == 0
+    assert len(compositing._TARGET_FEATS_CACHE) == 0
+    assert len(compositing._STAGE1_AC_CANDIDATE_CACHE) == 0
+    assert len(compositing._STAGE1_MULTIRES_CACHE) == 0
+    live_3hw = sum(
+        1 for a in jax.live_arrays() if a.ndim == 3 and a.shape == (3, 128, 128)
+    )
+    live_counts.append(live_3hw)
+
+  # Live (3, H, W) buffer count must not grow monotonically across distance sweeps
+  assert live_counts[-1] <= live_counts[0] + 2, f"Leaked (3, H, W) buffers across encodes: {live_counts}"
+

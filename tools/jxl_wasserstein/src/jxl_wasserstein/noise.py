@@ -211,6 +211,26 @@ def _cached_convolved_noise_np(
   return conv
 
 
+@functools.lru_cache(maxsize=6)
+def _cached_convolved_noise_jax(
+    height: int,
+    width: int,
+    visible_frame_index: int,
+    nonvisible_frame_index: int,
+    group_dim: int,
+) -> jax.Array:
+  """Caches device-resident (3, H, W) noise planes outside JIT trace context."""
+  conv_np = _cached_convolved_noise_np(
+      int(height),
+      int(width),
+      int(visible_frame_index),
+      int(nonvisible_frame_index),
+      int(group_dim),
+  )
+  with jax.ensure_compile_time_eval():
+    return jax.device_put(np.asarray(conv_np, dtype=np.float32))
+
+
 def get_convolved_noise_planes(
     height: int,
     width: int,
@@ -219,14 +239,13 @@ def get_convolved_noise_planes(
     group_dim: int = GROUP_DIM,
 ) -> jax.Array:
   """Returns the deterministic pre-convolved (3, H, W) noise planes as a JAX array."""
-  conv_np = _cached_convolved_noise_np(
+  return _cached_convolved_noise_jax(
       int(height),
       int(width),
       int(visible_frame_index),
       int(nonvisible_frame_index),
       int(group_dim),
   )
-  return jnp.asarray(conv_np, dtype=jnp.float32)
 
 
 def quantize_noise_lut_ste(noise_lut: jax.Array | Sequence[float]) -> jax.Array:
@@ -274,6 +293,49 @@ def eval_noise_strength_lut(
   return jnp.clip(interpolated, jnp.float32(0.0), jnp.float32(1.0))
 
 
+@functools.partial(jax.jit, static_argnames=("do_quantize",))
+def _add_jxl_noise_chw_jit(
+    arr_chw: jax.Array,
+    conv: jax.Array,
+    lut: jax.Array,
+    ytox_f: jax.Array,
+    ytob_f: jax.Array,
+    do_quantize: bool = True,
+) -> jax.Array:
+  """Fused JIT kernel for correlated intensity-dependent JXL noise in CHW XYB."""
+  if do_quantize:
+    lut = quantize_noise_lut_ste(lut)
+
+  vx = arr_chw[0]
+  vy = arr_chw[1]
+  vb = arr_chw[2]
+
+  in_g = (vy - vx) * jnp.float32(0.5)
+  in_r = (vy + vx) * jnp.float32(0.5)
+
+  strength_g = eval_noise_strength_lut(in_g, lut)
+  strength_r = eval_noise_strength_lut(in_r, lut)
+
+  rnd_r = conv[0] * jnp.float32(NOISE_NORM_CONST)
+  rnd_g = conv[1] * jnp.float32(NOISE_NORM_CONST)
+  rnd_c = conv[2] * jnp.float32(NOISE_NORM_CONST)
+
+  red_noise = strength_r * (
+      jnp.float32(RGN_CORR) * rnd_r + jnp.float32(RG_CORR) * rnd_c
+  )
+  green_noise = strength_g * (
+      jnp.float32(RGN_CORR) * rnd_g + jnp.float32(RG_CORR) * rnd_c
+  )
+
+  rg_noise = red_noise + green_noise
+
+  out_x = vx + ytox_f * rg_noise + (red_noise - green_noise)
+  out_y = vy + rg_noise
+  out_b = vb + ytob_f * rg_noise
+
+  return jnp.stack([out_x, out_y, out_b], axis=0)
+
+
 def add_jxl_noise_xyb(
     xyb: jax.Array,
     convolved_noise: jax.Array,
@@ -305,8 +367,6 @@ def add_jxl_noise_xyb(
   if lut.shape != (NUM_NOISE_POINTS,):
     raise ValueError(f"Expected noise_lut of shape (8,), got {lut.shape}")
   do_quantize = bool(quantize_lut) if quantize_lut is not None else bool(ste_quantize_lut)
-  if do_quantize:
-    lut = quantize_noise_lut_ste(lut)
 
   conv = jnp.asarray(convolved_noise, dtype=jnp.float32)
   if conv.shape != arr_chw.shape:
@@ -314,36 +374,11 @@ def add_jxl_noise_xyb(
         f"convolved_noise shape {conv.shape} does not match XYB (3, H, W) shape {arr_chw.shape}"
     )
 
-  vx = arr_chw[0]
-  vy = arr_chw[1]
-  vb = arr_chw[2]
-
-  in_g = (vy - vx) * jnp.float32(0.5)
-  in_r = (vy + vx) * jnp.float32(0.5)
-
-  strength_g = eval_noise_strength_lut(in_g, lut)
-  strength_r = eval_noise_strength_lut(in_r, lut)
-
-  rnd_r = conv[0] * jnp.float32(NOISE_NORM_CONST)
-  rnd_g = conv[1] * jnp.float32(NOISE_NORM_CONST)
-  rnd_c = conv[2] * jnp.float32(NOISE_NORM_CONST)
-
-  red_noise = strength_r * (
-      jnp.float32(RGN_CORR) * rnd_r + jnp.float32(RG_CORR) * rnd_c
-  )
-  green_noise = strength_g * (
-      jnp.float32(RGN_CORR) * rnd_g + jnp.float32(RG_CORR) * rnd_c
-  )
-
-  rg_noise = red_noise + green_noise
   ytox_f = jnp.asarray(ytox, dtype=jnp.float32)
   ytob_f = jnp.asarray(ytob, dtype=jnp.float32)
-
-  out_x = vx + ytox_f * rg_noise + (red_noise - green_noise)
-  out_y = vy + rg_noise
-  out_b = vb + ytob_f * rg_noise
-
-  out_chw = jnp.stack([out_x, out_y, out_b], axis=0)
+  out_chw = _add_jxl_noise_chw_jit(
+      arr_chw, conv, lut, ytox_f, ytob_f, do_quantize=do_quantize
+  )
   return out_chw if is_chw else jnp.moveaxis(out_chw, 0, -1)
 
 
@@ -357,6 +392,7 @@ def synthesize_jxl_noise(
     group_dim: int = GROUP_DIM,
     ste_quantize_lut: bool = True,
     quantize_lut: bool | None = None,
+    convolved_noise: jax.Array | None = None,
 ) -> jax.Array:
   """End-to-end deterministic JXL noise synthesis in XYB space.
 
@@ -377,12 +413,16 @@ def synthesize_jxl_noise(
   else:
     raise ValueError(f"Expected XYB shape (3, H, W) or (H, W, 3), got {arr.shape}")
 
-  conv = get_convolved_noise_planes(
-      height=h,
-      width=w,
-      visible_frame_index=int(visible_frame_index),
-      nonvisible_frame_index=int(nonvisible_frame_index),
-      group_dim=int(group_dim),
+  conv = (
+      convolved_noise
+      if convolved_noise is not None
+      else get_convolved_noise_planes(
+          height=h,
+          width=w,
+          visible_frame_index=int(visible_frame_index),
+          nonvisible_frame_index=int(nonvisible_frame_index),
+          group_dim=int(group_dim),
+      )
   )
   return add_jxl_noise_xyb(
       xyb=arr,

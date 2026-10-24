@@ -2066,6 +2066,7 @@ def reconstruct_single_frame_xyb(
     gab_override: bool | None = None,
     enable_noise: bool | None = None,
     acs_grid: jax.Array | None = None,
+    convolved_noise: jax.Array | None = None,
 ) -> jax.Array:
   """Reconstructs a single VarDCT frame into XYB `(3, H, W)` after Gaborish, EPF, and optional Noise."""
   if isinstance(state_or_topo, StaticVarDCTTopology):
@@ -2422,6 +2423,7 @@ def reconstruct_single_frame_xyb(
         visible_frame_index=visible_frame_index,
         nonvisible_frame_index=nonvisible_frame_index,
         ste_quantize_lut=ste_quantize_noise_lut,
+        convolved_noise=convolved_noise,
     )
 
   return xyb
@@ -2449,6 +2451,7 @@ def reconstruct_single_frame(
     gab_override: bool | None = None,
     enable_noise: bool | None = None,
     acs_grid: jax.Array | None = None,
+    convolved_noise: jax.Array | None = None,
 ) -> jax.Array:
   """Full differentiable single-frame VarDCT reconstruction in JAX -> nonlinear sRGB in [0, 1].
 
@@ -2480,6 +2483,7 @@ def reconstruct_single_frame(
       gab_override=gab_override,
       enable_noise=enable_noise,
       acs_grid=acs_grid,
+      convolved_noise=convolved_noise,
   )
   srgb_chw = opsin_to_srgb(xyb, topo.opsin_inv_matrix, topo.opsin_biases, clamp=True)
   if output_layout.upper() == "CHW":
@@ -2614,7 +2618,7 @@ def init_state_from_rgb_jax(
       np.clip(round((0.47 / d) * gab_iqf_mul * inv_global_scale), 1, 256)
   )
 
-  x_qm_scale = 3 if d <= 2.5 else 2
+  x_qm_scale = 3 + int(d > 2.5) + int(d > 5.5) + int(d > 9.5)
   b_qm_scale = 2
   color_factor = K_DEFAULT_COLOR_FACTOR
   base_correlation_x = K_BASE_CORRELATION_X

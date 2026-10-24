@@ -278,6 +278,8 @@ def _resolve_topology(
       return None
     key = (acs_np.shape, acs_np.tobytes())
     if key not in _ACS_TOPO_CACHE:
+      if len(_ACS_TOPO_CACHE) >= 32:
+        _ACS_TOPO_CACHE.clear()
       _ACS_TOPO_CACHE[key] = _LightweightAcStrategyTopology(acs_np)
     return _ACS_TOPO_CACHE[key]
   return None
@@ -315,7 +317,41 @@ def get_first_block_and_llf_masks(
 get_first_block_And_llf_masks = get_first_block_and_llf_masks
 
 
-def normalize_quant_ac_shape(quant_ac: jax.Array) -> jax.Array:
+def _infer_expected_hw8(
+    *,
+    state: JxlVarDCTState | None = None,
+    topology: Any | None = None,
+    ac_strategy: Any | None = None,
+    raw_quant_field: Any | None = None,
+) -> tuple[int, int] | None:
+  """Infers expected `(h8, w8)` 8x8 block dimensions from state, topology, or metadata."""
+  if (
+      topology is not None
+      and hasattr(topology, "h8")
+      and hasattr(topology, "w8")
+  ):
+    return int(topology.h8), int(topology.w8)
+  if state is not None and hasattr(state, "height") and hasattr(state, "width"):
+    return (int(state.height) + 7) // 8, (int(state.width) + 7) // 8
+  if (
+      ac_strategy is not None
+      and hasattr(ac_strategy, "shape")
+      and len(ac_strategy.shape) == 2
+  ):
+    return int(ac_strategy.shape[0]), int(ac_strategy.shape[1])
+  if (
+      raw_quant_field is not None
+      and hasattr(raw_quant_field, "shape")
+      and len(raw_quant_field.shape) == 2
+  ):
+    return int(raw_quant_field.shape[0]), int(raw_quant_field.shape[1])
+  return None
+
+
+def normalize_quant_ac_shape(
+    quant_ac: jax.Array,
+    expected_hw8: tuple[int, int] | None = None,
+) -> jax.Array:
   """Normalizes `quant_ac` from `(3, H, W)`, `(3, bh, bw, 8, 8)`, or `(bh, bw, 3, 8, 8)` to `(3, bh, bw, 8, 8)`."""
   q = jnp.asarray(quant_ac, dtype=jnp.float32)
   if q.ndim == 3:
@@ -323,12 +359,43 @@ def normalize_quant_ac_shape(quant_ac: jax.Array) -> jax.Array:
     bh, bw = h // 8, w // 8
     return jnp.transpose(q.reshape(c, bh, 8, bw, 8), (0, 1, 3, 2, 4))
   if q.ndim == 5:
+    if expected_hw8 is not None:
+      eh8, ew8 = int(expected_hw8[0]), int(expected_hw8[1])
+      is_chw = q.shape[:3] == (3, eh8, ew8)
+      is_hwc = q.shape[:3] == (eh8, ew8, 3)
+      if is_chw and not is_hwc:
+        return q
+      if is_hwc and not is_chw:
+        return jnp.transpose(q, (2, 0, 1, 3, 4))
     if q.shape[0] == 3 and q.shape[2] != 3:
       return q
     if q.shape[2] == 3 and q.shape[0] != 3:
       return jnp.transpose(q, (2, 0, 1, 3, 4))
     return q
   raise ValueError(f"Expected quant_ac to have 3 or 5 dims, got shape {q.shape}")
+
+
+def _normalize_quant_ac_blocks_hwc(
+    quant_ac: jax.Array,
+    expected_hw8: tuple[int, int] | None = None,
+) -> tuple[jax.Array, int, int]:
+  """Normalizes `quant_ac` into `(h8, w8, 3, 8, 8)` block-major order."""
+  q_f = jnp.asarray(quant_ac, dtype=jnp.float32)
+  if q_f.ndim == 3:
+    c_dim, h_px, w_px = q_f.shape
+    h8, w8 = h_px // 8, w_px // 8
+    return (
+        jnp.transpose(q_f.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4)),
+        h8,
+        w8,
+    )
+  if q_f.ndim == 5:
+    q_5d = normalize_quant_ac_shape(q_f, expected_hw8=expected_hw8)
+    _, h8, w8, _, _ = q_5d.shape
+    return jnp.transpose(q_5d, (1, 2, 0, 3, 4)), h8, w8
+  raise ValueError(
+      f"Expected quant_ac to have 3 or 5 dims, got shape {q_f.shape}"
+  )
 
 
 # -----------------------------------------------------------------------------
@@ -464,6 +531,7 @@ def _soft_category_weights(
 def _extract_ac_tokens_from_blocks(
     quant_ac: jax.Array,
     topology: StaticVarDCTTopology | _LightweightAcStrategyTopology | None = None,
+    expected_hw8: tuple[int, int] | None = None,
 ) -> tuple[
     jax.Array,
     list[Any],
@@ -471,23 +539,10 @@ def _extract_ac_tokens_from_blocks(
     tuple[int, int],
 ]:
   """Extracts non-LLF AC coefficients in natural scan order per block & channel."""
-  q_f = jnp.asarray(quant_ac, dtype=jnp.float32)
-  if q_f.ndim == 3:
-    c_dim, h_px, w_px = q_f.shape
-    h8, w8 = h_px // 8, w_px // 8
-    q_ac_blocks = jnp.transpose(
-        q_f.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4)
-    )
-  elif q_f.ndim == 5:
-    if q_f.shape[0] == 3 and q_f.shape[2] != 3:
-      q_ac_blocks = jnp.transpose(q_f, (1, 2, 0, 3, 4))
-    else:
-      q_ac_blocks = q_f
-    h8, w8 = q_ac_blocks.shape[0], q_ac_blocks.shape[1]
-  else:
-    raise ValueError(
-        f"Expected quant_ac to have 3 or 5 dims, got shape {q_f.shape}"
-    )
+  eff_hw8 = expected_hw8 or _infer_expected_hw8(topology=topology)
+  q_ac_blocks, h8, w8 = _normalize_quant_ac_blocks_hwc(
+      quant_ac, expected_hw8=eff_hw8
+  )
 
   ac_idx_1x1, _, _ = get_canonical_ac_scan_tables(1, 1)
 
@@ -796,29 +851,20 @@ def soft_ac_rate_bits(
       else jnp.asarray(1.0 if multi_cluster else 0.0, dtype=jnp.float32)
   )
   resolved_topo = _resolve_topology(topology, ac_strategy)
+  expected_hw8 = _infer_expected_hw8(
+      topology=resolved_topo if resolved_topo is not None else topology,
+      ac_strategy=ac_strategy,
+      raw_quant_field=raw_quant_field,
+  )
 
   if (
       resolved_topo is not None
       and len(resolved_topo.multi_groups) > 0
       and getattr(resolved_topo, "all_grid_aligned", False)
   ):
-    q_f = jnp.asarray(quant_ac, dtype=jnp.float32)
-    if q_f.ndim == 3:
-      c_dim, h_px, w_px = q_f.shape
-      h8, w8 = h_px // 8, w_px // 8
-      q_ac_blocks = jnp.transpose(
-          q_f.reshape(c_dim, h8, 8, w8, 8), (1, 3, 0, 2, 4)
-      )
-    elif q_f.ndim == 5:
-      if q_f.shape[0] == 3 and q_f.shape[2] != 3:
-        q_ac_blocks = jnp.transpose(q_f, (1, 2, 0, 3, 4))
-      else:
-        q_ac_blocks = q_f
-      h8, w8 = q_ac_blocks.shape[0], q_ac_blocks.shape[1]
-    else:
-      raise ValueError(
-          f"Expected quant_ac to have 3 or 5 dims, got shape {q_f.shape}"
-      )
+    q_ac_blocks, h8, w8 = _normalize_quant_ac_blocks_hwc(
+        quant_ac, expected_hw8=expected_hw8
+    )
 
     ac_idx_1x1, _, freq_band8_1x1 = get_canonical_ac_scan_tables(1, 1)
     one_hot_1x1 = jax.nn.one_hot(
@@ -995,7 +1041,7 @@ def soft_ac_rate_bits(
     return ac_bits + nzeros_bits
 
   ac_1x1, multi_ac_list, coords_1x1, (h8, w8) = _extract_ac_tokens_from_blocks(
-      quant_ac, topology=resolved_topo
+      quant_ac, topology=resolved_topo, expected_hw8=expected_hw8
   )
 
   _, _, freq_band8_1x1 = get_canonical_ac_scan_tables(1, 1)
@@ -2182,8 +2228,21 @@ def soft_jxl_rate_proxy(
     if state is None:
       raise ValueError("Either `state` or `quant_ac` must be provided.")
     quant_ac = _extract_state_quant_ac(state)
-  ac_5d = normalize_quant_ac_shape(quant_ac)
+  expected_hw8 = _infer_expected_hw8(
+      state=state,
+      topology=topology,
+      ac_strategy=(
+          ac_strategy if ac_strategy is not None else p.get("ac_strategy")
+      ),
+      raw_quant_field=(
+          raw_quant_field
+          if raw_quant_field is not None
+          else p.get("raw_quant_field")
+      ),
+  )
+  ac_5d = normalize_quant_ac_shape(quant_ac, expected_hw8=expected_hw8)
   _, bh, bw, _, _ = ac_5d.shape
+  ac_3hw = jnp.transpose(ac_5d, (0, 1, 3, 2, 4)).reshape(3, bh * 8, bw * 8)
 
   height = int(state.height) if state is not None else bh * 8
   width = int(state.width) if state is not None else bw * 8
@@ -2299,7 +2358,7 @@ def soft_jxl_rate_proxy(
   eff_multi_cluster = bool(p.get("multi_cluster", multi_cluster))
   eff_cluster_blend = p.get("cluster_blend", cluster_blend)
   ac_bits_val = soft_ac_rate_bits(
-      ac_5d,
+      ac_3hw,
       topology=topology,
       ac_strategy=acs_source,
       tau=tau_ac,
@@ -2421,8 +2480,15 @@ def compute_spatial_rate_map_bits(
     if state is None:
       raise ValueError("Either `state` or `quant_ac` must be provided.")
     quant_ac = _extract_state_quant_ac(state)
-  ac_5d = normalize_quant_ac_shape(quant_ac)
+  expected_hw8 = _infer_expected_hw8(
+      state=state,
+      topology=topology,
+      ac_strategy=p.get("ac_strategy"),
+      raw_quant_field=p.get("raw_quant_field"),
+  )
+  ac_5d = normalize_quant_ac_shape(quant_ac, expected_hw8=expected_hw8)
   _, h8, w8, _, _ = ac_5d.shape
+  ac_3hw = jnp.transpose(ac_5d, (0, 1, 3, 2, 4)).reshape(3, h8 * 8, w8 * 8)
 
   dc_quant_in = p.get("dc_quant", None)
   dc_quant_weights = p.get("dc_quant_weights", None)
@@ -2493,7 +2559,7 @@ def compute_spatial_rate_map_bits(
 
   bd = soft_jxl_rate_proxy(
       state=state,
-      quant_ac=ac_5d,
+      quant_ac=ac_3hw,
       dc_quant=dc_quant_grid,
       raw_quant_field=raw_quant_field,
       ytox_map=ytox_map,
@@ -2620,7 +2686,7 @@ def compute_spatial_rate_map_bits(
       )
   else:
     ac_1x1, multi_ac_list, coords_1x1, _ = _extract_ac_tokens_from_blocks(
-        ac_5d, topology=resolved_topo
+        ac_3hw, topology=resolved_topo, expected_hw8=(h8, w8)
     )
     if ac_1x1.shape[0] > 0:
       bz_1x1, bc_1x1, bcdf_1x1, blk_nz_1x1 = _compute_scan_band_summaries(

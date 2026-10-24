@@ -65,6 +65,7 @@ from jxl_wasserstein.forward_model import (
     get_default_dequant_matrices,
     init_state_from_rgb_jax,
     reconstruct_single_frame,
+    reconstruct_single_frame_xyb,
     srgb_to_xyb,
     ste_dequant_matrices,
     xyb_to_srgb,
@@ -573,11 +574,13 @@ def stage1_explore_ac_candidates(
         "wd_map": np.asarray(wd_map, dtype=np.float32),
         "proxy_bpp": proxy_bpp,
         "rate_map_bits": np.asarray(rate_map_bits, dtype=np.float32),
-        "u_ac": u_ac_1,
-        "u_dc": u_dc_0,
+        "u_ac": np.asarray(u_ac_1, dtype=np.float32),
+        "u_dc": np.asarray(u_dc_0, dtype=np.float32),
         "ac_strategy": acs_s,
         "state": st_s,
     }
+  while len(_STAGE1_CACHE) >= 2:
+    del _STAGE1_CACHE[next(iter(_STAGE1_CACHE))]
   _STAGE1_CACHE[cache_key] = {k: dict(v) for k, v in candidates.items()}
   return candidates
 
@@ -963,7 +966,8 @@ def select_quant_and_epf_jax(
       else:
         epf_sharpness[by, bx] = 2
 
-  epf_iters = 1 if float(distance) < 3.0 else 2
+  d_val = float(distance)
+  epf_iters = 1 if d_val < 1.5 else (2 if d_val < 4.0 else 3)
   return raw_q_np, epf_sharpness, epf_iters
 
 
@@ -1016,8 +1020,8 @@ def select_cfl_jax(
   xy_cov = jnp.sum(tx * ty, axis=(1, 3, 4))
   by_cov = jnp.sum(tb * ty, axis=(1, 3, 4))
 
-  reg_x = 1e-3
-  reg_b = 2e-3
+  reg_x = 0.025
+  reg_b = 0.045
   ratio_x = (xy_cov + reg_x * float(base_correlation_x)) / (yy_energy + reg_x)
   ratio_b = (by_cov + reg_b * float(base_correlation_b)) / (yy_energy + reg_b)
 
@@ -1028,8 +1032,8 @@ def select_cfl_jax(
       float(color_factor) * (ratio_b - float(base_correlation_b))
   )
 
-  ytox_map = np.clip(np.asarray(ytox_f), -128, 127).astype(np.int8)
-  ytob_map = np.clip(np.asarray(ytob_f), -128, 127).astype(np.int8)
+  ytox_map = np.clip(np.asarray(ytox_f), -64, 64).astype(np.int8)
+  ytob_map = np.clip(np.asarray(ytob_f), -64, 64).astype(np.int8)
 
   dc_2d = dc_means[..., 0]
   dc_centered = dc_2d - jnp.mean(dc_2d, axis=(1, 2), keepdims=True)
@@ -1037,22 +1041,22 @@ def select_cfl_jax(
   dc_xy = float(jnp.sum(dc_centered[0] * dc_centered[1]))
   dc_by = float(jnp.sum(dc_centered[2] * dc_centered[1]))
 
-  dc_reg = 5e-3
+  dc_reg = 0.002 * float(max(h8 * w8, 1))
   dc_ratio_x = (dc_xy + dc_reg * float(base_correlation_x)) / (dc_yy + dc_reg)
   dc_ratio_b = (dc_by + dc_reg * float(base_correlation_b)) / (dc_yy + dc_reg)
 
   ytox_dc = int(
       np.clip(
           round(float(color_factor) * (dc_ratio_x - float(base_correlation_x))),
-          -128,
-          127,
+          -64,
+          64,
       )
   )
   ytob_dc = int(
       np.clip(
           round(float(color_factor) * (dc_ratio_b - float(base_correlation_b))),
-          -128,
-          127,
+          -64,
+          64,
       )
   )
   return ytox_map, ytob_map, ytox_dc, ytob_dc
@@ -1111,24 +1115,61 @@ def _normalize_init_mode(init_mode: str | None) -> str:
   return mode
 
 
+def _build_ac_freq_weight_2d_np(topo: StaticVarDCTTopology) -> np.ndarray:
+  """Builds the `(H8*8, W8*8)` normalized frequency decay preconditioner matching `topo`."""
+  h8, w8 = topo.h8, topo.w8
+  u8 = np.arange(8, dtype=np.float32)[:, None]
+  v8 = np.arange(8, dtype=np.float32)[None, :]
+  w8x8 = 1.0 / (0.15 + 0.85 * (u8 * u8 + v8 * v8))
+  w8x8[0, 0] = 0.0
+  w_blk = np.broadcast_to(w8x8[None, None], (h8, w8, 8, 8)).copy()
+  for grp1 in topo.groups_1x1:
+    s_id = int(grp1["s"])
+    if s_id == 1:  # IDENTITY (spatial deltas)
+      m2d = np.asarray(grp1["mask_2d"], dtype=bool)
+      id_w = np.full((8, 8), 0.35, dtype=np.float32)
+      id_w[0, 0] = 0.0
+      w_blk[m2d] = id_w
+  for grp in topo.multi_groups:
+    cy, cx = int(grp["cy"]), int(grp["cx"])
+    cy_l, cx_l = int(grp["cy_l"]), int(grp["cx_l"])
+    u_m = np.arange(8 * cy_l, dtype=np.float32)[:, None] / float(cy_l)
+    v_m = np.arange(8 * cx_l, dtype=np.float32)[None, :] / float(cx_l)
+    w_canon = 1.0 / (0.15 + 0.85 * (u_m * u_m + v_m * v_m))
+    w_canon[:cy_l, :cx_l] = 0.0
+    w_s = w_canon.reshape(cy, 8, cx, 8).transpose(0, 2, 1, 3)
+    bys = np.asarray(grp["by"], dtype=np.int32)
+    bxs = np.asarray(grp["bx"], dtype=np.int32)
+    for by, bx in zip(bys.tolist(), bxs.tolist()):
+      w_blk[by : by + cy, bx : bx + cx] = w_s
+  return w_blk.transpose(0, 2, 1, 3).reshape(h8 * 8, w8 * 8)
+
+
 def _compute_precond_scales_jax(
     state_or_topo: JxlVarDCTState | StaticVarDCTTopology,
     raw_quant_tl: jax.Array | np.ndarray,
 ) -> tuple[jax.Array, jax.Array]:
   """Computes XYB residual-calibrated `(scale_dc, scale_ac)` preconditioners for zero/random init."""
-  inv_gs = K_GLOBAL_SCALE_DENOM / float(state_or_topo.global_scale)
-  qdc = float(state_or_topo.quant_dc)
+  topo = (
+      state_or_topo
+      if isinstance(state_or_topo, StaticVarDCTTopology)
+      else StaticVarDCTTopology(state_or_topo)
+  )
+  inv_gs = K_GLOBAL_SCALE_DENOM / float(topo.global_scale)
+  qdc = float(topo.quant_dc)
   dc_step_ratio = jnp.float32(1.13 / max(inv_gs / max(qdc, 1.0), 1e-6))
   scale_dc = (
-      jnp.array([6.0, 180.0, 6.0], dtype=jnp.float32)[:, None, None]
+      jnp.array([48.0, 200.0, 36.0], dtype=jnp.float32)[:, None, None]
       * dc_step_ratio
   )
   rq_tl_f = jnp.maximum(jnp.asarray(raw_quant_tl, dtype=jnp.float32), 1.0)
   rq_px = jnp.repeat(jnp.repeat(rq_tl_f, 8, axis=0), 8, axis=1)
   ac_step_ratio = 1.20 / jnp.maximum(inv_gs / rq_px, 1e-6)
+  with jax.ensure_compile_time_eval():
+    w_freq = jnp.asarray(_build_ac_freq_weight_2d_np(topo), dtype=jnp.float32)
   scale_ac = (
-      jnp.array([0.08, 1.0, 0.12], dtype=jnp.float32)[:, None, None]
-      * ac_step_ratio[None, :, :]
+      jnp.array([6.0, 12.0, 3.8], dtype=jnp.float32)[:, None, None]
+      * (ac_step_ratio * w_freq)[None, :, :]
   )
   return scale_dc, scale_ac
 
@@ -1173,10 +1214,11 @@ def compute_continuous_latents_jax(
     scale_dc, scale_ac = _compute_precond_scales_jax(topo, rq_tl)
     key = jax.random.PRNGKey(int(seed))
     k_dc, k_ac = jax.random.split(key)
-    z_dc = jax.random.normal(k_dc, (3, h8, w8), dtype=jnp.float32) * 0.08
+    z_dc_std = jnp.array([0.005, 0.06, 0.008], dtype=jnp.float32)[:, None, None]
+    z_dc = jax.random.normal(k_dc, (3, h8, w8), dtype=jnp.float32) * z_dc_std
     z_dc = z_dc.at[1].set(jnp.abs(z_dc[1]))
     z_ac = (
-        jax.random.normal(k_ac, (3, h8 * 8, w8 * 8), dtype=jnp.float32) * 0.015
+        jax.random.normal(k_ac, (3, h8 * 8, w8 * 8), dtype=jnp.float32) * 0.002
     )
     q_dc_rand = z_dc * scale_dc
     q_ac_rand = jnp.asarray(
@@ -1774,16 +1816,26 @@ def _make_topo_step_fns(
       dtype=jnp.float32,
   )
   cf_val = float(init_state.color_factor)
+  conv_noise_arg = (
+      get_convolved_noise_planes(
+          int(init_state.height), int(init_state.width), 1, 0
+      )
+      if enable_noise
+      else None
+  )
 
   topo_grad = topo
 
   @jax.jit
-  def _forward_ste(
+  def _forward_ste_jit(
       params: dict[str, jax.Array],
       q_ac_init: jax.Array,
       raw_quant_init_tl: jax.Array,
       ytox_init: jax.Array,
       ytob_init: jax.Array,
+      wy_over_wx: jax.Array,
+      wy_over_wb: jax.Array,
+      conv_noise: jax.Array | None = None,
   ) -> jax.Array:
     rq_tl = topo.broadcast_top_left_grid(
         jnp.clip(params["raw_quant"], 1.0, 256.0)
@@ -1801,8 +1853,8 @@ def _make_topo_step_fns(
         ytob_cur=ytob_use,
         ytox_init=ytox_init,
         ytob_init=ytob_init,
-        wy_over_wx=wy_over_wx_j,
-        wy_over_wb=wy_over_wb_j,
+        wy_over_wx=wy_over_wx,
+        wy_over_wb=wy_over_wb,
         color_factor=cf_val,
     )
     if opt_custom_dequant and "dc_dequant_scale" in params:
@@ -1837,10 +1889,11 @@ def _make_topo_step_fns(
         hard=False,
         ste_quantize_noise_lut=True,
         output_layout="CHW",
+        convolved_noise=conv_noise,
     )
 
   @jax.jit
-  def _surrogate_grad(
+  def _surrogate_grad_jit(
       params: dict[str, jax.Array],
       q_ac_init: jax.Array,
       raw_quant_init_tl: jax.Array,
@@ -1848,8 +1901,12 @@ def _make_topo_step_fns(
       ytob_init: jax.Array,
       grad_recon_chw: jax.Array,
       lam_f: jax.Array,
+      wy_over_wx: jax.Array,
+      wy_over_wb: jax.Array,
       ac_rate_weight: float = 1.0,
       cluster_blend: jax.Array = jnp.float32(0.0),
+      conv_noise: jax.Array | None = None,
+      target_xyb_chw: jax.Array | None = None,
   ) -> tuple[jax.Array, dict[str, jax.Array]]:
     def _loss(p: dict[str, jax.Array]) -> tuple[jax.Array, jax.Array]:
       rq_tl = topo.broadcast_top_left_grid(
@@ -1868,8 +1925,8 @@ def _make_topo_step_fns(
           ytob_cur=ytob_use,
           ytox_init=ytox_init,
           ytob_init=ytob_init,
-          wy_over_wx=wy_over_wx_j,
-          wy_over_wb=wy_over_wb_j,
+          wy_over_wx=wy_over_wx,
+          wy_over_wb=wy_over_wb,
           color_factor=cf_val,
       )
       if opt_custom_dequant and "dc_dequant_scale" in p:
@@ -1890,22 +1947,54 @@ def _make_topo_step_fns(
           if enable_noise
           else None
       )
-      recon_chw = reconstruct_single_frame(
-          topo_grad,
-          quant_ac=q_ac_eff,
-          dc_quant=q_dc_eff,
-          raw_quant_field=rq_tl,
-          ytox_map=ytox_use,
-          ytob_map=ytob_use,
-          dequant_matrices=dq_mats_ste,
-          dc_quant_weights=dc_w_ste,
-          include_noise=enable_noise,
-          noise_lut=lut_f,
-          hard=False,
-          ste_quantize_noise_lut=True,
-          output_layout="CHW",
-      )
-      wd_lin = jnp.sum(jax.lax.stop_gradient(grad_recon_chw) * recon_chw)
+      if target_xyb_chw is not None:
+        xyb_chw = reconstruct_single_frame_xyb(
+            topo_grad,
+            quant_ac=q_ac_eff,
+            dc_quant=q_dc_eff,
+            raw_quant_field=rq_tl,
+            ytox_map=ytox_use,
+            ytob_map=ytob_use,
+            dequant_matrices=dq_mats_ste,
+            dc_quant_weights=dc_w_ste,
+            include_noise=enable_noise,
+            noise_lut=lut_f,
+            hard=False,
+            ste_quantize_noise_lut=True,
+            convolved_noise=conv_noise,
+        )
+        recon_chw = xyb_to_srgb(
+            xyb_chw, topo_grad.opsin_inv_matrix, topo_grad.opsin_biases, clamp=True
+        )
+        dx_z = xyb_chw[0] - target_xyb_chw[0]
+        dy_z = xyb_chw[1] - target_xyb_chw[1]
+        db_z = (xyb_chw[2] - xyb_chw[1]) - (
+            target_xyb_chw[2] - target_xyb_chw[1]
+        )
+        xyb_guide = (
+            12.0
+            * jnp.sum(240.0 * dx_z * dx_z + 100.0 * dy_z * dy_z + 25.0 * db_z * db_z)
+            / jnp.float32(num_pixels)
+        )
+      else:
+        recon_chw = reconstruct_single_frame(
+            topo_grad,
+            quant_ac=q_ac_eff,
+            dc_quant=q_dc_eff,
+            raw_quant_field=rq_tl,
+            ytox_map=ytox_use,
+            ytob_map=ytob_use,
+            dequant_matrices=dq_mats_ste,
+            dc_quant_weights=dc_w_ste,
+            include_noise=enable_noise,
+            noise_lut=lut_f,
+            hard=False,
+            ste_quantize_noise_lut=True,
+            output_layout="CHW",
+            convolved_noise=conv_noise,
+        )
+        xyb_guide = jnp.float32(0.0)
+      wd_lin = jnp.sum(jax.lax.stop_gradient(grad_recon_chw) * recon_chw) + xyb_guide
       d_ac_r = p["delta_q_ac"] * ac_rate_weight + jax.lax.stop_gradient(
           p["delta_q_ac"]
       ) * (1.0 - ac_rate_weight)
@@ -1922,8 +2011,8 @@ def _make_topo_step_fns(
           ytob_cur=ytob_use,
           ytox_init=ytox_init,
           ytob_init=ytob_init,
-          wy_over_wx=wy_over_wx_j,
-          wy_over_wb=wy_over_wb_j,
+          wy_over_wx=wy_over_wx,
+          wy_over_wb=wy_over_wb,
           color_factor=cf_val,
       )
       q_dc_eff_r = (
@@ -1948,7 +2037,7 @@ def _make_topo_step_fns(
     return bpp_s, grads
 
   @jax.jit
-  def _forward_hard(
+  def _forward_hard_jit(
       q_ac_f: jax.Array,
       q_dc_f: jax.Array,
       rq_f: jax.Array,
@@ -1956,6 +2045,7 @@ def _make_topo_step_fns(
       yb_f: jax.Array,
       dc_w_f: jax.Array,
       lut_f: jax.Array,
+      conv_noise: jax.Array | None = None,
   ) -> jax.Array:
     return reconstruct_single_frame(
         topo,
@@ -1969,8 +2059,70 @@ def _make_topo_step_fns(
         noise_lut=lut_f if enable_noise else None,
         hard=True,
         output_layout="CHW",
+        convolved_noise=conv_noise,
     )
 
+  def _forward_ste(
+      params: dict[str, jax.Array],
+      q_ac_init: jax.Array,
+      raw_quant_init_tl: jax.Array,
+      ytox_init: jax.Array,
+      ytob_init: jax.Array,
+  ) -> jax.Array:
+    return _forward_ste_jit(
+        params,
+        q_ac_init,
+        raw_quant_init_tl,
+        ytox_init,
+        ytob_init,
+        wy_over_wx_j,
+        wy_over_wb_j,
+        conv_noise_arg,
+    )
+
+  def _surrogate_grad(
+      params: dict[str, jax.Array],
+      q_ac_init: jax.Array,
+      raw_quant_init_tl: jax.Array,
+      ytox_init: jax.Array,
+      ytob_init: jax.Array,
+      grad_recon_chw: jax.Array,
+      lam_f: jax.Array,
+      ac_rate_weight: float = 1.0,
+      cluster_blend: jax.Array = jnp.float32(0.0),
+      target_xyb_chw: jax.Array | None = None,
+  ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    return _surrogate_grad_jit(
+        params,
+        q_ac_init,
+        raw_quant_init_tl,
+        ytox_init,
+        ytob_init,
+        grad_recon_chw,
+        lam_f,
+        wy_over_wx_j,
+        wy_over_wb_j,
+        ac_rate_weight,
+        cluster_blend,
+        conv_noise_arg,
+        target_xyb_chw,
+    )
+
+  def _forward_hard(
+      q_ac_f: jax.Array,
+      q_dc_f: jax.Array,
+      rq_f: jax.Array,
+      yx_f: jax.Array,
+      yb_f: jax.Array,
+      dc_w_f: jax.Array,
+      lut_f: jax.Array,
+  ) -> jax.Array:
+    return _forward_hard_jit(
+        q_ac_f, q_dc_f, rq_f, yx_f, yb_f, dc_w_f, lut_f, conv_noise_arg
+    )
+
+  while len(_COMPILED_TOPO_SOLVERS) >= 6:
+    del _COMPILED_TOPO_SOLVERS[next(iter(_COMPILED_TOPO_SOLVERS))]
   _COMPILED_TOPO_SOLVERS[key] = (_forward_ste, _surrogate_grad, _forward_hard)
   return _forward_ste, _surrogate_grad, _forward_hard
 
@@ -2525,7 +2677,9 @@ def optimize_single_frame(
     ac_grad_mask = scale_ac
     delta_q_ac_0 = jnp.zeros_like(q_ac_init)
     rq_stage3_init = raw_quant_init
+    target_xyb_guide = srgb_to_xyb(target_chw)
   else:
+    target_xyb_guide = None
     scale_dc = jnp.full((3, 1, 1), 0.35, dtype=jnp.float32)
     # Active-support & frequency mask for AC coefficients (prevents Adam sign step
     # from flipping zero AC coefficients across +-0.5)
@@ -2569,10 +2723,10 @@ def optimize_single_frame(
   schedule = optax.cosine_decay_schedule(
       init_value=eff_lr_init,
       decay_steps=max(num_steps, 1),
-      alpha=0.35 if is_non_dct_init else 0.15,
+      alpha=0.02 if is_non_dct_init else 0.15,
   )
   if is_non_dct_init:
-    optimizer = optax.adam(learning_rate=schedule, eps=1e-8)
+    optimizer = optax.adam(learning_rate=schedule, b1=0.5, b2=0.85, eps=1e-8)
   else:
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -2660,16 +2814,31 @@ def optimize_single_frame(
         lam_eff,
         ac_rate_w,
         use_mc_blend,
+        target_xyb_guide,
     )
     if is_non_dct_init:
       q_ac_cur = q_ac_init + latents["delta_q_ac"]
       lam_charb = float(rd_lambda) / 0.1
-      g_ac = grads["delta_q_ac"] + (1e-4 * lam_charb) * (
+      ac_charb_w = 0.0 if step_idx <= int(0.25 * num_steps) else 0.25
+      g_ac = grads["delta_q_ac"] + (1e-4 * ac_charb_w * lam_charb) * (
           q_ac_cur / jnp.sqrt(q_ac_cur * q_ac_cur + 0.01)
       ) / float(h * w)
-      g_dc = grads["q_dc"] + (1e-5 * lam_charb) * (
-          latents["q_dc"] / jnp.sqrt(latents["q_dc"] * latents["q_dc"] + 0.01)
-      ) / float(h8 * w8)
+      c_x_dc = jnp.float32(8.0) * (
+          jnp.float32(init_state.ytox_dc) / jnp.float32(84.0)
+      )
+      c_b_dc = jnp.float32(0.5) * (
+          jnp.float32(1.0) + jnp.float32(init_state.ytob_dc) / jnp.float32(84.0)
+      )
+      g_dc_raw = grads["q_dc"]
+      g_dc_1 = g_dc_raw[1] - c_x_dc * g_dc_raw[0] - c_b_dc * g_dc_raw[2]
+      g_dc_0 = (
+          g_dc_raw[0]
+          - jnp.float32(0.125)
+          * (jnp.float32(init_state.ytox_dc) / jnp.float32(84.0))
+          * g_dc_1
+      )
+      g_dc_2 = jnp.float32(0.5) * g_dc_raw[2] - c_b_dc * g_dc_1
+      g_dc = jnp.stack([g_dc_0, g_dc_1, g_dc_2], axis=0)
     else:
       g_ac = grads["delta_q_ac"]
       g_dc = grads["q_dc"]
@@ -2968,6 +3137,8 @@ def init_pure_jax_wd_state(
         rd_lambda=eff_rd_lam,
         stage1_steps=1,
     )
+    while len(_WD_STATE_ACS_CACHE) >= 16:
+      del _WD_STATE_ACS_CACHE[next(iter(_WD_STATE_ACS_CACHE))]
     _WD_STATE_ACS_CACHE[acs_cache_key] = ac_strategy.copy()
   _, epf_sharp, epf_iters = select_quant_and_epf_jax(
       arr, distance=float(distance), ac_strategy=ac_strategy
@@ -3070,8 +3241,8 @@ def init_pure_jax_wd_state(
       np.clip(round(K_GLOBAL_SCALE_DENOM * target_scale / base_raw_q), 1, 65535)
   )
   state.quant_dc = int(np.clip(round(qdc_base * (d**0.25)), 16, 64))
-  state.x_qm_scale = 3 if d <= 2.5 else (4 if d <= 5.5 else 5)
-  state.b_qm_scale = 2
+  state.x_qm_scale = 3 + int(d > 2.5) + int(d > 5.5) + int(d > 9.5)
+  state.b_qm_scale = 2 + int(d > 5.5)
 
   topo = StaticVarDCTTopology(state)
   with jax.ensure_compile_time_eval():
@@ -3302,6 +3473,8 @@ def _make_mb_point_step_fn(
 
     return jax.grad(_surrogate)(params)
 
+  while len(_COMPILED_MB_SOLVERS) >= 6:
+    del _COMPILED_MB_SOLVERS[next(iter(_COMPILED_MB_SOLVERS))]
   _COMPILED_MB_SOLVERS[key] = (_mb_fwd, _mb_grad)
   return _mb_fwd, _mb_grad
 
