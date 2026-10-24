@@ -4366,6 +4366,18 @@ def _clear_transient_encode_caches() -> None:
   _STAGE1_MAIN_DP_CACHE.clear()
   _STAGE1_MULTIRES_CACHE.clear()
   _STAGE1_CACHE.clear()
+  import gc
+  gc.collect()
+  try:
+    import ctypes
+    cudart = ctypes.CDLL("libcudart.so")
+    pool = ctypes.c_void_p()
+    if cudart.cudaDeviceGetDefaultMemPool(ctypes.byref(pool), 0) == 0:
+      thresh = ctypes.c_uint64(0)
+      cudart.cudaMemPoolSetAttribute(pool, 1, ctypes.byref(thresh))
+      cudart.cudaMemPoolTrimTo(pool, 0)
+  except Exception:
+    pass
 
 
 def optimize_patch_composite(
