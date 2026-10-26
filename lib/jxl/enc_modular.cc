@@ -2138,6 +2138,35 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
     constexpr float diff_w = 0.0947170407f;
     const float dc_lam_dmul =
         DcLogDistLambdaMul(cparams_.butteraugli_distance);
+    std::vector<uint8_t> smooth_blk;
+    if (enable_rdo && enc_state->shared.ac_strategy.xsize() >= r.x0() + r.xsize() &&
+        enc_state->shared.ac_strategy.ysize() >= r.y0() + r.ysize() &&
+        enc_state->band_qf[1][0].xsize() >= r.x0() + r.xsize() &&
+        enc_state->band_qf[1][0].ysize() >= r.y0() + r.ysize()) {
+      smooth_blk.assign(r.xsize() * r.ysize(), 0);
+      for (size_t y = 0; y < r.ysize(); ++y) {
+        AcStrategyRow acs_row =
+            enc_state->shared.ac_strategy.ConstRow(r.y0() + y);
+        const float* act_row = r.ConstRow(enc_state->band_qf[1][0], y);
+        for (size_t x = 0; x < r.xsize(); ++x) {
+          AcStrategy acs = acs_row[r.x0() + x];
+          if (!acs.IsFirstBlock()) continue;
+          uint32_t act_bits = 0;
+          memcpy(&act_bits, &act_row[x], sizeof(act_bits));
+          if ((act_bits & 31u) != 0u) continue;
+          const size_t cov = acs.covered_blocks_x() * acs.covered_blocks_y();
+          const uint8_t tag = (cov >= 16) ? 2u : 1u;
+          const size_t cw = std::min(acs.covered_blocks_x(), r.xsize() - x);
+          const size_t ch = std::min(acs.covered_blocks_y(), r.ysize() - y);
+          for (size_t dy = 0; dy < ch; ++dy) {
+            uint8_t* dst = &smooth_blk[(y + dy) * r.xsize() + x];
+            for (size_t dx = 0; dx < cw; ++dx) {
+              dst[dx] = tag;
+            }
+          }
+        }
+      }
+    }
     for (size_t c : {1, 0, 2}) {
       float inv_factor = enc_state->shared.quantizer.GetInvDcStep(c) * mul;
       float y_factor = enc_state->shared.quantizer.GetDcStep(1) / mul;
@@ -2237,8 +2266,12 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
               (y + 1 < r.ysize())
                   ? stream_images_[stream_id].channel[0].plane.Row(y + 1)
                   : nullptr;
+          const uint8_t* sm_row =
+              !smooth_blk.empty() ? &smooth_blk[y * r.xsize()] : nullptr;
+          const float hi_d_chr =
+              Clamp1((cparams_.butteraugli_distance - 2.0f) * 0.20f, 0.0f, 1.0f);
           for (size_t x = 0; x < r.xsize(); x++) {
-            const float w_aq = enable_rdo ? calc_w_aq(q_row[x]) : 1.0f;
+            float w_aq = enable_rdo ? calc_w_aq(q_row[x]) : 1.0f;
             const float target_w =
                 (x > 0) ? ((row[x - 1] - b_y_comp * row_y[x - 1] -
                             quant_row_y[x - 1] * yk_eff) *
@@ -2255,7 +2288,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
                           quant_row_y[x + 1] * yk_eff) *
                          inv_factor)
                       : 0.0f;
-            const float w_aq_e = has_e ? calc_w_aq(q_row[x + 1]) : 1.0f;
+            float w_aq_e = has_e ? calc_w_aq(q_row[x + 1]) : 1.0f;
             const bool has_s = enable_rdo && (y + 1 < r.ysize());
             const float target_s =
                 has_s ? ((row_next[x] - b_y_comp * row_y_next[x] -
@@ -2268,9 +2301,25 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
                         quant_row_y_next[x - 1] * yk_eff) *
                        inv_factor)
                     : 0.0f;
-            const float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
+            float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
             const float val_c =
                 row[x] - b_y_comp * row_y[x] - quant_row_y[x] * yk_eff;
+            if (sm_row != nullptr && sm_row[x] != 0u) {
+              const float raw_cur = val_c * inv_factor;
+              const float grad_w =
+                  (x > 0) ? std::abs(raw_cur - target_w) : 0.0f;
+              const float grad_n =
+                  (y > 0) ? std::abs(raw_cur - target_n) : 0.0f;
+              const float smooth_g =
+                  Clamp1(1.15f - std::max(grad_w, grad_n), 0.0f, 1.0f);
+              const float sm_mul =
+                  (sm_row[x] == 2u) ? (0.95f + 0.35f * hi_d_chr)
+                                    : (0.85f + 0.15f * hi_d_chr);
+              const float chr_floor = dc_lam_dmul * sm_mul * smooth_g;
+              w_aq = std::max(w_aq, chr_floor);
+              w_aq_e = std::max(w_aq_e, chr_floor);
+              w_aq_s = std::max(w_aq_s, chr_floor);
+            }
             if (use_non_wp) {
               quant_row[x] = QuantizeGradient(
                   quant_row, stride, c, x, y, r.xsize(), val_c, inv_factor,

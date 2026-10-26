@@ -869,6 +869,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                                bool enable_rdo,
                                const ImageF& initial_quant_field,
                                const ImageF (*band_qf)[4],
+                               const AcStrategyImage* ac_strategy,
                                ModularFrameEncoder* modular_frame_encoder,
                                DequantMatrices* dequant_matrices) {
   // TODO(veluca): quant matrices for no-gaborish.
@@ -963,6 +964,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     float delta_hf[3] = {};
     float delta_mf[3] = {};
     float delta_chr[3] = {};
+    float smooth_frac = 0.0f;
     if (band_qf != nullptr && band_qf[1][0].xsize() > 0 &&
         band_qf[1][0].ysize() > 0 &&
         frame_dim.xsize_blocks * frame_dim.ysize_blocks > 1) {
@@ -1017,6 +1019,27 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
               }
             }
           }
+        }
+        if (ac_strategy != nullptr && d > 2.0f && total_blocks > 0) {
+          size_t smooth_large_blocks = 0;
+          for (size_t by = 0; by < frame_dim.ysize_blocks; ++by) {
+            AcStrategyRow acs_row = ac_strategy->ConstRow(by);
+            const float* JXL_RESTRICT bq10 = band_qf[1][0].ConstRow(by);
+            for (size_t bx = 0; bx < frame_dim.xsize_blocks; ++bx) {
+              AcStrategy acs = acs_row[bx];
+              if (!acs.IsFirstBlock()) continue;
+              const size_t cov =
+                  acs.covered_blocks_x() * acs.covered_blocks_y();
+              if (cov < 16) continue;
+              uint32_t act_bits = 0;
+              memcpy(&act_bits, &bq10[bx], sizeof(act_bits));
+              if ((act_bits & 31u) == 0u) {
+                smooth_large_blocks += cov;
+              }
+            }
+          }
+          smooth_frac = static_cast<float>(smooth_large_blocks) /
+                        static_cast<float>(total_blocks);
         }
         if (w_sum > 1e-6 && total_blocks > 0) {
           static constexpr float kHfRef[3] = {-0.085f, -0.076f, -0.080f};
@@ -1144,6 +1167,17 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       x_dc_scale *= all_m * std::exp(-0.0357682817f * s_d);
       y_dc_scale *= all_m;
       b_dc_scale *= all_m * std::exp(-0.00723599782f * s_d);
+      // Opponent chromatic CSF (R-G in X, B-Y in B) is low-pass with no low-
+      // frequency roll-off: on frames with substantial large-transform smooth
+      // backgrounds (bokeh, sky, studio backdrops), damp high-distance MulDC
+      // coarsening while keeping MulDC wide enough for AdaptiveDCSmoothing.
+      const float smooth_gate =
+          Clamp1((smooth_frac - 0.18f) / 0.28f, 0.0f, 1.0f);
+      if (d > 2.0f && smooth_gate > 0.0f) {
+        const float hi_chr = std::log(std::min(d, 16.0f) * 0.5f) * smooth_gate;
+        x_dc_scale *= std::exp(0.42f * hi_chr);
+        b_dc_scale *= std::exp(0.18f * hi_chr);
+      }
       const float custom_inv_dc[3] = {
           kInvDCQuant[0] * x_dc_scale,
           kInvDCQuant[1] * y_dc_scale,
@@ -2845,8 +2879,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   if (initialize_global_state) {
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
         memory_manager, cparams, frame_header, frame_dim, enable_rdo,
-        initial_quant_field, /*band_qf=*/nullptr, modular_frame_encoder,
-        &matrices));
+        initial_quant_field, /*band_qf=*/nullptr, /*ac_strategy=*/nullptr,
+        modular_frame_encoder, &matrices));
     quantizer.RecomputeFromGlobalScale();
   }
 
@@ -2989,8 +3023,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     if (initialize_global_state && cparams.butteraugli_distance > 1.05f) {
       JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
           memory_manager, cparams, frame_header, frame_dim, enable_rdo,
-          initial_quant_field, enc_state->band_qf, modular_frame_encoder,
-          &matrices));
+          initial_quant_field, enc_state->band_qf, &ac_strategy,
+          modular_frame_encoder, &matrices));
       quantizer.RecomputeFromGlobalScale();
       const uint32_t all_acs_64_mask =
           (1u << static_cast<uint32_t>(AcStrategyType::DCT128X128)) - 1u;
@@ -3169,8 +3203,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         cparams.butteraugli_distance > 1.05f) {
       JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
           memory_manager, cparams, frame_header, frame_dim, enable_rdo,
-          initial_quant_field, enc_state->band_qf, modular_frame_encoder,
-          &matrices));
+          initial_quant_field, enc_state->band_qf, &ac_strategy,
+          modular_frame_encoder, &matrices));
       quantizer.RecomputeFromGlobalScale();
     }
     const bool defer_prune =

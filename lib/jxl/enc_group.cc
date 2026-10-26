@@ -12519,9 +12519,11 @@ Status RefineQuantFieldClosedLoop(
             const double be = blk_err_cur[by * xsize_blocks + bx];
             if (be > 1.35 * mean_be_2g) continue;
             for (size_t mc = 0; mc < 3; ++mc) {
+              if (mc != 0 && be < 0.40 * mean_be_2g) continue;
               int8_t best_dq = 0;
               double best_dbits = -1.15;
               for (int32_t dq : {-3, -2, -1, 1, 2, 3}) {
+                if (mc != 0 && (dq < -1 || dq > 1)) continue;
                 double dbits = 0.0;
                 if (price_dc_step(dg, mc, lx, ly, dq, /*allow_new_sym=*/false,
                                   &dbits) &&

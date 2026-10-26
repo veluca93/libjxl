@@ -104,6 +104,8 @@ constexpr int32_t kMaxSafeAbsQ = 32760;
 struct DcChannelRdCost {
   double bits = 0.0;
   double dist = 0.0;
+  double smooth_dist = 0.0;
+  uint32_t smooth_n = 0;
   bool valid = true;
   double total(double lambda_dist) const { return bits + lambda_dist * dist; }
 };
@@ -119,9 +121,11 @@ DcChannelRdCost EvalChromaDcChannelCost(
   uint32_t hist[64] = {0};
   uint64_t extra_bits = 0;
   uint32_t total_n = 0;
+  uint32_t smooth_n = 0;
   double dist = 0.0;
-  std::vector<int32_t> q_prev(frame_dim.group_dim, 0);
-  std::vector<int32_t> q_cur(frame_dim.group_dim, 0);
+  double smooth_dist = 0.0;
+  std::vector<int32_t> q_prev(frame_dim.dc_group_dim, 0);
+  std::vector<int32_t> q_cur(frame_dim.dc_group_dim, 0);
 
   for (size_t group_index = 0; group_index < frame_dim.num_dc_groups;
        ++group_index) {
@@ -131,11 +135,17 @@ DcChannelRdCost EvalChromaDcChannelCost(
       const float* JXL_RESTRICT rc_orig = r.ConstPlaneRow(dc_orig, c, y);
       const float* JXL_RESTRICT ry = r.ConstPlaneRow(dc_orig, 1, y);
       const int32_t* JXL_RESTRICT qy = r.ConstRow(quant_y, y);
+      const int32_t* JXL_RESTRICT qy_p =
+          (y > 0) ? r.ConstRow(quant_y, y - 1) : nullptr;
       for (size_t x = 0; x < r.xsize(); ++x) {
         const int32_t left = (x > 0) ? q_cur[x - 1] : (y > 0 ? q_prev[x] : 0);
         const int32_t top = (y > 0) ? q_prev[x] : left;
         const int32_t tl = (x > 0 && y > 0) ? q_prev[x - 1] : left;
         const int32_t guess = ClampedGradI32(top, left, tl);
+        const int32_t qy_l = (x > 0) ? qy[x - 1] : (y > 0 ? qy_p[x] : qy[x]);
+        const int32_t qy_t = (y > 0) ? qy_p[x] : qy_l;
+        const int32_t qy_tl = (x > 0 && y > 0) ? qy_p[x - 1] : qy_l;
+        const int32_t dq_y = qy[x] - ClampedGradI32(qy_t, qy_l, qy_tl);
         const float pred_y_cfl =
             y_comp * ry[x] + static_cast<float>(qy[x]) * yk_eff;
         const float raw_target = (rc[x] - pred_y_cfl) * inv_f;
@@ -160,7 +170,12 @@ DcChannelRdCost EvalChromaDcChannelCost(
         }
         q_cur[x] = q_val;
         const float err = orig_target - static_cast<float>(q_val);
-        dist += static_cast<double>(err * err);
+        const double err2 = static_cast<double>(err * err);
+        dist += err2;
+        if (std::abs(dq_y) <= 2) {
+          smooth_dist += err2;
+          smooth_n++;
+        }
         AddHybridUint420(res, hist, &extra_bits);
         total_n++;
       }
@@ -170,6 +185,8 @@ DcChannelRdCost EvalChromaDcChannelCost(
   DcChannelRdCost out;
   out.bits = HistogramEntropyBits(hist, total_n, extra_bits);
   out.dist = dist;
+  out.smooth_dist = smooth_dist;
+  out.smooth_n = smooth_n;
   return out;
 }
 
@@ -310,8 +327,18 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
       if (seen[cand + 128]) return;
       seen[cand + 128] = true;
       const DcChannelRdCost cost = eval(cand);
-      if (!cost.valid || cost.dist > base.dist * 1.03) return;
-      const double score = cost.total(lambda_d);
+      if (!cost.valid || cost.dist > base.dist * 1.02) return;
+      if (cost.smooth_n >= 64 &&
+          cost.smooth_dist >
+              base.smooth_dist * 1.015 + 0.005 * static_cast<double>(cost.smooth_n)) {
+        return;
+      }
+      const double smooth_excess =
+          (cost.smooth_n >= 64)
+              ? std::max(0.0, cost.smooth_dist - base.smooth_dist)
+              : 0.0;
+      const double score =
+          cost.bits + lambda_d * (cost.dist + 1.25 * smooth_excess);
       if (score < best_score) {
         best_score = score;
         best_idx = cand;
@@ -616,12 +643,18 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
             sum_log_q += std::log(std::max(1e-4f, q_row[bx]));
           }
         }
+        const size_t inner_blocks = (xsize_dc - 2) * (ysize_dc - 2);
         const float q_ref = std::exp(
-            sum_log_q / static_cast<double>((xsize_dc - 2) * (ysize_dc - 2)));
+            sum_log_q / static_cast<double>(inner_blocks));
         double total_delta = 0.0;
+        double smooth_delta = 0.0;
+        double chroma_delta = 0.0;
+        size_t smooth_n = 0;
         for (size_t by = 1; by + 1 < ysize_dc; ++by) {
           const float* JXL_RESTRICT rx_t = dc.ConstPlaneRow(0, by);
           const float* JXL_RESTRICT ry_t = dc.ConstPlaneRow(1, by);
+          const float* JXL_RESTRICT ry_tn = dc.ConstPlaneRow(1, by - 1);
+          const float* JXL_RESTRICT ry_ts = dc.ConstPlaneRow(1, by + 1);
           const float* JXL_RESTRICT rb_t = dc.ConstPlaneRow(2, by);
           const float* JXL_RESTRICT rx_m =
               shared.dc_storage.ConstPlaneRow(0, by);
@@ -651,6 +684,16 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
             const float db = (s_by - m_by) * ((s_by - t_by) + (m_by - t_by)) * wb;
             total_delta +=
                 static_cast<double>(w_aq) * (1.0f * dy + 0.35f * dx + 0.25f * db);
+            const double d_chr =
+                static_cast<double>(w_aq) * (0.65f * dx + 0.45f * db);
+            chroma_delta += d_chr;
+            const float lap_y =
+                0.25f * (ry_tn[bx] + ry_ts[bx] + ry_t[bx - 1] + ry_t[bx + 1]) -
+                ry_t[bx];
+            if (std::abs(lap_y) * inv_dc_y < 0.35f) {
+              smooth_delta += static_cast<double>(w_aq) * dy + d_chr;
+              smooth_n++;
+            }
           }
         }
         // Incremental U64 header cost for kSkipAdaptiveDCSmoothing (flag=128).
@@ -663,7 +706,11 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
         const double skip_header_bits =
             (effective_flags == 0) ? 8.0 : (effective_flags < 17 ? 4.0 : 0.0);
         const double skip_threshold = 0.25 * skip_header_bits;
-        if (total_delta > skip_threshold) {
+        const bool smooth_needs_dc_filter =
+            (smooth_n >= inner_blocks / 8 &&
+             smooth_delta < -0.0025 * static_cast<double>(smooth_n)) ||
+            (chroma_delta < -0.0025 * static_cast<double>(inner_blocks));
+        if (!smooth_needs_dc_filter && total_delta > skip_threshold) {
           frame_header.UpdateFlag(true, FrameHeader::kSkipAdaptiveDCSmoothing);
         } else {
           shared.dc_storage.Swap(smoothed_dc);
