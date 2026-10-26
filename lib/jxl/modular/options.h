@@ -116,6 +116,9 @@ struct ModularOptions {
   // Ignore the image and just pretend all tokens are zeroes
   bool zero_tokens = false;
 
+  // Polish final leaf predictors and integer offsets after tree splitting.
+  bool polish_leaves = false;
+
   ModularOptions() {
     // GCC has complaints about inline vector initialization; do it manually.
     static const std::vector<uint32_t> kDefaultSplittingHeuristicsProperties = {

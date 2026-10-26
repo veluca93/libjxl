@@ -1166,8 +1166,11 @@ StatusOr<size_t> EntropyEncodingData::BuildAndStoreEntropyCodes(
   }
 
   if (builder.size() > 1 && writer != nullptr) {
-    JXL_RETURN_IF_ERROR(EncodeContextMap(
-        context_map, clustered_histograms.size(), writer, layer, aux_out));
+    const bool rdo_ctx_map =
+        params.rdo_context_map && !params.streaming_mode;
+    JXL_RETURN_IF_ERROR(
+        EncodeContextMap(context_map, clustered_histograms.size(), writer,
+                         layer, aux_out, rdo_ctx_map));
   }
   if (aux_out != nullptr) {
     for (size_t i = prev_histograms; i < clustered_histograms.size(); ++i) {

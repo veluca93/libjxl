@@ -135,14 +135,16 @@ static JXL_INLINE void ComputeBlockThresholds(
       zero_thres[1][0] -= 0.003f;
     }
     float luma_hf_dz = 0.0f;
+    const float raw_act = static_cast<float>(activity);
+    const float eff_act = raw_act / (1.0f + 0.032f * dz_w_rt * raw_act);
     if (activity > 0) {
-      const float delta_hf = -0.002f * hr_w + dz_w_rt * (0.0100f * activity);
+      const float delta_hf = -0.002f * hr_w + dz_w_rt * (0.0100f * eff_act);
       zero_thres[1][1] += delta_hf;
       zero_thres[1][2] += delta_hf;
       luma_hf_dz = std::max(0.0f, delta_hf);
     }
     zero_thres[1][3] +=
-        -0.002f * hr_w + dz_w_rt * (0.0025f + 0.0115f * activity);
+        -0.002f * hr_w + dz_w_rt * (0.0025f + 0.0115f * eff_act);
     for (int cc : {0, 2}) {
       const float c_mf_ratio = band_q[cc][2] / std::max(q_block, 1e-4f);
       const float c_luma_mask_w =

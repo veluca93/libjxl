@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "lib/jxl/ac_context.h"
@@ -64,7 +65,8 @@ std::vector<uint8_t> MoveToFrontTransform(const std::vector<uint8_t>& v) {
 
 Status EncodeContextMap(const std::vector<uint8_t>& context_map,
                         size_t num_histograms, BitWriter* writer,
-                        LayerType layer, AuxOut* aux_out) {
+                        LayerType layer, AuxOut* aux_out,
+                        bool use_rdo_options) {
   if (num_histograms == 1) {
     // Simple code
     writer->Write(1, 1);
@@ -75,44 +77,145 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
 
   JxlMemoryManager* memory_manager = writer->memory_manager();
   std::vector<uint8_t> transformed_symbols = MoveToFrontTransform(context_map);
-  std::vector<std::vector<Token>> tokens(1);
-  std::vector<std::vector<Token>> mtf_tokens(1);
-  for (const uint8_t& ctx : context_map) {
-    tokens[0].emplace_back(0, ctx);
+
+  if (!use_rdo_options) {
+    std::vector<std::vector<Token>> tokens(1);
+    std::vector<std::vector<Token>> mtf_tokens(1);
+    for (const uint8_t& ctx : context_map) {
+      tokens[0].emplace_back(0, ctx);
+    }
+    for (const uint8_t& sym : transformed_symbols) {
+      mtf_tokens[0].emplace_back(0, sym);
+    }
+    HistogramParams params;
+    params.uint_method = HistogramParams::HybridUintMethod::kContextMap;
+    size_t ans_cost;
+    size_t mtf_cost;
+    {
+      EntropyEncodingData codes;
+      JXL_ASSIGN_OR_RETURN(
+          ans_cost,
+          BuildAndEncodeHistograms(memory_manager, params, 1, tokens, &codes,
+                                   nullptr, LayerType::Header, nullptr));
+    }
+    {
+      EntropyEncodingData codes;
+      JXL_ASSIGN_OR_RETURN(
+          mtf_cost, BuildAndEncodeHistograms(memory_manager, params, 1,
+                                             mtf_tokens, &codes, nullptr,
+                                             LayerType::Header, nullptr));
+    }
+    const bool use_mtf = mtf_cost < ans_cost;
+    tokens[0].clear();
+    for (size_t i = 0; i < transformed_symbols.size(); i++) {
+      tokens[0].emplace_back(0,
+                             use_mtf ? transformed_symbols[i] : context_map[i]);
+    }
+    const size_t entry_bits = CeilLog2Nonzero(num_histograms);
+    const size_t simple_cost = entry_bits * context_map.size();
+    if (entry_bits < 4 && simple_cost < ans_cost && simple_cost < mtf_cost) {
+      return writer->WithMaxBits(
+          3 + entry_bits * context_map.size(), layer, aux_out, [&] {
+            writer->Write(1, 1);
+            writer->Write(2, entry_bits);
+            for (uint8_t entry : context_map) {
+              writer->Write(entry_bits, entry);
+            }
+            return true;
+          });
+    }
+    return writer->WithMaxBits(
+        2 + tokens[0].size() * 24, layer, aux_out, [&]() -> Status {
+          writer->Write(1, 0);
+          writer->Write(1, TO_JXL_BOOL(use_mtf));
+          EntropyEncodingData codes;
+          JXL_ASSIGN_OR_RETURN(
+              size_t cost,
+              BuildAndEncodeHistograms(memory_manager, params, 1, tokens,
+                                       &codes, writer, layer, aux_out));
+          (void)cost;
+          WriteTokens(tokens[0], codes, 0, writer);
+          return true;
+        });
   }
-  for (const uint8_t& sym : transformed_symbols) {
-    mtf_tokens[0].emplace_back(0, sym);
-  }
-  HistogramParams params;
-  params.uint_method = HistogramParams::HybridUintMethod::kContextMap;
-  size_t ans_cost;
-  size_t mtf_cost;
-  {
-    EntropyEncodingData codes;
-    JXL_ASSIGN_OR_RETURN(
-        ans_cost, BuildAndEncodeHistograms(memory_manager, params, 1, tokens,
-                                           &codes, nullptr, LayerType::Header,
-                                           /*aux_out*/ nullptr));
-  }
-  {
-    EntropyEncodingData codes;
-    JXL_ASSIGN_OR_RETURN(
-        mtf_cost, BuildAndEncodeHistograms(
-                      memory_manager, params, 1, mtf_tokens, &codes, nullptr,
-                      LayerType::Header, /*aux_out*/ nullptr));
-  }
-  bool use_mtf = mtf_cost < ans_cost;
-  // Rebuild token list.
-  tokens[0].clear();
-  for (size_t i = 0; i < transformed_symbols.size(); i++) {
-    tokens[0].emplace_back(0,
-                           use_mtf ? transformed_symbols[i] : context_map[i]);
-  }
+
   size_t entry_bits = CeilLog2Nonzero(num_histograms);
-  size_t simple_cost = entry_bits * context_map.size();
-  if (entry_bits < 4 && simple_cost < ans_cost && simple_cost < mtf_cost) {
+  size_t simple_cost = 3 + entry_bits * context_map.size();
+
+  struct CandOption {
+    bool use_mtf;
+    HistogramParams::LZ77Method lz77;
+    HistogramParams::HybridUintMethod uint_method;
+    HistogramParams::ANSHistogramStrategy ans_strategy;
+    HistogramParams::ClusteringType clustering;
+  };
+
+  std::vector<CandOption> options;
+  const auto base_lz77 = (context_map.size() <= 2)
+                             ? HistogramParams::LZ77Method::kNone
+                             : HistogramParams::LZ77Method::kRLE;
+  for (bool mtf : {false, true}) {
+    options.push_back(
+        {mtf, base_lz77, HistogramParams::HybridUintMethod::kContextMap,
+         HistogramParams::ANSHistogramStrategy::kPrecise,
+         HistogramParams::ClusteringType::kBest});
+  }
+  if (context_map.size() > 64) {
+    for (bool mtf : {false, true}) {
+      options.push_back(
+          {mtf, HistogramParams::LZ77Method::kRLE,
+           HistogramParams::HybridUintMethod::kBest,
+           HistogramParams::ANSHistogramStrategy::kPrecise,
+           HistogramParams::ClusteringType::kBest});
+      options.push_back(
+          {mtf, HistogramParams::LZ77Method::kOptc256,
+           HistogramParams::HybridUintMethod::kBest,
+           HistogramParams::ANSHistogramStrategy::kPrecise,
+           HistogramParams::ClusteringType::kBest});
+    }
+  }
+
+  size_t best_bits = std::numeric_limits<size_t>::max();
+  size_t best_opt = 0;
+  for (size_t idx = 0; idx < options.size(); ++idx) {
+    const CandOption& opt = options[idx];
+    const std::vector<uint8_t>& src =
+        opt.use_mtf ? transformed_symbols : context_map;
+    std::vector<std::vector<Token>> cand_tokens(1);
+    cand_tokens[0].reserve(src.size());
+    for (uint8_t sym : src) {
+      cand_tokens[0].emplace_back(0, sym);
+    }
+    HistogramParams cand_params;
+    cand_params.lz77_method = opt.lz77;
+    cand_params.uint_method = opt.uint_method;
+    cand_params.ans_histogram_strategy = opt.ans_strategy;
+    cand_params.clustering = opt.clustering;
+    BitWriter cand_writer{memory_manager};
+    JXL_RETURN_IF_ERROR(cand_writer.WithMaxBits(
+        2 + src.size() * 24 + 1024, LayerType::Header, nullptr,
+        [&]() -> Status {
+          cand_writer.Write(1, 0);
+          cand_writer.Write(1, TO_JXL_BOOL(opt.use_mtf));
+          EntropyEncodingData codes;
+          JXL_ASSIGN_OR_RETURN(
+              size_t cost, BuildAndEncodeHistograms(memory_manager, cand_params,
+                                                    1, cand_tokens, &codes,
+                                                    &cand_writer,
+                                                    LayerType::Header, nullptr));
+          (void)cost;
+          WriteTokens(cand_tokens[0], codes, 0, &cand_writer);
+          return true;
+        }));
+    if (cand_writer.BitsWritten() < best_bits) {
+      best_bits = cand_writer.BitsWritten();
+      best_opt = idx;
+    }
+  }
+
+  if (entry_bits < 4 && simple_cost < best_bits) {
     JXL_RETURN_IF_ERROR(writer->WithMaxBits(
-        3 + entry_bits * context_map.size(), layer, aux_out, [&] {
+        simple_cost, layer, aux_out, [&] {
           writer->Write(1, 1);
           writer->Write(2, entry_bits);
           for (uint8_t entry : context_map) {
@@ -121,10 +224,23 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
           return true;
         }));
   } else {
+    const CandOption& opt = options[best_opt];
+    const std::vector<uint8_t>& src =
+        opt.use_mtf ? transformed_symbols : context_map;
+    std::vector<std::vector<Token>> tokens(1);
+    tokens[0].reserve(src.size());
+    for (uint8_t sym : src) {
+      tokens[0].emplace_back(0, sym);
+    }
+    HistogramParams params;
+    params.lz77_method = opt.lz77;
+    params.uint_method = opt.uint_method;
+    params.ans_histogram_strategy = opt.ans_strategy;
+    params.clustering = opt.clustering;
     JXL_RETURN_IF_ERROR(writer->WithMaxBits(
-        2 + tokens[0].size() * 24, layer, aux_out, [&]() -> Status {
+        2 + src.size() * 24 + 1024, layer, aux_out, [&]() -> Status {
           writer->Write(1, 0);
-          writer->Write(1, TO_JXL_BOOL(use_mtf));  // Use/don't use MTF.
+          writer->Write(1, TO_JXL_BOOL(opt.use_mtf));  // Use/don't use MTF.
           EntropyEncodingData codes;
           JXL_ASSIGN_OR_RETURN(
               size_t cost,

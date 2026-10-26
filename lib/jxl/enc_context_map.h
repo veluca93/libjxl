@@ -27,7 +27,8 @@ static const size_t kClustersLimit = 128;
 // histogram ids is given by num_histograms.
 Status EncodeContextMap(const std::vector<uint8_t>& context_map,
                         size_t num_histograms, BitWriter* writer,
-                        LayerType layer, AuxOut* aux_out);
+                        LayerType layer, AuxOut* aux_out,
+                        bool use_rdo_options = false);
 
 Status EncodeBlockCtxMap(const BlockCtxMap& block_ctx_map, BitWriter* writer,
                          AuxOut* aux_out);

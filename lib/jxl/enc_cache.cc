@@ -181,7 +181,7 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
   const float half_y_step = shared->quantizer.GetDcStep(1) * 0.5f;
   const float base_b = shared->cmap.base().GetBaseCorrelationB();
   const float color_factor = shared->cmap.base().GetColorFactor();
-  const float b_y_comp = has_dc_rdo ? 0.75f : 0.0f;
+  const float b_y_comp = has_dc_rdo ? 0.751457036f : 0.0f;
   const bool clamp_i16 = shared->metadata != nullptr &&
                          shared->metadata->m.modular_16_bit_buffer_sufficient;
   const int32_t max_abs_q =
@@ -402,11 +402,21 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
     shared.quantizer.RecomputeFromGlobalScale();
   }
 
-  if (enc_state->token_cost_model != nullptr) {
-    JXL_RETURN_IF_ERROR(BuildPass2FrozenTokenCostModel(
-        frame_header, opsin, rect, pool, enc_state));
-    JXL_RETURN_IF_ERROR(RefineQuantFieldClosedLoop(frame_header, opsin, rect,
-                                                   pool, enc_state));
+  const bool use_post_dc_rdo =
+      enc_state->token_cost_model != nullptr && !enc_state->streaming_mode &&
+      enc_state->initialize_global_state &&
+      enc_state->progressive_splitter.GetNumPasses() == 1;
+  std::unique_ptr<AcTokenCostModel> detached_tcm;
+  if (use_post_dc_rdo) {
+    JXL_ASSIGN_OR_RETURN(
+        enc_state->base_raw_quant_field,
+        ImageI::Create(memory_manager, shared.raw_quant_field.xsize(),
+                       shared.raw_quant_field.ysize()));
+    JXL_RETURN_IF_ERROR(
+        CopyImageTo(shared.raw_quant_field, &enc_state->base_raw_quant_field));
+    detached_tcm = std::move(enc_state->token_cost_model);
+  } else {
+    enc_state->base_raw_quant_field = ImageI();
   }
 
   JXL_ASSIGN_OR_RETURN(
@@ -592,10 +602,9 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
         JXL_RETURN_IF_ERROR(CopyImageTo(shared.dc_storage, &smoothed_dc));
         JXL_RETURN_IF_ERROR(AdaptiveDCSmoothing(
             memory_manager, shared.quantizer.MulDC(), &smoothed_dc, pool));
-        const float scale_dc = 1.0f / shared.quantizer.inv_quant_dc();
-        const float inv_dc_x = kInvDCQuant[0] * scale_dc;
-        const float inv_dc_y = kInvDCQuant[1] * scale_dc;
-        const float inv_dc_b = kInvDCQuant[2] * scale_dc;
+        const float inv_dc_x = shared.quantizer.GetInvDcStep(0);
+        const float inv_dc_y = shared.quantizer.GetInvDcStep(1);
+        const float inv_dc_b = shared.quantizer.GetInvDcStep(2);
         const float wx = inv_dc_x * inv_dc_x;
         const float wy = inv_dc_y * inv_dc_y;
         const float wb = inv_dc_b * inv_dc_b;
@@ -664,6 +673,38 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
             memory_manager, shared.quantizer.MulDC(), &shared.dc_storage, pool));
       }
     }
+  }
+
+  if (use_post_dc_rdo) {
+    enc_state->token_cost_model = std::move(detached_tcm);
+    JXL_RETURN_IF_ERROR(BuildPass2FrozenTokenCostModel(
+        frame_header, opsin, rect, pool, enc_state,
+        /*pilot_coeffs_ready=*/true));
+    JXL_RETURN_IF_ERROR(RefineQuantFieldClosedLoop(
+        frame_header, opsin, rect, pool, enc_state, modular_frame_encoder));
+    {
+      uint32_t final_used_tables_mask = 0;
+      for (size_t y = 0; y < shared.ac_strategy.ysize(); ++y) {
+        AcStrategyRow row = shared.ac_strategy.ConstRow(y);
+        for (size_t x = 0; x < shared.ac_strategy.xsize(); ++x) {
+          AcStrategy acs = row[x];
+          if (!acs.IsFirstBlock()) continue;
+          const size_t st = static_cast<size_t>(acs.Strategy());
+          final_used_tables_mask |=
+              (1u << static_cast<uint32_t>(kAcStrategyToQuantTableMap[st]));
+        }
+      }
+      shared.matrices.PruneUnusedEncodings(final_used_tables_mask);
+    }
+    const auto process_final_ac = [&](size_t group_idx, size_t _) -> Status {
+      return ComputeCoefficients(group_idx, enc_state, opsin, rect,
+                                 /*dc=*/nullptr);
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, shared.frame_dim.num_groups,
+                                  ThreadPool::NoInit, process_final_ac,
+                                  "Compute final AC coeffs"));
+    enc_state->base_raw_quant_field = ImageI();
+    enc_state->rdoq_level_field = ImageSB();
   }
   return true;
 }

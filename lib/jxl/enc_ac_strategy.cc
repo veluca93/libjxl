@@ -904,7 +904,12 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                 // Scaled so 1/sqrt(kC2)=33.3 matches ~30 * q_norm * |o - r|
                 const float u_ssim4_sq = (q_norm * q_norm * 0.90f) * d_ssim4_val;
                 const float u_ssim4_l1 = (q_norm * q_norm * 0.90f) * d_ssim4_l1;
-                ssim2_c += 5.6f * u_ssim4_l1;
+                const float sd_o4 = std::sqrt(std::max(0.0f, sig_o2));
+                const float sd_r4 = std::sqrt(std::max(0.0f, sig_r2));
+                const float d_sd4 = std::max(0.0f, sd_o4 - sd_r4);
+                const float wd_ch_mul = (c == 0) ? 0.35f : 1.0f;
+                ssim2_c +=
+                    5.6f * (u_ssim4_l1 + 4.5f * wd_ch_mul * d_sd4 * d_sd4);
                 ssim4_c += 8.8f * u_ssim4_sq * u_ssim4_sq;
 
                 // 1:1 EdgeDiffMap (detail_lost / blur + artifact / ringing):
@@ -959,7 +964,11 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
             const float d_ssim8_val =
                 (sig_e8_2 + mu_e8_n2 * two_cov8_c2) / denom_8;
             const float u_ssim8_sq = (q_norm * q_norm * 0.90f) * d_ssim8_val;
-            ssim2_c += 41.6f * u_ssim8_sq;
+            const float sd_o8 = std::sqrt(std::max(0.0f, sig_o8_2));
+            const float sd_r8 = std::sqrt(std::max(0.0f, sig_r8_2));
+            const float d_sd8 = std::max(0.0f, sd_o8 - sd_r8);
+            const float wd_ch_mul8 = (c == 0) ? 0.35f : 1.0f;
+            ssim2_c += 41.6f * (u_ssim8_sq + 4.5f * wd_ch_mul8 * d_sd8 * d_sd8);
             ssim4_c += 28.8f * u_ssim8_sq * u_ssim8_sq + cell_ring4;
           }
         }
@@ -1285,8 +1294,9 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     uint8_t act;
   };
   struct DPTable {
-    float cost[528][528];
-    uint16_t split[528][528];
+    float cost_flat[528 * 528];
+    uint16_t split_flat[528 * 528];
+    uint16_t iv_idx[32][33];
     AcStrategyType leaf[32][32][9][9];
     uint8_t leaf_act[32][32][9][9];
     float leaf_q[32][32][9][9];
@@ -1350,6 +1360,12 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                            [ix / kColorTileDimInBlocks];
       for (const auto& tx : kTransforms1x1) {
         if (tx.max_speed_tier < speed_tier) continue;
+        const size_t t_idx = static_cast<size_t>(
+            kAcStrategyToQuantTableMap[static_cast<size_t>(tx.type)]);
+        if (tx.type != AcStrategyType::DCT &&
+            (config.disabled_tables_mask & (1u << t_idx)) != 0) {
+          continue;
+        }
         float cand_entropy = 1e30f;
         float cand_q = 0.0f;
         uint8_t cand_act = 0;
@@ -1373,14 +1389,22 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     }
   }
 
-  // Map 1D intervals [pos, pos + len) in [0, 32) to [0, 528).
-  uint16_t iv_idx[32][33] = {};
+  // Map 1D intervals [pos, pos + len) in [0, max_dim) to compact [0, next_iv).
+  const size_t max_dim = std::max<size_t>(1, std::max(rx, ry));
+  uint16_t (&iv_idx)[32][33] = dp->iv_idx;
   uint16_t next_iv = 0;
-  for (size_t pos = 0; pos < 32; ++pos) {
-    for (size_t len = 1; pos + len <= 32; ++len) {
+  for (size_t pos = 0; pos < max_dim; ++pos) {
+    for (size_t len = 1; pos + len <= max_dim; ++len) {
       iv_idx[pos][len] = next_iv++;
     }
   }
+  const size_t iv_stride = next_iv;
+  auto dp_cost = [&](uint16_t iy, uint16_t ix) -> float& {
+    return dp->cost_flat[static_cast<size_t>(iy) * iv_stride + ix];
+  };
+  auto dp_split = [&](uint16_t iy, uint16_t ix) -> uint16_t& {
+    return dp->split_flat[static_cast<size_t>(iy) * iv_stride + ix];
+  };
 
   auto rect_base_sum = [&](size_t x0, size_t y0, size_t w, size_t h) -> float {
     return dp->prefix_sum[y0 + h][x0 + w] - dp->prefix_sum[y0][x0 + w] -
@@ -1435,7 +1459,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     uint16_t cur_chosen[64];
     size_t cur_num = 0;
     size_t nodes = 0;
-    constexpr size_t kMaxNodes = 2048;
+    constexpr size_t kMaxNodes = 4096;
 
     auto dfs = [&](auto& self, size_t idx, uint64_t used,
                    float cur_gain) -> void {
@@ -1503,8 +1527,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           const uint16_t iy = iv_idx[y0][1];
           for (size_t x0 = 0; x0 < rx; ++x0) {
             const uint16_t ix = iv_idx[x0][1];
-            dp->cost[iy][ix] = dp->entropy_estimate[y0][x0];
-            dp->split[iy][ix] = 0;
+            dp_cost(iy, ix) = dp->entropy_estimate[y0][x0];
+            dp_split(iy, ix) = 0;
             dp->leaf[y0][x0][1][1] = dp->best_8x8_type[y0][x0];
             dp->leaf_q[y0][x0][1][1] = dp->best_8x8_q[y0][x0];
             dp->leaf_act[y0][x0][1][1] = dp->best_8x8_act[y0][x0];
@@ -1564,6 +1588,13 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         has_direct = true;
         direct_type = AcStrategyType::DCT64X64;
       }
+      if (has_direct) {
+        const size_t t_idx = static_cast<size_t>(
+            kAcStrategyToQuantTableMap[static_cast<size_t>(direct_type)]);
+        if ((config.disabled_tables_mask & (1u << t_idx)) != 0) {
+          has_direct = false;
+        }
+      }
 
       const AcStrategy acs_direct = AcStrategy::FromRawStrategy(direct_type);
 
@@ -1582,8 +1613,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           // Vertical splits: [x0, x0 + k) and [x0 + k, x0 + w)
           for (size_t k = 1; k < w; ++k) {
             if (!enable_rdo && k != k_dyadic_w) continue;
-            const float c = dp->cost[iy][iv_idx[x0][k]] +
-                            dp->cost[iy][iv_idx[x0 + k][w - k]];
+            const float c = dp_cost(iy, iv_idx[x0][k]) +
+                            dp_cost(iy, iv_idx[x0 + k][w - k]);
             if (c < best_c) {
               best_c = c;
               best_s = static_cast<uint16_t>(k);
@@ -1592,8 +1623,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
           // Horizontal splits: [y0, y0 + k) and [y0 + k, y0 + h)
           for (size_t k = 1; k < h; ++k) {
             if (!enable_rdo && k != k_dyadic_h) continue;
-            const float c = dp->cost[iv_idx[y0][k]][ix] +
-                            dp->cost[iv_idx[y0 + k][h - k]][ix];
+            const float c = dp_cost(iv_idx[y0][k], ix) +
+                            dp_cost(iv_idx[y0 + k][h - k], ix);
             if (c < best_c) {
               best_c = c;
               best_s = static_cast<uint16_t>(32 + k);
@@ -1611,14 +1642,14 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             for (size_t xi = 0; xi < num_x_segs; ++xi) {
               const uint8_t xa = x_segs[xi].a;
               const uint8_t xb = x_segs[xi].b;
-              const float c_mid = dp->cost[iy_mid][iv_idx[x0 + xa][xb - xa]];
+              const float c_mid = dp_cost(iy_mid, iv_idx[x0 + xa][xb - xa]);
               // CW: TL (xb x ya), TR ((w-xb) x yb), BR ((w-xa) x (h-yb)),
               //     BL (xa x (h-ya)), center ((xb-xa) x (yb-ya))
               const float c_cw =
-                  dp->cost[iy_top_a][iv_idx[x0][xb]] +
-                  dp->cost[iy_top_b][iv_idx[x0 + xb][w - xb]] +
-                  dp->cost[iy_bot_b][iv_idx[x0 + xa][w - xa]] +
-                  dp->cost[iy_bot_a][iv_idx[x0][xa]] + c_mid;
+                  dp_cost(iy_top_a, iv_idx[x0][xb]) +
+                  dp_cost(iy_top_b, iv_idx[x0 + xb][w - xb]) +
+                  dp_cost(iy_bot_b, iv_idx[x0 + xa][w - xa]) +
+                  dp_cost(iy_bot_a, iv_idx[x0][xa]) + c_mid;
               if (c_cw < best_c) {
                 best_c = c_cw;
                 best_s = static_cast<uint16_t>(
@@ -1630,10 +1661,10 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
               // CCW: TL (xa x yb), TR ((w-xa) x ya), BR ((w-xb) x (h-ya)),
               //      BL (xb x (h-yb)), center ((xb-xa) x (yb-ya))
               const float c_ccw =
-                  dp->cost[iy_top_b][iv_idx[x0][xa]] +
-                  dp->cost[iy_top_a][iv_idx[x0 + xa][w - xa]] +
-                  dp->cost[iy_bot_a][iv_idx[x0 + xb][w - xb]] +
-                  dp->cost[iy_bot_b][iv_idx[x0][xb]] + c_mid;
+                  dp_cost(iy_top_b, iv_idx[x0][xa]) +
+                  dp_cost(iy_top_a, iv_idx[x0 + xa][w - xa]) +
+                  dp_cost(iy_bot_a, iv_idx[x0 + xb][w - xb]) +
+                  dp_cost(iy_bot_b, iv_idx[x0][xb]) + c_mid;
               if (c_ccw < best_c) {
                 best_c = c_ccw;
                 best_s = static_cast<uint16_t>(
@@ -1650,10 +1681,11 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             const bool is_8x32 = (w == 4 && h == 1) || (w == 1 && h == 4);
             const bool eval_direct =
                 enable_rdo
-                    ? (is_8x32 ? (best_c < base_sum - 1e-4f)
-                               : ((w * h <= 16) ||
-                                  ((x0 & 1) == 0 && (y0 & 1) == 0) ||
-                                  (best_c < base_sum - 1e-4f)))
+                    ? ((rx <= 8 && ry <= 8 && !is_8x32) ||
+                       (is_8x32 ? (best_c < base_sum - 1e-4f)
+                                : ((w * h <= 16) ||
+                                   ((x0 & 1) == 0 && (y0 & 1) == 0) ||
+                                   (best_c < base_sum - 1e-4f))))
                     : (x0 % w == 0 && y0 % h == 0);
             if (eval_direct) {
               float cand_entropy = kInf;
@@ -1692,7 +1724,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
 
           if (enable_rdo &&
               ((w == 8 && h == 8) || (w == rx && h == ry && rx <= 8 && ry <= 8)) &&
-              best_s != 0 && ((x0 % 4 == 0 && y0 % 4 == 0) || (w == rx && h == ry))) {
+              ((x0 % 4 == 0 && y0 % 4 == 0) || (w == rx && h == ry))) {
             uint16_t ng_chosen[64];
             size_t ng_num = 0;
             float ng_gain = 0.0f;
@@ -1704,8 +1736,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
             }
           }
 
-          dp->cost[iy][ix] = best_c;
-          dp->split[iy][ix] = best_s;
+          dp_cost(iy, ix) = best_c;
+          dp_split(iy, ix) = best_s;
         }
       }
     }
@@ -1797,7 +1829,7 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     const SubRect cur = stack[--sp];
     const uint16_t iy = iv_idx[cur.y0][cur.h];
     const uint16_t ix = iv_idx[cur.x0][cur.w];
-    const uint16_t s = dp->split[iy][ix];
+    const uint16_t s = dp_split(iy, ix);
     if (s == 0) {
       const AcStrategyType ltype = dp->leaf[cur.y0][cur.x0][cur.h][cur.w];
       JXL_RETURN_IF_ERROR(ac_strategy->Set(bx + cur.x0, by + cur.y0, ltype));
@@ -1806,13 +1838,15 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                          dp->leaf_act[cur.y0][cur.x0][cur.h][cur.w]);
       continue;
     }
-    if (enable_rdo && cur.w <= 8 && cur.h <= 8 &&
+    const bool already_checked_root_ng =
+        (cur.w == rx && cur.h == ry && rx <= 8 && ry <= 8 && s != 0x3FFFu);
+    if (enable_rdo && cur.w <= 8 && cur.h <= 8 && !already_checked_root_ng &&
         (s == 0x3FFFu || (cur.w >= 4 && cur.h >= 4))) {
       uint16_t ng_chosen[64];
       size_t ng_num = 0;
       float ng_gain = 0.0f;
       const float compare_cost =
-          (s == 0x3FFFu) ? kInf : dp->cost[iy][ix];
+          (s == 0x3FFFu) ? kInf : dp_cost(iy, ix);
       solve_non_guillotine_subrect(cur.x0, cur.y0, cur.w, cur.h, compare_cost,
                                    ng_chosen, &ng_num, &ng_gain);
       if (ng_num > 0) {
@@ -1941,7 +1975,7 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
     }
   }
   config.band_qf_stride = 0;
-  if (cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
+  if (cparams.butteraugli_distance <= 15.0f && cparams.resampling <= 1 &&
       cparams.gaborish != Override::kOff &&
       quant_field->xsize() * quant_field->ysize() > 64 && band_qf != nullptr &&
       band_qf[0][0].xsize() > 0 && band_qf[0][0].ysize() > 0) {

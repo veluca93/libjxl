@@ -167,7 +167,8 @@ void CollectExtraBitsIncrease(TreeSamples &tree_samples,
 void FindBestSplit(TreeSamples &tree_samples, float threshold,
                    const std::vector<ModularMultiplierInfo> &mul_info,
                    StaticPropRange initial_static_prop_range,
-                   float fast_decode_multiplier, Tree *tree) {
+                   float fast_decode_multiplier, bool polish_leaves,
+                   Tree *tree) {
   struct NodeInfo {
     size_t pos;
     size_t begin;
@@ -495,6 +496,24 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
       }
       nodes.push_back(
           NodeInfo{(*tree)[pos].lchild, best->pos, end, new_sp_range});
+    } else if (polish_leaves && end > begin && num_predictors > 1) {
+      // Final leaf: re-evaluate allowed predictors without internal-split
+      // change_pred_penalty, keeping only a small tree-token tie-breaker.
+      float best_leaf_bits = base_bits;
+      Predictor best_leaf_pred = (*tree)[pos].predictor;
+      for (size_t pred = 0; pred < num_predictors; ++pred) {
+        const Predictor cand_p = tree_samples.PredictorFromIndex(pred);
+        const float cand_bits =
+            EstimateBits(counts.data() + pred * max_symbols, max_symbols) +
+            tot_extra_bits[pred];
+        float pen = (cand_p == (*tree)[pos].predictor) ? 0.0f : 1.5f;
+        if (cand_p == Predictor::Weighted) pen += 1e-4f;
+        if (cand_bits + pen < best_leaf_bits) {
+          best_leaf_bits = cand_bits + pen;
+          best_leaf_pred = cand_p;
+        }
+      }
+      (*tree)[pos].predictor = best_leaf_pred;
     }
   }
 }
@@ -512,7 +531,8 @@ HWY_EXPORT(FindBestSplit);  // Local function.
 Status ComputeBestTree(TreeSamples &tree_samples, float threshold,
                        const std::vector<ModularMultiplierInfo> &mul_info,
                        StaticPropRange static_prop_range,
-                       float fast_decode_multiplier, Tree *tree) {
+                       float fast_decode_multiplier, Tree *tree,
+                       bool polish_leaves) {
   // TODO(veluca): take into account that different contexts can have different
   // uint configs.
   //
@@ -528,7 +548,7 @@ Status ComputeBestTree(TreeSamples &tree_samples, float threshold,
              std::numeric_limits<uint32_t>::max());
   HWY_DYNAMIC_DISPATCH(FindBestSplit)
   (tree_samples, threshold, mul_info, static_prop_range, fast_decode_multiplier,
-   tree);
+   polish_leaves, tree);
   return true;
 }
 

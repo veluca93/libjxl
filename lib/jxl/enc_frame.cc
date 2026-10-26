@@ -103,17 +103,6 @@ Status ParamsPostInit(CompressParams* p) {
   }
   if (p->resampling <= 0) {
     p->resampling = 1;
-    // For very low bit rates, using 2x2 resampling gives better results on
-    // most photographic images, with an adjusted butteraugli score chosen to
-    // give roughly the same amount of bits per pixel.
-    if (!p->already_downsampled && p->butteraugli_distance >= 10) {
-      // TODO(Jonnyawsom3): Explore 4x4 resampling at distance 25. Lower bpp
-      // but results are inconsistent and images under 4K become far too blurry.
-      p->resampling = 2;
-      // Adding 0.25 balances photo with non-photo, shifting towards lower bpp
-      // to avoid large overshoot while maintaining quality equal to before.
-      p->butteraugli_distance = (p->butteraugli_distance * 0.25) + 0.25;
-    }
   }
   if (p->ec_resampling <= 0) {
     p->ec_resampling = p->resampling;
@@ -291,12 +280,8 @@ void SetProgressiveMode(const CompressParams& cparams,
 uint64_t FrameFlagsFromParams(const CompressParams& cparams) {
   uint64_t flags = 0;
 
-  const float dist = cparams.butteraugli_distance;
-
-  // We don't add noise at low butteraugli distances because the original
-  // noise is stored within the compressed image and adding noise makes things
-  // worse.
-  if (ApplyOverride(cparams.noise, dist >= kMinButteraugliForNoise) ||
+  // Make synthetic noise strictly opt-in unless explicitly requested.
+  if (ApplyOverride(cparams.noise, false) ||
       cparams.photon_noise_iso > 0 ||
       cparams.manual_noise.size() == NoiseParams::kNumNoisePoints) {
     flags |= FrameHeader::kNoise;
@@ -1078,14 +1063,17 @@ Status ComputeVarDCTEncodingData(FrameHeader& frame_header,
                                            linear, opsin, rect, cms, pool,
                                            aux_out));
 
+  enc_state->epf_optimized_in_rdo = false;
   enc_state->orig_opsin = &orig_opsin;
   Status init_status = InitializePassesEncoder(
       frame_header, *opsin, rect, cms, pool, enc_state, enc_modular, aux_out);
   enc_state->orig_opsin = nullptr;
   JXL_RETURN_IF_ERROR(init_status);
 
-  JXL_RETURN_IF_ERROR(
-      ComputeARHeuristics(frame_header, enc_state, orig_opsin, rect, pool));
+  if (!enc_state->epf_optimized_in_rdo) {
+    JXL_RETURN_IF_ERROR(
+        ComputeARHeuristics(frame_header, enc_state, orig_opsin, rect, pool));
+  }
 
   JXL_RETURN_IF_ERROR(ComputeACMetadata(pool, enc_state, enc_modular));
 
@@ -1220,6 +1208,7 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
       hist_params.uint_method = HistogramParams::HybridUintMethod::kBest;
       hist_params.ans_histogram_strategy =
           HistogramParams::ANSHistogramStrategy::kPrecise;
+      hist_params.rdo_context_map = enc_state->band_qf[0][0].xsize() > 0;
     }
     if (enc_state->cparams.speed_tier > SpeedTier::kTortoise) {
       hist_params.lz77_method = HistogramParams::LZ77Method::kNone;

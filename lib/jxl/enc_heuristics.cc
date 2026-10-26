@@ -864,6 +864,7 @@ namespace {
 
 Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                                const CompressParams& cparams,
+                               const FrameHeader& frame_header,
                                const FrameDimensions& frame_dim,
                                bool enable_rdo,
                                const ImageF& initial_quant_field,
@@ -930,22 +931,30 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       float eta_d;
       float a_mid0;
       float a_mid_d;
+      float w0_dslope;
+      float d0_dslope;
     };
-    // Principled from-scratch parametric DCT quantization model for X, Y, B.
+    // Principled from-scratch parametric DCT quantization model for X, Y, B
+    // (including smooth log(d / 1.85) distance slopes for steepness & chroma).
     static constexpr ChannelQMParams kChannelParams[3] = {
         // c = 0 (X):
-        {3068.0f, 0.628f, -0.185f, 0.055f, 2.03f, 0.885f, 1.10f, 1.53f, 0.010f,
-         0.003f, 0.012f, 0.022f, 0.004f},
+        {4380.35547f, 0.615591586f, -0.185f, 0.055f, 2.09565282f, 0.885f, 1.10f,
+         1.53f, 0.010f, 0.003f, 0.012f, 0.022f, 0.004f, -0.0135177998f,
+         0.0230346546f},
         // c = 1 (Y):
-        {597.0f, 0.667f, 0.966f, 0.242f, 1.12f, 1.269f, 0.14f, 0.67f, 0.000f,
-         0.004f, 0.007f, 0.029f, 0.005f},
-        // c = 2 (B):
-        {223.0f, 0.747f, 0.280f, 0.090f, 2.68f, 1.310f, 0.66f, 1.25f, 0.014f,
-         0.004f, 0.014f, 0.026f, 0.005f},
+        {808.807312f, 0.653820932f, 0.966f, 0.242f, 1.7416153f, 1.269f, 0.14f,
+         0.67f, 0.000f, 0.004f, 0.007f, 0.029f, 0.005f, 0.0f, 0.0208702553f},
+        // c = 2 (B): convex 4-metric compromise — preserve LF/MF blue-yellow
+        // contrast for WD_s1 & SSIM2 while retaining S-cone HF roll-off so bits
+        // are not wasted on invisible HF blue grain under BA3 & CVVDP.
+        {290.563446f, 0.715576172f, 0.520f, 0.115f, 2.04612994f, 1.295f, 0.46f,
+         1.02f, 0.011f, 0.004f, 0.012f, 0.026f, 0.005f, -0.000394175004f,
+         0.0368712395f},
     };
 
-    const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 3.5f);
+    const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 15.0f);
     const float t_d = Clamp1((d - 0.5f) / 2.0f, 0.0f, 1.0f);
+    const float s_d = Clamp1(std::log(d * (1.0f / 1.85f)), -1.45f, 1.85f);
     constexpr float kU0 = 0.10f;
 
     auto inv_mult_step = [](float r) -> float {
@@ -957,8 +966,9 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     if (band_qf != nullptr && band_qf[1][0].xsize() > 0 &&
         band_qf[1][0].ysize() > 0 &&
         frame_dim.xsize_blocks * frame_dim.ysize_blocks > 1) {
+      const float hi_d_taper = Clamp1((d - 2.5f) / 7.5f, 0.0f, 1.0f);
       const float w_bd =
-          0.52f * Clamp1(3.5f - d, 0.0f, 1.0f) *
+          0.52f * (1.0f - 0.30f * hi_d_taper) *
           Clamp1((d - 0.35f) * 2.0f, 0.0f, 1.0f);
       if (w_bd > 1e-3f) {
         const float inv_w_bd = 1.0f / std::max(w_bd, 0.15f);
@@ -1037,11 +1047,16 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       }
     }
 
+    const size_t frame_blocks = frame_dim.xsize_blocks * frame_dim.ysize_blocks;
+    const size_t max_bands =
+        (frame_blocks < 1024 || d >= 5.0f)
+            ? 4
+            : ((frame_blocks < 2500 || d >= 2.5f) ? 5 : 8);
     std::vector<QuantEncoding> encodings(kNumQuantTables,
                                          QuantEncoding::Library<0>());
     for (size_t idx = 0; idx < 8; ++idx) {
       const DctTableSpec& spec = kDctTables[idx];
-      const size_t out_bands = spec.num_bands;
+      const size_t out_bands = std::min(spec.num_bands, max_bands);
       const float b = spec.b;
       const float a = spec.a;
       const float tx_decay = std::exp(-0.18f * b);
@@ -1050,14 +1065,19 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
 
       for (size_t c = 0; c < 3; ++c) {
         const ChannelQMParams& p = kChannelParams[c];
+        const float w0_eff =
+            (p.w0_dslope != 0.0f) ? (p.W0 * std::exp(p.w0_dslope * s_d)) : p.W0;
+        const float d0_eff = p.D0 * std::exp(p.d0_dslope * s_d);
+        const float db_eff = p.Db * std::exp(0.0447954014f * s_d);
         const float ln_w_u0 =
-            std::log(p.W0) + p.gamma_d * t_d +
+            std::log(w0_eff) + p.gamma_d * t_d +
             (p.s1 * b + p.s2 * (b / (0.5f + b)) -
              p.rho * (a / (0.20f + b))) *
                 (1.0f - p.beta_blk * t_d);
         const float D =
-            (p.D0 + p.Db * std::log(1.0f + b)) * (1.0f + p.eta_d * t_d);
-        const float kap = p.k0 - p.kb * (b / (0.25f + b));
+            (d0_eff + db_eff * std::log(1.0f + b)) * (1.0f + p.eta_d * t_d);
+        float kap = p.k0 - p.kb * (b / (0.25f + b));
+        kap = Clamp1(kap + (-0.0169299729f) * s_d, -1.5f, 1.8f);
         const float a_mid = (p.a_mid0 - p.a_mid_d * t_d) * tx_decay;
 
         auto eval_ln_w = [&](float u) -> float {
@@ -1106,6 +1126,32 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
 
     JXL_RETURN_IF_ERROR(DequantMatricesSetCustom(dequant_matrices, encodings,
                                                  modular_frame_encoder));
+    if (frame_blocks >= 256 &&
+        frame_header.color_transform == ColorTransform::kXYB &&
+        frame_header.chroma_subsampling.Is444()) {
+      // Align XYB DC channel precision with the 4-metric convex RDO optimum:
+      // refine Y and B DC precision to preserve multi-scale pyramid structure
+      // (SSIM2, CVVDP, WD_s1) and LLF reconstruction while keeping X DC at the
+      // WD_s1-safe operating point.
+      float x_dc_scale =
+          0.757971644f - 0.143665373f * Clamp1((d - 1.0f) / 3.0f, 0.0f, 1.0f);
+      float y_dc_scale =
+          1.17833197f - 0.14812851f * Clamp1((d - 1.0f) / 4.5f, 0.0f, 1.0f);
+      float b_dc_scale =
+          y_dc_scale *
+          (0.957945466f + 0.03f * Clamp1((d - 1.5f) / 4.0f, 0.0f, 1.0f));
+      const float all_m = std::exp(0.00649557495f * s_d);
+      x_dc_scale *= all_m * std::exp(-0.0357682817f * s_d);
+      y_dc_scale *= all_m;
+      b_dc_scale *= all_m * std::exp(-0.00723599782f * s_d);
+      const float custom_inv_dc[3] = {
+          kInvDCQuant[0] * x_dc_scale,
+          kInvDCQuant[1] * y_dc_scale,
+          kInvDCQuant[2] * b_dc_scale,
+      };
+      JXL_RETURN_IF_ERROR(DequantMatricesSetCustomDC(
+          memory_manager, dequant_matrices, custom_inv_dc));
+    }
   }
   return true;
 }
@@ -1950,9 +1996,8 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
       cparams.speed_tier <= SpeedTier::kSquirrel &&
       !cparams.disable_perceptual_optimizations &&
       cparams.butteraugli_distance >= 0.35f &&
-      cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
+      cparams.butteraugli_distance <= 15.0f && cparams.resampling <= 1 &&
       cparams.ec_resampling <= 1 && cparams.gaborish != Override::kOff &&
-      cparams.epf != 3 &&
       enc_state->progressive_splitter.GetNumPasses() == 1;
   if (frame_header.loop_filter.epf_iters == 0 && ar_enable_rdo) {
     FillPlane(static_cast<uint8_t>(0), &epf_sharpness, Rect(epf_sharpness));
@@ -2440,7 +2485,8 @@ Status BuildPass1TokenCostModel(const FrameHeader& frame_header,
 Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
                                       const Image3F& opsin, const Rect& rect,
                                       ThreadPool* pool,
-                                      PassesEncoderState* enc_state) {
+                                      PassesEncoderState* enc_state,
+                                      bool pilot_coeffs_ready) {
   if (enc_state->token_cost_model == nullptr || enc_state->streaming_mode ||
       !enc_state->initialize_global_state ||
       enc_state->progressive_splitter.GetNumPasses() != 1) {
@@ -2456,17 +2502,19 @@ Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
   std::unique_ptr<AcTokenCostModel> frozen_tcm =
       std::move(enc_state->token_cost_model);
 
-  JXL_ASSIGN_OR_RETURN(
-      Image3F pilot_dc,
-      Image3F::Create(memory_manager, frame_dim.xsize_blocks,
-                      frame_dim.ysize_blocks));
-  const auto compute_pilot_coeffs = [&](size_t group_idx,
-                                        size_t /*thread*/) -> Status {
-    return ComputeCoefficients(group_idx, enc_state, opsin, rect, &pilot_dc);
-  };
-  JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups,
-                                ThreadPool::NoInit, compute_pilot_coeffs,
-                                "Pass2A PilotCoeffs"));
+  if (!pilot_coeffs_ready) {
+    JXL_ASSIGN_OR_RETURN(
+        Image3F pilot_dc,
+        Image3F::Create(memory_manager, frame_dim.xsize_blocks,
+                        frame_dim.ysize_blocks));
+    const auto compute_pilot_coeffs = [&](size_t group_idx,
+                                          size_t /*thread*/) -> Status {
+      return ComputeCoefficients(group_idx, enc_state, opsin, rect, &pilot_dc);
+    };
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups,
+                                  ThreadPool::NoInit, compute_pilot_coeffs,
+                                  "Pass2A PilotCoeffs"));
+  }
 
   // Compute exact Pass-2 coefficient scan orders on pilot coeffs.
   frozen_tcm->coeff_orders.resize(kCoeffOrderMaxSize);
@@ -2478,6 +2526,54 @@ Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
       cparams.speed_tier, *enc_state->coeffs[0], shared.ac_strategy, frame_dim,
       pilot_used_orders, /*prev_used_acs=*/0, kAllOrdersMask,
       used_orders_info.second, frozen_tcm->coeff_orders.data()));
+
+  // Refresh Pass-2 strategy and qf residual bit prices from Pass-2 layout.
+  {
+    size_t strat_count[27] = {};
+    size_t qf_res_count[512] = {};
+    size_t total_first_blocks = 0;
+    for (size_t by = 0; by < frame_dim.ysize_blocks; ++by) {
+      AcStrategyRow acs_row = shared.ac_strategy.ConstRow(by);
+      const int32_t* qf_row = shared.raw_quant_field.ConstRow(by);
+      const int32_t* qf_top =
+          (by > 0) ? shared.raw_quant_field.ConstRow(by - 1) : nullptr;
+      for (size_t bx = 0; bx < frame_dim.xsize_blocks; ++bx) {
+        AcStrategy acs = acs_row[bx];
+        if (!acs.IsFirstBlock()) continue;
+        const uint8_t st = acs.RawStrategy();
+        if (st < 27) strat_count[st]++;
+        int32_t pred_qf = qf_row[bx];
+        if (bx > 0 && by > 0) {
+          pred_qf = (qf_row[bx - 1] + qf_top[bx] + 1) >> 1;
+        } else if (bx > 0) {
+          pred_qf = qf_row[bx - 1];
+        } else if (by > 0) {
+          pred_qf = qf_top[bx];
+        }
+        const int32_t res_idx =
+            Clamp1<int32_t>(qf_row[bx] - pred_qf + 256, 0, 511);
+        qf_res_count[res_idx]++;
+        total_first_blocks++;
+      }
+    }
+    const float fb_denom = static_cast<float>(total_first_blocks) + 13.5f;
+    for (size_t st = 0; st < 27; ++st) {
+      frozen_tcm->acs_strategy_bits[st] = -std::log2(
+          (static_cast<float>(strat_count[st]) + 0.5f) / fb_denom);
+    }
+    double qf_bits_sum = 0.0;
+    if (total_first_blocks > 0) {
+      const double inv_fb = 1.0 / static_cast<double>(total_first_blocks);
+      for (size_t i = 0; i < 512; ++i) {
+        if (qf_res_count[i] > 0) {
+          const double p = static_cast<double>(qf_res_count[i]) * inv_fb;
+          qf_bits_sum -= p * std::log2(p);
+        }
+      }
+    }
+    frozen_tcm->qf_block_bits =
+        Clamp1(static_cast<float>(qf_bits_sum), 1.0f, 3.8f);
+  }
 
   // Compute exact Pass-2 block context map (1D DP qf_thresholds + JS-div).
   frozen_tcm->block_ctx_map = BlockCtxMap();
@@ -2491,7 +2587,9 @@ Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
   }
 
   // Tokenize pilot coefficients on exact Pass-2 orders and block_ctx_map.
-  ZeroFillImage(&shared.quant_dc);
+  if (!pilot_coeffs_ready) {
+    ZeroFillImage(&shared.quant_dc);
+  }
   if (frozen_tcm->pass1_nzeros.xsize() == 0) {
     JXL_ASSIGN_OR_RETURN(
         frozen_tcm->pass1_nzeros,
@@ -2670,8 +2768,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   const bool enable_rdo =
       cparams.speed_tier <= SpeedTier::kSquirrel &&
       !cparams.disable_perceptual_optimizations &&
+      !shared.metadata->m.color_encoding.IsGray() &&
       cparams.butteraugli_distance >= 0.35f &&
-      cparams.butteraugli_distance < 3.5f && cparams.resampling <= 1 &&
+      cparams.butteraugli_distance <= 15.0f && cparams.resampling <= 1 &&
       cparams.ec_resampling <= 1 && cparams.gaborish != Override::kOff &&
       cparams.epf != 3 &&
       enc_state->progressive_splitter.GetNumPasses() == 1 &&
@@ -2729,7 +2828,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   if (frame_header.loop_filter.gab) {
     // Changing the weight here to 0.99f would help to reduce ringing in
     // generation loss.
-    const float gab_w = enable_rdo ? 0.988f : 1.0f;
+    const float gab_w =
+        enable_rdo
+            ? (0.988f + 0.006f * Clamp1((cparams.butteraugli_distance - 2.5f) /
+                                            5.0f,
+                                        0.0f, 1.0f))
+            : 1.0f;
     float weight[3] = {
         gab_w,
         gab_w,
@@ -2740,8 +2844,10 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
   if (initialize_global_state) {
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
-        memory_manager, cparams, frame_dim, enable_rdo, initial_quant_field,
-        /*band_qf=*/nullptr, modular_frame_encoder, &matrices));
+        memory_manager, cparams, frame_header, frame_dim, enable_rdo,
+        initial_quant_field, /*band_qf=*/nullptr, modular_frame_encoder,
+        &matrices));
+    quantizer.RecomputeFromGlobalScale();
   }
 
   enc_state->x_qm_multiplier =
@@ -2758,74 +2864,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       enc_state->x_qm_multiplier, enc_state->b_qm_multiplier, quantizer.Scale(),
       quantizer.InvGlobalScale()));
 
-  const size_t acs_tile_dim_blocks =
-      enable_rdo ? kGroupDimInBlocks : kEncTileDimInBlocks;
-  auto process_tile = [&](const uint32_t tid, const size_t thread) -> Status {
-    size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks);
-    size_t tx = tid % n_enc_tiles;
-    size_t ty = tid / n_enc_tiles;
-    size_t gby0 = ty * acs_tile_dim_blocks;
-    size_t gby1 =
-        std::min((ty + 1) * acs_tile_dim_blocks, frame_dim.ysize_blocks);
-    size_t gbx0 = tx * acs_tile_dim_blocks;
-    size_t gbx1 =
-        std::min((tx + 1) * acs_tile_dim_blocks, frame_dim.xsize_blocks);
-    Rect group_rect(gbx0, gby0, gbx1 - gbx0, gby1 - gby0);
-
-    // For speeds up to Wombat, we only compute the color correlation map
-    // once we know the transform type and the quantization map.
-    if (cparams.speed_tier <= SpeedTier::kSquirrel) {
-      if (enable_rdo) {
-        quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
-                                    &raw_quant_field);
-      }
-      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
-        size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
-        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
-          size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
-          Rect r(bx0, by0, bx1 - bx0, by1 - by0);
-          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-              r, *opsin, rect, matrices,
-              /*ac_strategy=*/nullptr,
-              /*raw_quant_field=*/enable_rdo ? &raw_quant_field : nullptr,
-              /*quantizer=*/enable_rdo ? &quantizer : nullptr, /*fast=*/false,
-              thread, &cmap,
-              /*shrink_towards_zero=*/!enable_rdo ||
-                  cparams.noise == Override::kOn,
-              enable_rdo ? enc_state->x_qm_multiplier : 1.0f,
-              enable_rdo ? enc_state->b_qm_multiplier : 1.0f));
-        }
-      }
-    }
-
-    // Choose block sizes and adjust the quant field in the RDO loop.
-    JXL_RETURN_IF_ERROR(
-        acs_heuristics.ProcessRect(group_rect, cmap, &ac_strategy, thread));
-
-    quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
-                                &raw_quant_field);
-
-    // Compute a non-default CfL map if we are at Hare speed, or slower.
-    if (cparams.speed_tier <= SpeedTier::kHare) {
-      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
-        size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
-        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
-          size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
-          Rect r(bx0, by0, bx1 - bx0, by1 - by0);
-          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
-              r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
-              &quantizer, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat,
-              thread, &cmap,
-              /*shrink_towards_zero=*/!enable_rdo ||
-                  cparams.noise == Override::kOn,
-              enable_rdo ? enc_state->x_qm_multiplier : 1.0f,
-              enable_rdo ? enc_state->b_qm_multiplier : 1.0f,
-              cparams.butteraugli_distance));
-        }
-      }
-    }
-    return true;
-  };
   const bool use_two_pass_rdo =
       enable_rdo && !streaming_mode && cparams.use_full_image_heuristics;
   ImageF initial_quant_field_base;
@@ -2853,18 +2891,130 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     }
   }
 
-  size_t num_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks) *
-                     DivCeil(frame_dim.ysize_blocks, acs_tile_dim_blocks);
+  auto restore_tile_quant = [&](const Rect& r) -> Status {
+    JXL_RETURN_IF_ERROR(
+        CopyImageTo(r, initial_quant_field_base, r, &initial_quant_field));
+    for (size_t c = 0; c < 3; ++c) {
+      for (size_t s = 0; s < 4; ++s) {
+        if (band_qf_base[c * 4 + s].xsize() > 0 &&
+            band_qf_base[c * 4 + s].ysize() > 0) {
+          JXL_RETURN_IF_ERROR(CopyImageTo(r, band_qf_base[c * 4 + s], r,
+                                          &enc_state->band_qf[c][s]));
+        }
+      }
+    }
+    return true;
+  };
+
+  // Schedule independent 256x256px AC groups in parallel, and iterate the 4x4
+  // 64x64px CfL tiles inside each AC group in causal row-major order so
+  // ClampedGradient CfL prediction is 100% deterministic and race-free while
+  // preserving full arbitrary-origin block placement inside each AC group.
+  const size_t acs_tile_dim_blocks =
+      enable_rdo ? kGroupDimInBlocks : kEncTileDimInBlocks;
+  const size_t n_groups_x =
+      DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks);
+  const size_t num_groups =
+      n_groups_x * DivCeil(frame_dim.ysize_blocks, acs_tile_dim_blocks);
+  auto process_tile = [&](const uint32_t gid, const size_t thread) -> Status {
+    const size_t gx = gid % n_groups_x;
+    const size_t gy = gid / n_groups_x;
+    const size_t gby0 = gy * acs_tile_dim_blocks;
+    const size_t gby1 =
+        std::min((gy + 1) * acs_tile_dim_blocks, frame_dim.ysize_blocks);
+    const size_t gbx0 = gx * acs_tile_dim_blocks;
+    const size_t gbx1 =
+        std::min((gx + 1) * acs_tile_dim_blocks, frame_dim.xsize_blocks);
+    const Rect group_rect(gbx0, gby0, gbx1 - gbx0, gby1 - gby0);
+
+    if (cparams.speed_tier <= SpeedTier::kSquirrel) {
+      if (enable_rdo) {
+        quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                    &raw_quant_field);
+      }
+      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+        const size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+          const size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+          const Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+              r, *opsin, rect, matrices,
+              /*ac_strategy=*/nullptr,
+              /*raw_quant_field=*/enable_rdo ? &raw_quant_field : nullptr,
+              /*quantizer=*/enable_rdo ? &quantizer : nullptr, /*fast=*/false,
+              thread, &cmap,
+              /*shrink_towards_zero=*/!enable_rdo ||
+                  cparams.noise == Override::kOn,
+              enc_state->x_qm_multiplier, enc_state->b_qm_multiplier,
+              cparams.butteraugli_distance));
+        }
+      }
+    }
+
+    JXL_RETURN_IF_ERROR(
+        acs_heuristics.ProcessRect(group_rect, cmap, &ac_strategy, thread));
+    quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                &raw_quant_field);
+
+    if (cparams.speed_tier <= SpeedTier::kHare) {
+      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+        const size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+          const size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+          const Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+          JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+              r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+              &quantizer, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat,
+              thread, &cmap,
+              /*shrink_towards_zero=*/!enable_rdo ||
+                  cparams.noise == Override::kOn,
+              enc_state->x_qm_multiplier, enc_state->b_qm_multiplier,
+              cparams.butteraugli_distance));
+        }
+      }
+    }
+    return true;
+  };
+
   const auto prepare = [&](const size_t num_threads) -> Status {
     JXL_RETURN_IF_ERROR(acs_heuristics.PrepareForThreads(num_threads));
     JXL_RETURN_IF_ERROR(cfl_heuristics.PrepareForThreads(num_threads));
     return true;
   };
   JXL_RETURN_IF_ERROR(
-      RunOnPool(pool, 0, num_tiles, prepare, process_tile, "Enc Heuristics"));
+      RunOnPool(pool, 0, num_groups, prepare, process_tile, "Enc Heuristics"));
 
   std::unique_ptr<AcTokenCostModel> token_cost_model;
   if (use_two_pass_rdo) {
+    if (initialize_global_state && cparams.butteraugli_distance > 1.05f) {
+      JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
+          memory_manager, cparams, frame_header, frame_dim, enable_rdo,
+          initial_quant_field, enc_state->band_qf, modular_frame_encoder,
+          &matrices));
+      quantizer.RecomputeFromGlobalScale();
+      const uint32_t all_acs_64_mask =
+          (1u << static_cast<uint32_t>(AcStrategyType::DCT128X128)) - 1u;
+      JXL_RETURN_IF_ERROR(
+          matrices.EnsureComputed(memory_manager, all_acs_64_mask));
+      for (size_t c = 0; c < 3; ++c) {
+        const float* dct8_matrix = matrices.Matrix(AcStrategyType::DCT, c);
+        const float m_ref = dct8_matrix[1];
+        constexpr float kBetaCsf = 0.08f;
+        float csf_sum = 0.0f;
+        for (size_t i = 0; i < 64; ++i) {
+          const float m_uv =
+              (i == 0) ? m_ref : std::max(dct8_matrix[i], m_ref * 0.5f);
+          const float w_uv = std::pow(m_ref / m_uv, kBetaCsf);
+          acs_heuristics.config.csf_w[c][i] = w_uv;
+          csf_sum += w_uv;
+        }
+        const float csf_norm = 61.8f / csf_sum;
+        for (size_t i = 0; i < 64; ++i) {
+          acs_heuristics.config.csf_w[c][i] *= csf_norm;
+        }
+      }
+    }
+
     token_cost_model = jxl::make_unique<AcTokenCostModel>();
     JXL_RETURN_IF_ERROR(BuildPass1TokenCostModel(
         frame_header, enc_state, *opsin, rect, acs_heuristics.config.cost_delta,
@@ -2882,32 +3032,78 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       }
     }
     acs_heuristics.config.token_cost_model = token_cost_model.get();
+    uint32_t disabled_tables_mask = 0;
+    if (initialize_global_state) {
+      size_t table_instances[kNumQuantTables] = {};
+      size_t table_blocks[kNumQuantTables] = {};
+      for (size_t y = 0; y < ac_strategy.ysize(); ++y) {
+        AcStrategyRow row = ac_strategy.ConstRow(y);
+        for (size_t x = 0; x < ac_strategy.xsize(); ++x) {
+          AcStrategy acs = row[x];
+          if (!acs.IsFirstBlock()) continue;
+          const size_t st = static_cast<size_t>(acs.Strategy());
+          const size_t t_idx = static_cast<size_t>(kAcStrategyToQuantTableMap[st]);
+          table_instances[t_idx]++;
+          table_blocks[t_idx] += acs.covered_blocks_x() * acs.covered_blocks_y();
+        }
+      }
+      const auto& encs = matrices.encodings();
+      const float d_prune = std::max(0.35f, cparams.butteraugli_distance);
+      for (size_t t = 1; t < kNumQuantTables && t < encs.size(); ++t) {
+        if (encs[t].mode != QuantEncoding::kQuantModeDCT) continue;
+        const float tax_bits =
+            3.0f + 48.0f * static_cast<float>(encs[t].dct_params.num_distance_bands);
+        const float est_gain =
+            2.5f * static_cast<float>(table_instances[t]) +
+            (3.2f / (0.5f + 0.6f * d_prune)) * static_cast<float>(table_blocks[t]);
+        if (est_gain < 0.75f * tax_bits) {
+          disabled_tables_mask |= (1u << t);
+        }
+      }
+    }
+    acs_heuristics.config.disabled_tables_mask = disabled_tables_mask;
 
-    auto process_tile_pass2 = [&](const uint32_t tid,
+    auto process_tile_pass2 = [&](const uint32_t gid,
                                   const size_t thread) -> Status {
-      size_t n_enc_tiles = DivCeil(frame_dim.xsize_blocks, acs_tile_dim_blocks);
-      size_t tx = tid % n_enc_tiles;
-      size_t ty = tid / n_enc_tiles;
-      size_t gby0 = ty * acs_tile_dim_blocks;
-      size_t gby1 =
-          std::min((ty + 1) * acs_tile_dim_blocks, frame_dim.ysize_blocks);
-      size_t gbx0 = tx * acs_tile_dim_blocks;
-      size_t gbx1 =
-          std::min((tx + 1) * acs_tile_dim_blocks, frame_dim.xsize_blocks);
-      Rect group_rect(gbx0, gby0, gbx1 - gbx0, gby1 - gby0);
+      const size_t gx = gid % n_groups_x;
+      const size_t gy = gid / n_groups_x;
+      const size_t gby0 = gy * acs_tile_dim_blocks;
+      const size_t gby1 =
+          std::min((gy + 1) * acs_tile_dim_blocks, frame_dim.ysize_blocks);
+      const size_t gbx0 = gx * acs_tile_dim_blocks;
+      const size_t gbx1 =
+          std::min((gx + 1) * acs_tile_dim_blocks, frame_dim.xsize_blocks);
+      const Rect group_rect(gbx0, gby0, gbx1 - gbx0, gby1 - gby0);
+
+      int32_t prev_x[4][4] = {};
+      int32_t prev_b[4][4] = {};
+      for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+        const size_t ty = by0 / kEncTileDimInBlocks;
+        const size_t ly = (by0 - gby0) / kEncTileDimInBlocks;
+        for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+          const size_t tx = bx0 / kEncTileDimInBlocks;
+          const size_t lx = (bx0 - gbx0) / kEncTileDimInBlocks;
+          prev_x[ly][lx] = cmap.ytox_map.ConstRow(ty)[tx];
+          prev_b[ly][lx] = cmap.ytob_map.ConstRow(ty)[tx];
+        }
+      }
 
       JXL_RETURN_IF_ERROR(
           acs_heuristics.ProcessRect(group_rect, cmap, &ac_strategy, thread));
-
       quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
                                   &raw_quant_field);
 
       if (cparams.speed_tier <= SpeedTier::kHare) {
+        int32_t max_cfl_delta = 0;
         for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
-          size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+          const size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+          const size_t ty = by0 / kEncTileDimInBlocks;
+          const size_t ly = (by0 - gby0) / kEncTileDimInBlocks;
           for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
-            size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
-            Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+            const size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+            const size_t tx = bx0 / kEncTileDimInBlocks;
+            const size_t lx = (bx0 - gbx0) / kEncTileDimInBlocks;
+            const Rect r(bx0, by0, bx1 - bx0, by1 - by0);
             JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
                 r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
                 &quantizer, /*fast=*/cparams.speed_tier >= SpeedTier::kWombat,
@@ -2915,14 +3111,41 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                 /*shrink_towards_zero=*/cparams.noise == Override::kOn,
                 enc_state->x_qm_multiplier, enc_state->b_qm_multiplier,
                 cparams.butteraugli_distance));
+            max_cfl_delta = std::max(
+                max_cfl_delta,
+                std::max(std::abs(int32_t{cmap.ytox_map.ConstRow(ty)[tx]} -
+                                  prev_x[ly][lx]),
+                         std::abs(int32_t{cmap.ytob_map.ConstRow(ty)[tx]} -
+                                  prev_b[ly][lx])));
+          }
+        }
+        if (cparams.speed_tier <= SpeedTier::kSquirrel && max_cfl_delta >= 5) {
+          JXL_RETURN_IF_ERROR(restore_tile_quant(group_rect));
+          JXL_RETURN_IF_ERROR(acs_heuristics.ProcessRect(
+              group_rect, cmap, &ac_strategy, thread));
+          quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                      &raw_quant_field);
+          for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
+            const size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
+            for (size_t bx0 = gbx0; bx0 < gbx1; bx0 += kEncTileDimInBlocks) {
+              const size_t bx1 = std::min(bx0 + kEncTileDimInBlocks, gbx1);
+              const Rect r(bx0, by0, bx1 - bx0, by1 - by0);
+              JXL_RETURN_IF_ERROR(cfl_heuristics.ComputeTile(
+                  r, *opsin, rect, matrices, &ac_strategy, &raw_quant_field,
+                  &quantizer, /*fast=*/false, thread, &cmap,
+                  /*shrink_towards_zero=*/cparams.noise == Override::kOn,
+                  enc_state->x_qm_multiplier, enc_state->b_qm_multiplier,
+                  cparams.butteraugli_distance));
+            }
           }
         }
       }
       return true;
     };
-    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, prepare,
+    JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_groups, prepare,
                                   process_tile_pass2, "Enc Heuristics P2"));
     acs_heuristics.config.token_cost_model = nullptr;
+    acs_heuristics.config.disabled_tables_mask = 0;
   }
 
   JXL_RETURN_IF_ERROR(acs_heuristics.Finalize(frame_dim, ac_strategy, aux_out));
@@ -2942,15 +3165,26 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         used_acs_mask |= (1u << st);
       }
     }
-    if (enable_rdo && cparams.butteraugli_distance > 1.05f) {
+    if (!use_two_pass_rdo && enable_rdo &&
+        cparams.butteraugli_distance > 1.05f) {
       JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
-          memory_manager, cparams, frame_dim, enable_rdo, initial_quant_field,
-          enc_state->band_qf, modular_frame_encoder, &matrices));
+          memory_manager, cparams, frame_header, frame_dim, enable_rdo,
+          initial_quant_field, enc_state->band_qf, modular_frame_encoder,
+          &matrices));
+      quantizer.RecomputeFromGlobalScale();
     }
-    matrices.PruneUnusedEncodings(used_tables_mask);
+    const bool defer_prune =
+        use_two_pass_rdo && enc_state->progressive_splitter.GetNumPasses() == 1;
+    if (!defer_prune) {
+      matrices.PruneUnusedEncodings(used_tables_mask);
+    }
     if (enable_rdo) {
+      const uint32_t ensure_mask =
+          defer_prune
+              ? ((1u << static_cast<uint32_t>(AcStrategyType::DCT128X128)) - 1u)
+              : used_acs_mask;
       JXL_RETURN_IF_ERROR(
-          matrices.EnsureComputed(memory_manager, used_acs_mask));
+          matrices.EnsureComputed(memory_manager, ensure_mask));
     }
   }
 

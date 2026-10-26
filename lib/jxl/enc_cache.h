@@ -147,6 +147,12 @@ struct PassesEncoderState {
   // target quantizer fields at 8x8 block resolution for intra-block AQ and RDO.
   ImageF band_qf[3][4];
 
+  // Snapshot of pre-closed-loop raw_quant_field so ContinueSaturatedBlock uses
+  // identical clipping continuation across DC extraction and final AC coding.
+  ImageI base_raw_quant_field;
+  ImageSB rdoq_level_field;
+  bool epf_optimized_in_rdo = false;
+
   std::unique_ptr<AcTokenCostModel> token_cost_model;
 
   JxlMemoryManager* memory_manager() const { return shared.memory_manager; }

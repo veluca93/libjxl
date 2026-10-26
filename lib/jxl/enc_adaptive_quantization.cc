@@ -386,11 +386,13 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
         }
 
         const float size_gate = (xsize * ysize > 64) ? 1.0f : 0.0f;
+        const float hi_d_taper =
+            Clamp1((butteraugli_target - 2.5f) / 7.5f, 0.0f, 1.0f);
         const float dist_w =
-            size_gate * 0.28f * Clamp1(3.5f - butteraugli_target, 0.0f, 1.0f) *
+            size_gate * 0.28f * (1.0f - 0.35f * hi_d_taper) *
             Clamp1((butteraugli_target - 0.55f) * 2.2f, 0.0f, 1.0f);
         const float band_dist_w =
-            size_gate * 0.52f * Clamp1(3.5f - butteraugli_target, 0.0f, 1.0f) *
+            size_gate * 0.52f * (1.0f - 0.30f * hi_d_taper) *
             Clamp1((butteraugli_target - 0.35f) * 2.0f, 0.0f, 1.0f);
         const float edge_loc_y =
             Clamp1(E[1][0] / (E0_harm[1] + 1e-4f), 1.0f, 2.5f);

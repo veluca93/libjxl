@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -231,7 +232,7 @@ StatusOr<Tree> LearnTree(
   JXL_RETURN_IF_ERROR(ComputeBestTree(
       tree_samples, options.splitting_heuristics_node_threshold * required_cost,
       multiplier_info, static_prop_range, options.fast_decode_multiplier,
-      &tree));
+      &tree, options.polish_leaves));
   return tree;
 }
 
@@ -683,6 +684,122 @@ StatusOr<Tree> LearnTree(
   JXL_ASSIGN_OR_RETURN(Tree tree,
                        LearnTree(std::move(tree_samples), total_pixels,
                                  options[start], multiplier_info, range));
+
+  if (options[start].polish_leaves &&
+      options[start].wp_tree_mode == ModularOptions::TreeMode::kNoWP &&
+      tree.size() > 1) {
+    std::vector<size_t> leaf_nodes;
+    for (size_t n = 0; n < tree.size(); ++n) {
+      if (tree[n].property == -1) {
+        tree[n].lchild = static_cast<int>(leaf_nodes.size());
+        leaf_nodes.push_back(n);
+      }
+    }
+    const size_t num_leaves = leaf_nodes.size();
+    std::vector<std::vector<int32_t>> leaf_res(num_leaves);
+    std::vector<uint8_t> leaf_overflow(num_leaves, 0);
+    for (size_t i = start; i < stop; ++i) {
+      const Image &img = images[i];
+      if (img.w == 0 || img.h == 0 || img.channel.empty()) continue;
+      for (size_t c = 0; c < img.channel.size(); ++c) {
+        if (c >= img.nb_meta_channels &&
+            (img.channel[c].w > options[i].max_chan_size ||
+             img.channel[c].h > options[i].max_chan_size)) {
+          break;
+        }
+        const Channel &ch = img.channel[c];
+        if (!ch.w || !ch.h) continue;
+        std::array<pixel_type, kNumStaticProperties> static_props = {
+            {static_cast<pixel_type>(c), static_cast<pixel_type>(i)}};
+        size_t num_props = 0;
+        bool use_wp = false;
+        bool wp_only = false;
+        bool grad_only = false;
+        FlatTree ft = FilterTree(tree, static_props, &num_props, &use_wp,
+                                 &wp_only, &grad_only);
+        if (use_wp) continue;
+        MATreeLookup lookup(ft);
+        Properties props(num_props);
+        const size_t ref_w = (num_props > kNumNonrefProperties)
+                                 ? (num_props - kNumNonrefProperties)
+                                 : 0;
+        JXL_ASSIGN_OR_RETURN(
+            Channel refs, Channel::Create(img.memory_manager(), ref_w, ch.w));
+        const ptrdiff_t onerow = ch.plane.PixelsPerRow();
+        for (size_t y = 0; y < ch.h; ++y) {
+          const pixel_type *JXL_RESTRICT p = ch.Row(y);
+          PrecomputeReferences(ch, y, img, c, &refs);
+          InitPropsRow(&props, static_props, y);
+          for (size_t x = 0; x < ch.w; ++x) {
+            const PredictionResult res =
+                PredictTreeNoWP(&props, ch.w, p + x, onerow, x, y, lookup, refs);
+            if (res.context < 0 ||
+                static_cast<size_t>(res.context) >= num_leaves ||
+                res.multiplier != 1) {
+              continue;
+            }
+            const size_t ctx_idx = static_cast<size_t>(res.context);
+            const int64_t r64 =
+                static_cast<int64_t>(p[x]) - static_cast<int64_t>(res.guess);
+            if (r64 < -1000000 || r64 > 1000000) {
+              leaf_overflow[ctx_idx] = 1;
+            } else {
+              leaf_res[ctx_idx].push_back(static_cast<int32_t>(r64));
+            }
+          }
+        }
+      }
+    }
+
+    const HybridUintConfig cfgs[2] = {HybridUintConfig(4, 2, 0),
+                                      HybridUintConfig(4, 1, 2)};
+    auto eval_offset_cost = [&](const std::vector<int32_t> &rs,
+                                int32_t off) -> double {
+      const double inv_n = 1.0 / static_cast<double>(rs.size());
+      const double min_p = 1.0 / static_cast<double>(ANS_TAB_SIZE);
+      double best_c = std::numeric_limits<double>::max();
+      for (const HybridUintConfig &cfg : cfgs) {
+        uint32_t counts[256] = {};
+        uint64_t extra = 0;
+        for (int32_t r : rs) {
+          uint32_t tok = 0;
+          uint32_t nb = 0;
+          uint32_t eb = 0;
+          cfg.Encode(PackSigned(r - off), &tok, &nb, &eb);
+          counts[std::min<uint32_t>(tok, 255u)]++;
+          extra += nb;
+        }
+        double ent = static_cast<double>(extra);
+        for (size_t s = 0; s < 256; ++s) {
+          const uint32_t cnt = counts[s];
+          if (cnt == 0 || cnt == rs.size()) continue;
+          const double prob = std::max(min_p, static_cast<double>(cnt) * inv_n);
+          ent -= static_cast<double>(cnt) * std::log2(prob);
+        }
+        best_c = std::min(best_c, ent);
+      }
+      return best_c;
+    };
+
+    for (size_t lid = 0; lid < num_leaves; ++lid) {
+      const size_t node_idx = leaf_nodes[lid];
+      if (leaf_overflow[lid] || tree[node_idx].multiplier != 1 ||
+          leaf_res[lid].size() < 24) {
+        continue;
+      }
+      const double cost0 = eval_offset_cost(leaf_res[lid], 0);
+      double best_cost = cost0 - 5.5;
+      int32_t best_off = 0;
+      for (int32_t off : {-4, -3, -2, -1, 1, 2, 3, 4}) {
+        const double c = eval_offset_cost(leaf_res[lid], off);
+        if (c < best_cost) {
+          best_cost = c;
+          best_off = off;
+        }
+      }
+      tree[node_idx].predictor_offset = best_off;
+    }
+  }
   return tree;
 }
 

@@ -112,6 +112,7 @@ struct HistogramParams {
   bool streaming_mode = false;
   bool add_missing_symbols = false;
   bool add_fixed_histograms = false;
+  bool rdo_context_map = false;
 };
 
 struct Histogram {

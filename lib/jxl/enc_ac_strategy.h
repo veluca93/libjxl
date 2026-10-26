@@ -58,6 +58,7 @@ struct ACSConfig {
   float cost_delta;
   float zeros_mul;
   float butteraugli_distance;
+  uint32_t disabled_tables_mask = 0;
   const float& Pixel(size_t c, size_t x, size_t y) const {
     return src_rows[c][y * src_stride + x];
   }

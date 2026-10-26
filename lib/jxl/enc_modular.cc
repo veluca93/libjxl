@@ -1205,6 +1205,16 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
             trees[chunk],
             LearnTree(stream_images_.data(), stream_options_.data(), start,
                       stop, multiplier_info));
+        if (stream_options_[start].wp_tree_mode ==
+                ModularOptions::TreeMode::kNoWP ||
+            stream_options_[start].wp_tree_mode ==
+                ModularOptions::TreeMode::kGradientOnly) {
+          for (const auto& node : trees[chunk]) {
+            JXL_ENSURE(node.property != static_cast<int>(kWPProp));
+            JXL_ENSURE(node.property != -1 ||
+                       node.predictor != Predictor::Weighted);
+          }
+        }
       } else {
         size_t total_pixels = 0;
         for (size_t i = start; i < stop; i++) {
@@ -1265,7 +1275,47 @@ Status ModularFrameEncoder::ComputeTree(ThreadPool* pool) {
   return true;
 }
 
-Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
+Status ModularFrameEncoder::LearnVarDCTDCTree(Tree* out_tree) const {
+  uint32_t start = ModularStreamId::VarDCTDC(0).ID(frame_dim_);
+  uint32_t stop = ModularStreamId::ModularDC(0).ID(frame_dim_);
+  while (start < stop && stream_images_[start].empty()) ++start;
+  while (start < stop && stream_images_[stop - 1].empty()) --stop;
+  Tree raw_tree;
+  if (start >= stop) {
+    raw_tree = {PropertyDecisionNode::Leaf(Predictor::Gradient)};
+  } else if (stream_options_[start].tree_kind ==
+             ModularOptions::TreeKind::kLearn) {
+    JXL_ASSIGN_OR_RETURN(
+        raw_tree,
+        LearnTree(stream_images_.data(), stream_options_.data(), start, stop));
+    if (stream_options_[start].wp_tree_mode ==
+            ModularOptions::TreeMode::kNoWP ||
+        stream_options_[start].wp_tree_mode ==
+            ModularOptions::TreeMode::kGradientOnly) {
+      for (const auto& node : raw_tree) {
+        JXL_ENSURE(node.property != static_cast<int>(kWPProp));
+        JXL_ENSURE(node.property != -1 ||
+                   node.predictor != Predictor::Weighted);
+      }
+    }
+  } else {
+    size_t total_pixels = 0;
+    for (size_t i = start; i < stop; ++i) {
+      for (const Channel& ch : stream_images_[i].channel) {
+        total_pixels += ch.w * ch.h;
+      }
+    }
+    total_pixels = std::max<size_t>(total_pixels, 1);
+    raw_tree =
+        PredefinedTree(stream_options_[start].tree_kind, total_pixels, 8, 0);
+  }
+  std::vector<Token> dummy_tokens;
+  JXL_RETURN_IF_ERROR(TokenizeTree(raw_tree, &dummy_tokens, out_tree));
+  JXL_ENSURE(raw_tree.size() == out_tree->size());
+  return true;
+}
+
+Status ModularFrameEncoder::ComputeTokensInternal(ThreadPool* pool) {
   size_t num_streams = stream_images_.size();
   stream_headers_.resize(num_streams);
   tokens_.resize(num_streams);
@@ -1281,6 +1331,187 @@ Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
   };
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_streams, ThreadPool::NoInit,
                                 process_stream, "ComputeTokens"));
+  return true;
+}
+
+Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
+  use_selected_modular_params_ = false;
+  if (cparams_.modular_mode || cparams_.speed_tier > SpeedTier::kSquirrel ||
+      cparams_.decoding_speed_tier >= 2 || !cparams_.custom_fixed_tree.empty() ||
+      tree_tokens_.empty() || tree_tokens_[0].empty() || tokens_.empty()) {
+    return true;
+  }
+  size_t total_toks = 0;
+  for (const auto& st : tokens_) total_toks += st.size();
+  if (total_toks == 0 || total_toks > 500000) return true;
+
+  const uint32_t dc_start = ModularStreamId::VarDCTDC(0).ID(frame_dim_);
+  const uint32_t dc_stop = ModularStreamId::ModularDC(0).ID(frame_dim_);
+  const uint32_t acm_start = ModularStreamId::ACMetadata(0).ID(frame_dim_);
+  JXL_ASSIGN_OR_RETURN(ModularStreamId qt0, ModularStreamId::QuantTable(0));
+  const uint32_t acm_stop = qt0.ID(frame_dim_);
+
+  std::vector<uint32_t> dc_sids;
+  std::vector<ModularOptions> orig_dc_opts;
+  for (uint32_t s = dc_start; s < dc_stop && s < stream_images_.size(); ++s) {
+    if (!stream_images_[s].empty() &&
+        stream_options_[s].tree_kind == ModularOptions::TreeKind::kLearn) {
+      dc_sids.push_back(s);
+      orig_dc_opts.push_back(stream_options_[s]);
+    }
+  }
+  std::vector<uint32_t> acm_sids;
+  std::vector<ModularOptions> orig_acm_opts;
+  for (uint32_t s = acm_start; s < acm_stop && s < stream_images_.size(); ++s) {
+    if (!stream_images_[s].empty() &&
+        stream_options_[s].tree_kind == ModularOptions::TreeKind::kLearn) {
+      acm_sids.push_back(s);
+      orig_acm_opts.push_back(stream_options_[s]);
+    }
+  }
+
+  auto eval_bitstream =
+      [&](const Tree& tr, const std::vector<std::vector<Token>>& tr_toks,
+          const std::vector<GroupHeader>& hdrs,
+          const std::vector<std::vector<Token>>& raw_toks,
+          const std::vector<size_t>& img_w, const HistogramParams& base_hp,
+          size_t* out_bits) -> Status {
+    BitWriter bw(memory_manager_);
+    JXL_RETURN_IF_ERROR(bw.WithMaxBits(1, LayerType::ModularTree, nullptr, [&] {
+      bw.Write(1, 1);
+      return true;
+    }));
+    HistogramParams hp = base_hp;
+    {
+      EntropyEncodingData tree_code;
+      std::vector<std::vector<Token>> tr_toks_copy = tr_toks;
+      JXL_ASSIGN_OR_RETURN(
+          size_t tcost,
+          BuildAndEncodeHistograms(memory_manager_, hp, kNumTreeContexts,
+                                   tr_toks_copy, &tree_code, &bw,
+                                   LayerType::ModularTree, nullptr));
+      (void)tcost;
+      JXL_RETURN_IF_ERROR(WriteTokens(tr_toks_copy[0], tree_code, 0, &bw,
+                                      LayerType::ModularTree, nullptr));
+    }
+    hp.streaming_mode = false;
+    hp.add_missing_symbols = false;
+    hp.image_widths = img_w;
+    EntropyEncodingData trial_code;
+    std::vector<std::vector<Token>> toks_copy = raw_toks;
+    JXL_ASSIGN_OR_RETURN(
+        size_t gcost,
+        BuildAndEncodeHistograms(memory_manager_, hp, (tr.size() + 1) / 2,
+                                 toks_copy, &trial_code, &bw,
+                                 LayerType::ModularGlobal, nullptr));
+    (void)gcost;
+    for (size_t s = 0; s < stream_images_.size(); ++s) {
+      if (stream_images_[s].channel.empty()) continue;
+      JXL_RETURN_IF_ERROR(Bundle::Write(hdrs[s], &bw, LayerType::Dc, nullptr));
+      JXL_RETURN_IF_ERROR(WriteTokens(toks_copy[s], trial_code, 0, &bw,
+                                      LayerType::Dc, nullptr));
+    }
+    *out_bits = bw.BitsWritten();
+    return true;
+  };
+
+  const HistogramParams hp_base =
+      HistogramParams::ForModular(cparams_, extra_dc_precision, false);
+  HistogramParams hp_cands[6] = {hp_base, hp_base, hp_base,
+                                 hp_base, hp_base, hp_base};
+  hp_cands[1].lz77_method = HistogramParams::LZ77Method::kNone;
+  hp_cands[1].rdo_context_map = true;
+  hp_cands[2].lz77_method = HistogramParams::LZ77Method::kRLE;
+  hp_cands[2].rdo_context_map = true;
+  hp_cands[3].lz77_method = HistogramParams::LZ77Method::kOptc256;
+  hp_cands[3].rdo_context_map = true;
+  hp_cands[4].lz77_method = HistogramParams::LZ77Method::kOptc256;
+  hp_cands[4].rdo_context_map = true;
+  hp_cands[4].force_huffman = true;
+  hp_cands[5].lz77_method = HistogramParams::LZ77Method::kOptc256;
+  hp_cands[5].rdo_context_map = true;
+  hp_cands[5].clustering = HistogramParams::ClusteringType::kFast;
+
+  Tree best_tree = tree_;
+  std::vector<std::vector<Token>> best_tree_tokens = tree_tokens_;
+  std::vector<GroupHeader> best_headers = stream_headers_;
+  std::vector<std::vector<Token>> best_raw_tokens = tokens_;
+  std::vector<size_t> best_widths = image_widths_;
+  HistogramParams best_hp = hp_base;
+  size_t best_bits = std::numeric_limits<size_t>::max();
+
+  auto test_current_tree = [&](bool include_raw_baseline) -> Status {
+    const size_t h_start = include_raw_baseline ? 0 : 1;
+    for (size_t hi = h_start; hi < 6; ++hi) {
+      size_t bits = 0;
+      JXL_RETURN_IF_ERROR(eval_bitstream(tree_, tree_tokens_, stream_headers_,
+                                         tokens_, image_widths_, hp_cands[hi],
+                                         &bits));
+      if (bits < best_bits) {
+        best_bits = bits;
+        best_tree = tree_;
+        best_tree_tokens = tree_tokens_;
+        best_headers = stream_headers_;
+        best_raw_tokens = tokens_;
+        best_widths = image_widths_;
+        best_hp = hp_cands[hi];
+      }
+    }
+    return true;
+  };
+
+  JXL_RETURN_IF_ERROR(test_current_tree(/*include_raw_baseline=*/true));
+
+  if (!dc_sids.empty() || !acm_sids.empty()) {
+    static constexpr float kThreshPairs[7][2] = {{90.0f, 96.0f},
+                                                 {38.0f, 44.0f},
+                                                 {52.0f, 56.0f},
+                                                 {68.0f, 72.0f},
+                                                 {125.0f, 125.0f},
+                                                 {175.0f, 170.0f},
+                                                 {260.0f, 240.0f}};
+    for (const auto& pair : kThreshPairs) {
+      for (uint32_t s : dc_sids) {
+        stream_options_[s].splitting_heuristics_node_threshold = pair[0];
+        stream_options_[s].polish_leaves = true;
+      }
+      for (uint32_t s : acm_sids) {
+        stream_options_[s].splitting_heuristics_node_threshold = pair[1];
+        stream_options_[s].polish_leaves = true;
+        if (cparams_.decoding_speed_tier < 3) {
+          stream_options_[s].predictor = Predictor::Variable;
+        }
+        stream_options_[s].max_properties = 1;
+        stream_options_[s].splitting_heuristics_properties = {
+            0,  1,  2,  3,  6,  7,  4,  5,  8,  9,
+            10, 11, 12, 13, 14, 16, 17, 18, 19};
+      }
+      JXL_RETURN_IF_ERROR(ComputeTree(pool));
+      if (tree_tokens_.empty() || tree_tokens_[0].empty()) continue;
+      JXL_RETURN_IF_ERROR(ComputeTokensInternal(pool));
+      JXL_RETURN_IF_ERROR(test_current_tree(/*include_raw_baseline=*/false));
+    }
+    for (size_t k = 0; k < dc_sids.size(); ++k) {
+      stream_options_[dc_sids[k]] = orig_dc_opts[k];
+    }
+    for (size_t k = 0; k < acm_sids.size(); ++k) {
+      stream_options_[acm_sids[k]] = orig_acm_opts[k];
+    }
+  }
+
+  tree_ = std::move(best_tree);
+  tree_tokens_ = std::move(best_tree_tokens);
+  stream_headers_ = std::move(best_headers);
+  tokens_ = std::move(best_raw_tokens);
+  image_widths_ = std::move(best_widths);
+  selected_modular_params_ = best_hp;
+  use_selected_modular_params_ = true;
+  return true;
+}
+
+Status ModularFrameEncoder::ComputeTokens(ThreadPool* pool) {
+  JXL_RETURN_IF_ERROR(ComputeTokensInternal(pool));
+  JXL_RETURN_IF_ERROR(OptimizeVarDCTModularEncoding(pool));
   return true;
 }
 
@@ -1304,7 +1535,10 @@ Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
 
   // Write tree
   HistogramParams params =
-      HistogramParams::ForModular(cparams_, extra_dc_precision, streaming_mode);
+      (use_selected_modular_params_ && !streaming_mode)
+          ? selected_modular_params_
+          : HistogramParams::ForModular(cparams_, extra_dc_precision,
+                                        streaming_mode);
   {
     EntropyEncodingData tree_code;
     JXL_ASSIGN_OR_RETURN(
@@ -1558,13 +1792,19 @@ struct DcRdoParams {
 };
 
 constexpr DcRdoParams kDcRdoParams[3] = {
-    // c = 0 (X): dz = 0.65 -> 2*dz - 1 = 0.30 -> lambda_d = 3.333
-    {3.333333f, 1.0f, 1.466667f, 2.533333f, 0.50f, 0.35f, 0.15f},
-    // c = 1 (Y): dz = 0.58 -> 2*dz - 1 = 0.16 -> lambda_d = 6.250
-    {6.250000f, 1.0f, 1.000000f, 1.000000f, 0.55f, 0.35f, 0.15f},
-    // c = 2 (B): dz = 0.61 -> 2*dz - 1 = 0.22 -> lambda_d = 4.545
-    {4.545455f, 1.0f, 1.272727f, 1.272727f, 0.50f, 0.35f, 0.15f},
+    // c = 0 (X):
+    {3.46387267f, 1.0f, 1.466667f, 2.533333f, 0.50f, 0.35f, 0.15f},
+    // c = 1 (Y):
+    {6.49476194f, 1.0f, 1.000000f, 1.000000f, 0.55f, 0.35f, 0.15f},
+    // c = 2 (B):
+    {4.72346354f, 1.0f, 1.272727f, 1.272727f, 0.50f, 0.35f, 0.15f},
 };
+
+inline float DcLogDistLambdaMul(float butteraugli_distance) {
+  const float d = Clamp1(butteraugli_distance, 0.35f, 15.0f);
+  const float s_d = Clamp1(std::log(d * (1.0f / 1.85f)), -1.45f, 1.85f);
+  return std::exp(-0.0132449241f * s_d);
+}
 
 inline float DcGreedyRdCost(float s, const DcRdoParams& p, float w_aq) {
   const float abs_s = std::abs(s);
@@ -1660,10 +1900,11 @@ int QuantizeDcResidualRdo(const int32_t* qrow, size_t onerow, size_t c,
     cost_m1 = p.cost_4 + std::log2(static_cast<float>(k + 1) * 0.5f);
   }
 
+  const float lam_d = p.lambda_d;
   auto eval_cand = [&](int m, float rate_cost) -> float {
     const int32_t q_cand = ClampDcSample(guess + sign * m, clamp_i16);
     const float err = target - static_cast<float>(q_cand);
-    float total = rate_cost + (p.lambda_d * w_aq) * err * err;
+    float total = rate_cost + (lam_d * w_aq) * err * err;
     if (has_e) {
       int32_t pred_e = q_cand;
       if (y > 0) {
@@ -1772,7 +2013,8 @@ Status ModularFrameEncoder::QuantizeVarDCTYDC(
   const bool enable_rdo =
       enc_state->band_qf[0][3].xsize() >= r.x0() + r.xsize() &&
       enc_state->band_qf[0][3].ysize() >= r.y0() + r.ysize();
-  const float diff_w = 0.10f;
+  constexpr float kDcRdoDiffW = 0.0947170407f;
+  const float dc_lam_dmul = DcLogDistLambdaMul(cparams_.butteraugli_distance);
   float q_ref = 1.0f;
   if (enable_rdo) {
     double sum_log_q = 0.0;
@@ -1788,7 +2030,7 @@ Status ModularFrameEncoder::QuantizeVarDCTYDC(
   auto calc_w_aq = [&](float q_blk) -> float {
     const float log2_q =
         Clamp1(std::log2(std::max(1e-4f, q_blk) / q_ref), -0.90f, 0.90f);
-    return std::exp2(aq_exp * log2_q);
+    return dc_lam_dmul * std::exp2(aq_exp * log2_q);
   };
   bool has_outliers = false;
   const size_t stride = quant_y_out->PixelsPerRow();
@@ -1818,7 +2060,7 @@ Status ModularFrameEncoder::QuantizeVarDCTYDC(
       const float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
       quant_row[x] = QuantizeGradient(
           quant_row, stride, 1, x, y, r.xsize(), row[x], inv_factor, enable_rdo,
-          diff_w, w_aq, target_w, target_n, has_e, target_e, w_aq_e, has_s,
+          kDcRdoDiffW, w_aq, target_w, target_n, has_e, target_e, w_aq_e, has_s,
           target_s, target_sw, w_aq_s, clamp_i16, &has_outliers);
     }
   }
@@ -1844,25 +2086,38 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
 
   size_t stream_id = ModularStreamId::VarDCTDC(group_index).ID(frame_dim_);
   stream_options_[stream_id].max_chan_size = 0xFFFFFF;
-  stream_options_[stream_id].predictor = Predictor::Weighted;
-  stream_options_[stream_id].wp_tree_mode = ModularOptions::TreeMode::kWPOnly;
-  if (cparams_.speed_tier >= SpeedTier::kSquirrel) {
-    stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kWPFixedDC;
-  }
-  if (cparams_.speed_tier < SpeedTier::kSquirrel && !nl_dc) {
-    stream_options_[stream_id].predictor =
-        (cparams_.speed_tier < SpeedTier::kKitten ? Predictor::Variable
-                                                  : Predictor::Best);
-    stream_options_[stream_id].wp_tree_mode =
-        ModularOptions::TreeMode::kDefault;
+  stream_options_[stream_id].wp_mode = 0;
+  stream_options_[stream_id].predictor = Predictor::Gradient;
+  stream_options_[stream_id].wp_tree_mode =
+      (cparams_.decoding_speed_tier >= 3)
+          ? ModularOptions::TreeMode::kGradientOnly
+          : ModularOptions::TreeMode::kNoWP;
+  stream_options_[stream_id].tree_kind =
+      ModularOptions::TreeKind::kGradientFixedDC;
+  const bool is_gray = enc_state->shared.metadata != nullptr &&
+                       enc_state->shared.metadata->m.color_encoding.IsGray();
+  const bool learn_dc_tree =
+      !jpeg_transcode && cparams_.decoding_speed_tier < 3 &&
+      cparams_.speed_tier <= SpeedTier::kSquirrel &&
+      cparams_.resampling <= 1 &&
+      enc_state->progressive_splitter.GetNumPasses() == 1;
+  if (learn_dc_tree) {
+    stream_options_[stream_id].predictor = Predictor::Variable;
+    stream_options_[stream_id].wp_tree_mode = ModularOptions::TreeMode::kNoWP;
     stream_options_[stream_id].tree_kind = ModularOptions::TreeKind::kLearn;
-  }
-  if (!jpeg_transcode || cparams_.decoding_speed_tier >= 1) {
-    stream_options_[stream_id].predictor = Predictor::Gradient;
-    stream_options_[stream_id].wp_tree_mode =
-        ModularOptions::TreeMode::kGradientOnly;
-    stream_options_[stream_id].tree_kind =
-        ModularOptions::TreeKind::kGradientFixedDC;
+    stream_options_[stream_id].nb_repeats = 1.0f;
+    stream_options_[stream_id].max_property_values = 256;
+    stream_options_[stream_id].splitting_heuristics_node_threshold = 90.0f;
+    if (!is_gray && frame_header.chroma_subsampling.Is444()) {
+      stream_options_[stream_id].max_properties = 2;
+      stream_options_[stream_id].splitting_heuristics_properties = {
+          0,  1,  9,  10, 11, 12, 13, 14, 2,  3,  4, 5,
+          6,  7,  8,  16, 17, 18, 19, 20, 21, 22, 23};
+    } else {
+      stream_options_[stream_id].max_properties = 0;
+      stream_options_[stream_id].splitting_heuristics_properties = {
+          0, 1, 9, 10, 11, 12, 13, 14, 2, 3, 4, 5, 6, 7, 8};
+    }
   }
   stream_options_[stream_id].histogram_params =
       stream_options_[0].histogram_params;
@@ -1873,21 +2128,23 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
   const ColorCorrelation& color_correlation = enc_state->shared.cmap.base();
   if (nl_dc) {
     JXL_ENSURE(frame_header.chroma_subsampling.Is444());
-    const bool use_gradient =
-        stream_options_[stream_id].predictor == Predictor::Gradient ||
-        stream_options_[stream_id].tree_kind ==
-            ModularOptions::TreeKind::kGradientFixedDC;
+    const bool use_non_wp =
+        stream_options_[stream_id].wp_tree_mode !=
+            ModularOptions::TreeMode::kWPOnly &&
+        stream_options_[stream_id].predictor != Predictor::Weighted;
     const bool enable_rdo =
         enc_state->band_qf[0][3].xsize() >= r.x0() + r.xsize() &&
         enc_state->band_qf[0][3].ysize() >= r.y0() + r.ysize();
-    const float diff_w = 0.10f;
+    constexpr float diff_w = 0.0947170407f;
+    const float dc_lam_dmul =
+        DcLogDistLambdaMul(cparams_.butteraugli_distance);
     for (size_t c : {1, 0, 2}) {
       float inv_factor = enc_state->shared.quantizer.GetInvDcStep(c) * mul;
       float y_factor = enc_state->shared.quantizer.GetDcStep(1) / mul;
       float cfl_factor = color_correlation.DCFactors()[c];
       const float yk = y_factor * cfl_factor;
       const float b_y_comp =
-          (c == 2 && enable_rdo && !jpeg_transcode) ? 0.75f : 0.0f;
+          (c == 2 && enable_rdo && !jpeg_transcode) ? 0.751457036f : 0.0f;
       const float yk_eff = yk - b_y_comp * y_factor;
       float q_ref = 1.0f;
       if (enable_rdo) {
@@ -1905,7 +2162,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
       auto calc_w_aq = [&](float q_blk) -> float {
         const float log2_q =
             Clamp1(std::log2(std::max(1e-4f, q_blk) / q_ref), -0.90f, 0.90f);
-        return std::exp2(aq_exp * log2_q);
+        return dc_lam_dmul * std::exp2(aq_exp * log2_q);
       };
       weighted::Header header;
       weighted::State wp_state(header, r.xsize(), r.ysize());
@@ -1949,7 +2206,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
             const float target_sw =
                 (has_s && x > 0) ? (row_next[x - 1] * inv_factor) : 0.0f;
             const float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
-            if (use_gradient) {
+            if (use_non_wp) {
               quant_row[x] = QuantizeGradient(
                   quant_row, stride, c, x, y, r.xsize(), row[x], inv_factor,
                   enable_rdo, diff_w, w_aq, target_w, target_n, has_e, target_e,
@@ -2014,7 +2271,7 @@ Status ModularFrameEncoder::AddVarDCTDC(const FrameHeader& frame_header,
             const float w_aq_s = has_s ? calc_w_aq(q_row_next[x]) : 1.0f;
             const float val_c =
                 row[x] - b_y_comp * row_y[x] - quant_row_y[x] * yk_eff;
-            if (use_gradient) {
+            if (use_non_wp) {
               quant_row[x] = QuantizeGradient(
                   quant_row, stride, c, x, y, r.xsize(), val_c, inv_factor,
                   enable_rdo, diff_w, w_aq, target_w, target_n, has_e, target_e,

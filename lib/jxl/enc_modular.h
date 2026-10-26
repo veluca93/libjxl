@@ -101,6 +101,17 @@ class ModularFrameEncoder {
   std::vector<size_t> ac_metadata_size;
   std::vector<uint8_t> extra_dc_precision;
 
+  Image* VarDCTDCImage(size_t dc_group_index) {
+    const size_t stream_id =
+        ModularStreamId::VarDCTDC(dc_group_index).ID(frame_dim_);
+    if (stream_id >= stream_images_.size()) return nullptr;
+    return &stream_images_[stream_id];
+  }
+
+  // Learns (or constructs) a standalone non-WP Modular MA tree over the current
+  // VarDCTDC streams with sequential leaf context IDs populated.
+  Status LearnVarDCTDCTree(Tree* out_tree) const;
+
   JxlMemoryManager* memory_manager() const { return memory_manager_; }
 
  private:
@@ -112,6 +123,8 @@ class ModularFrameEncoder {
                              int minShift, int maxShift,
                              const ModularStreamId& stream, bool do_color,
                              bool groupwise);
+  Status ComputeTokensInternal(ThreadPool* pool);
+  Status OptimizeVarDCTModularEncoding(ThreadPool* pool);
   JxlMemoryManager* memory_manager_;
   std::vector<Image> stream_images_;
   std::vector<ModularOptions> stream_options_;
@@ -128,6 +141,8 @@ class ModularFrameEncoder {
   std::vector<size_t> tree_splits_;
   std::vector<std::vector<uint32_t>> gi_channel_;
   std::vector<size_t> image_widths_;
+  bool use_selected_modular_params_ = false;
+  HistogramParams selected_modular_params_;
 
   struct GroupParams {
     Rect rect;
