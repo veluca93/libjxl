@@ -165,7 +165,7 @@ V GammaModulation(const D d, const size_t x, const size_t y,
   overall_ratio = Mul(SumOfLanes(d, overall_ratio), Set(d, 0.5f / 64));
   // ideally -1.0, but likely optimal correction adds some entropy, so slightly
   // less than that.
-  const auto kGamma = Set(d, 0.1005613337192697f);
+  const auto kGamma = Set(d, 0.100359298f);
   return MulAdd(kGamma, FastLog2f(d, overall_ratio), out_val);
 }
 
@@ -197,7 +197,7 @@ V BlueModulation(const D d, const size_t x, const size_t y,
                                Min(Sub(p_b, p_y_effective), Set(d, kLimit))));
     }
   }
-  static const float kMul = 0.90590804735610064;
+  static const float kMul = 0.916944027f;
   sum = SumOfLanes(d, sum);
   float scalar_sum = GetLane(sum);
   // If it is all blue, don't boost the quantization.
@@ -392,7 +392,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
             size_gate * 0.28f * (1.0f - 0.35f * hi_d_taper) *
             Clamp1((butteraugli_target - 0.55f) * 2.2f, 0.0f, 1.0f);
         const float band_dist_w =
-            size_gate * 0.52f * (1.0f - 0.30f * hi_d_taper) *
+            size_gate * 0.516969919f * (1.0f - 0.30f * hi_d_taper) *
             Clamp1((butteraugli_target - 0.35f) * 2.0f, 0.0f, 1.0f);
         const float edge_loc_y =
             Clamp1(E[1][0] / (E0_harm[1] + 1e-4f), 1.0f, 2.5f);
@@ -417,10 +417,10 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
                             1.0f);
         const float e_harm = std::max(0.0f, E0_harm[1] - 5e-4f) * gammac;
         const float mask_base =
-            -0.115f - 0.58f * e_harm / (e_harm + 0.028f) +
-            0.40f * GetLane(gamma_val);
+            -0.115f - 0.578829229f * e_harm / (e_harm + 0.0276169423f) +
+            0.400148928f * GetLane(gamma_val);
         const float hf_mod = Clamp1(
-            0.42f - 48.64f * E[1][0] / edge_loc_y, -0.45f, 0.0f);
+            0.42f - 49.0555191f * E[1][0] / edge_loc_y, -0.45f, 0.0f);
         const float psych_log_q =
             mask_base + hf_mod + 0.75f * blue_boost +
             dist_w * (edge_boost_q + chroma_boost - uniform_tex_mask);
@@ -453,7 +453,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
             float phi = Clamp1(0.95f + 0.07f * rel, 0.92f, 1.22f) * c_boost;
             if (s == 0) {
               const float hf_mask =
-                  1.0f / (1.0f + 0.32f * (tex_excess / tex_thresh) /
+                  1.0f / (1.0f + 0.323514462f * (tex_excess / tex_thresh) /
                                      (edge_loc * edge_loc));
               const float c_s0_csf =
                   use_chroma_csf
@@ -628,7 +628,8 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
 
   if (band_qf != nullptr && xsize_blocks * ysize_blocks > 64) {
     const float aq_damp =
-        0.25f + 0.35f * Clamp1((butteraugli_target - 0.50f) / 2.00f, 0.0f, 1.0f);
+        0.245252654f +
+        0.346051216f * Clamp1((butteraugli_target - 0.50f) / 2.00f, 0.0f, 1.0f);
     if (aq_damp > 1e-4f) {
       double sum_log_q = 0.0;
       for (size_t by = 0; by < ysize_blocks; ++by) {
@@ -805,9 +806,9 @@ StatusOr<ImageF> TileDistMap(const ImageF& distmap, int tile_size, int margin,
   return tile_distmap;
 }
 
-const float kDcQuantPow = 0.83f;
+const float kDcQuantPow = 0.830462515f;
 const float kDcQuant = 1.095924047623553f;
-const float kAcQuant = 0.765f;
+const float kAcQuant = 0.770739436f;
 
 // Computes the decoded image for a given set of compression parameters.
 StatusOr<ImageBundle> RoundtripImage(const FrameHeader& frame_header,

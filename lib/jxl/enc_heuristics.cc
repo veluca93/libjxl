@@ -934,28 +934,38 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       float a_mid_d;
       float w0_dslope;
       float d0_dslope;
+      float w0_lo_slope;
+      float d0_lo_slope;
+      float d0_hi_slope;
+      float db_mul;
     };
     // Principled from-scratch parametric DCT quantization model for X, Y, B
     // (including smooth log(d / 1.85) distance slopes for steepness & chroma).
     static constexpr ChannelQMParams kChannelParams[3] = {
         // c = 0 (X):
-        {4380.35547f, 0.615591586f, -0.185f, 0.055f, 2.09565282f, 0.885f, 1.10f,
-         1.53f, 0.010f, 0.003f, 0.012f, 0.022f, 0.004f, -0.0135177998f,
-         0.0230346546f},
+        {4380.35547f, 0.615591586f, -0.185f, 0.055f, 2.09565282f, 0.885f,
+         1.10305357f, 1.53f, 0.010f, 0.003f, 0.012f, 0.0218714848f, 0.004f,
+         -0.0135177998f, 0.0230346546f, 0.00512734987f, 0.00285051018f, 0.0f,
+         0.999176383f},
         // c = 1 (Y):
-        {808.807312f, 0.653820932f, 0.966f, 0.242f, 1.7416153f, 1.269f, 0.14f,
-         0.67f, 0.000f, 0.004f, 0.007f, 0.029f, 0.005f, 0.0f, 0.0208702553f},
+        {808.807312f, 0.653820932f, 0.961432993f, 0.245166048f, 1.7416153f,
+         1.269f, 0.138599098f, 0.681327343f, 0.000f, 0.004f, 0.007f,
+         0.0286034308f, 0.005f, 0.0f, 0.0208702553f, -0.000636900018f,
+         -0.000346260029f, -0.00363907497f, 1.0056529f},
         // c = 2 (B): convex 4-metric compromise — preserve LF/MF blue-yellow
         // contrast for WD_s1 & SSIM2 while retaining S-cone HF roll-off so bits
         // are not wasted on invisible HF blue grain under BA3 & CVVDP.
-        {290.563446f, 0.715576172f, 0.520f, 0.115f, 2.04612994f, 1.295f, 0.46f,
-         1.02f, 0.011f, 0.004f, 0.012f, 0.026f, 0.005f, -0.000394175004f,
-         0.0368712395f},
+        {290.563446f, 0.715576172f, 0.513301969f, 0.115f, 2.04612994f, 1.295f,
+         0.46f, 1.02f, 0.011f, 0.004f, 0.012f, 0.026f, 0.005f,
+         -0.000394175004f, 0.0368712395f, 0.0011156f, -0.00549831009f, 0.0f,
+         0.993407249f},
     };
 
     const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 15.0f);
     const float t_d = Clamp1((d - 0.5f) / 2.0f, 0.0f, 1.0f);
     const float s_d = Clamp1(std::log(d * (1.0f / 1.85f)), -1.45f, 1.85f);
+    const float s_lo = std::min(0.0f, s_d);
+    const float s_hi = std::max(0.0f, s_d);
     constexpr float kU0 = 0.10f;
 
     auto inv_mult_step = [](float r) -> float {
@@ -970,7 +980,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         frame_dim.xsize_blocks * frame_dim.ysize_blocks > 1) {
       const float hi_d_taper = Clamp1((d - 2.5f) / 7.5f, 0.0f, 1.0f);
       const float w_bd =
-          0.52f * (1.0f - 0.30f * hi_d_taper) *
+          0.516969919f * (1.0f - 0.30f * hi_d_taper) *
           Clamp1((d - 0.35f) * 2.0f, 0.0f, 1.0f);
       if (w_bd > 1e-3f) {
         const float inv_w_bd = 1.0f / std::max(w_bd, 0.15f);
@@ -1082,16 +1092,23 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       const size_t out_bands = std::min(spec.num_bands, max_bands);
       const float b = spec.b;
       const float a = spec.a;
-      const float tx_decay = std::exp(-0.18f * b);
+      const float tx_decay = std::exp(-0.181210801f * b);
       DctQuantWeightParams new_params;
       new_params.num_distance_bands = out_bands;
 
       for (size_t c = 0; c < 3; ++c) {
         const ChannelQMParams& p = kChannelParams[c];
-        const float w0_eff =
+        float w0_eff =
             (p.w0_dslope != 0.0f) ? (p.W0 * std::exp(p.w0_dslope * s_d)) : p.W0;
-        const float d0_eff = p.D0 * std::exp(p.d0_dslope * s_d);
-        const float db_eff = p.Db * std::exp(0.0447954014f * s_d);
+        w0_eff *= std::exp(p.w0_lo_slope * s_lo);
+        float d0_eff = p.D0 * std::exp(p.d0_dslope * s_d);
+        d0_eff *= std::exp(p.d0_lo_slope * s_lo);
+        if (p.d0_hi_slope != 0.0f) {
+          d0_eff *= std::exp(p.d0_hi_slope * s_hi);
+        }
+        float db_eff = p.Db * std::exp(0.0447954014f * s_d);
+        db_eff *= std::exp(0.000102732003f * s_lo);
+        db_eff *= p.db_mul;
         const float ln_w_u0 =
             std::log(w0_eff) + p.gamma_d * t_d +
             (p.s1 * b + p.s2 * (b / (0.5f + b)) -
@@ -1100,7 +1117,8 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         const float D =
             (d0_eff + db_eff * std::log(1.0f + b)) * (1.0f + p.eta_d * t_d);
         float kap = p.k0 - p.kb * (b / (0.25f + b));
-        kap = Clamp1(kap + (-0.0169299729f) * s_d, -1.5f, 1.8f);
+        kap = Clamp1(kap + (-0.0169299729f) * s_d + (-0.000604303961f) * s_lo,
+                     -1.5f, 1.8f);
         const float a_mid = (p.a_mid0 - p.a_mid_d * t_d) * tx_decay;
 
         auto eval_ln_w = [&](float u) -> float {
@@ -1156,17 +1174,21 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       // refine Y and B DC precision to preserve multi-scale pyramid structure
       // (SSIM2, CVVDP, WD_s1) and LLF reconstruction while keeping X DC at the
       // WD_s1-safe operating point.
-      float x_dc_scale =
+      const float x_dc_base0 =
           0.757971644f - 0.143665373f * Clamp1((d - 1.0f) / 3.0f, 0.0f, 1.0f);
-      float y_dc_scale =
+      const float y_dc_base0 =
           1.17833197f - 0.14812851f * Clamp1((d - 1.0f) / 4.5f, 0.0f, 1.0f);
-      float b_dc_scale =
-          y_dc_scale *
+      const float b_dc_base0 =
+          y_dc_base0 *
           (0.957945466f + 0.03f * Clamp1((d - 1.5f) / 4.0f, 0.0f, 1.0f));
-      const float all_m = std::exp(0.00649557495f * s_d);
-      x_dc_scale *= all_m * std::exp(-0.0357682817f * s_d);
-      y_dc_scale *= all_m;
-      b_dc_scale *= all_m * std::exp(-0.00723599782f * s_d);
+      const float all_m0 = std::exp(0.00649557495f * s_d);
+      float all_m = all_m0;
+      all_m *= std::exp(-0.00133447594f * s_lo);
+      all_m *= std::exp(0.00054139999f * s_hi);
+      float x_dc_scale = x_dc_base0 * all_m * std::exp(-0.0357682817f * s_d);
+      x_dc_scale *= std::exp(0.00100066001f * s_lo);
+      float y_dc_scale = y_dc_base0 * all_m;
+      float b_dc_scale = b_dc_base0 * all_m * std::exp(-0.00723599782f * s_d);
       // Opponent chromatic CSF (R-G in X, B-Y in B) is low-pass with no low-
       // frequency roll-off: on frames with substantial large-transform smooth
       // backgrounds (bokeh, sky, studio backdrops), damp high-distance MulDC
@@ -1175,8 +1197,14 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
           Clamp1((smooth_frac - 0.18f) / 0.28f, 0.0f, 1.0f);
       if (d > 2.0f && smooth_gate > 0.0f) {
         const float hi_chr = std::log(std::min(d, 16.0f) * 0.5f) * smooth_gate;
-        x_dc_scale *= std::exp(0.42f * hi_chr);
-        b_dc_scale *= std::exp(0.18f * hi_chr);
+        const float x_bokeh_mul = std::exp(0.42f * hi_chr);
+        const float b_bokeh_mul = std::exp(0.18f * hi_chr);
+        const float x_bokeh_floor =
+            x_dc_base0 * all_m0 * std::exp(-0.0357682817f * s_d) * x_bokeh_mul;
+        const float b_bokeh_floor =
+            b_dc_base0 * all_m0 * std::exp(-0.00723599782f * s_d) * b_bokeh_mul;
+        x_dc_scale = std::max(x_dc_scale * x_bokeh_mul, x_bokeh_floor);
+        b_dc_scale = std::max(b_dc_scale * b_bokeh_mul, b_bokeh_floor);
       }
       const float custom_inv_dc[3] = {
           kInvDCQuant[0] * x_dc_scale,

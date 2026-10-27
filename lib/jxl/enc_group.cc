@@ -465,7 +465,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
                        : ((rdoq_level == -3) ? 0.435468376f : 0.334956259f);
   }
   const float eff_ref_bits =
-      base_ref * (1.0f + 0.353990942f * eob_scale) * rdoq_ref_mul;
+      base_ref * (1.0f + 0.355283588f * eob_scale) * rdoq_ref_mul;
   constexpr float kQuadTilt = 0.494345099f;
   const float base_h = 0.58f;
   const float t_ref = 0.60f;
@@ -1423,7 +1423,8 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           const float d_target = cparams.butteraugli_distance;
           const float dz_w =
               has_band_qf
-                  ? Clamp1((d_target - 0.35f) / (d_target + 0.55f) * 1.55f,
+                  ? Clamp1((d_target - 0.35f) / (d_target + 0.55f) *
+                               1.56866455f,
                            0.0f, 1.0f)
                   : 0.0f;
           const float eob_scale =
@@ -1895,7 +1896,7 @@ Status EvalAcGroupCacheImpl(const PassesEncoderState* enc_state,
 
   const float d_target = enc_state->cparams.butteraugli_distance;
   const float dz_w =
-      Clamp1((d_target - 0.35f) / (d_target + 0.55f) * 1.55f, 0.0f, 1.0f);
+      Clamp1((d_target - 0.35f) / (d_target + 0.55f) * 1.56866455f, 0.0f, 1.0f);
   const float eob_scale =
       (enc_state->cparams.speed_tier <= SpeedTier::kHare)
           ? Clamp1((d_target - 0.28f) / (d_target + 0.50f) * 1.45f, 0.0f, 1.0f)
@@ -2301,7 +2302,7 @@ Status EvalAcsBoxCandidateImpl(const PassesEncoderState* enc_state,
 
   const float d_target = enc_state->cparams.butteraugli_distance;
   const float dz_w =
-      Clamp1((d_target - 0.35f) / (d_target + 0.55f) * 1.55f, 0.0f, 1.0f);
+      Clamp1((d_target - 0.35f) / (d_target + 0.55f) * 1.56866455f, 0.0f, 1.0f);
   const float eob_scale =
       (enc_state->cparams.speed_tier <= SpeedTier::kHare)
           ? Clamp1((d_target - 0.28f) / (d_target + 0.50f) * 1.45f, 0.0f, 1.0f)
@@ -8475,9 +8476,15 @@ Status RefineQuantFieldClosedLoop(
         Clamp1(cparams.butteraugli_distance, 0.35f, 15.0f);
     const float s_d =
         Clamp1(std::log(d_clamped * (1.0f / 1.85f)), -1.45f, 1.85f);
-    const double slope_scale_eff =
+    const float s_lo = std::min(0.0f, s_d);
+    const float s_hi = std::max(0.0f, s_d);
+    double slope_scale_eff =
         0.92420335414208032 *
         std::exp(-0.0067694249999999999 * static_cast<double>(s_d));
+    slope_scale_eff *=
+        std::exp(-0.0068919500336050987 * static_cast<double>(s_lo));
+    slope_scale_eff *=
+        std::exp(0.030910825356841087 * static_cast<double>(s_hi));
     size_t active_cnt = 0;
     for (size_t m = 0; m < 4; ++m) {
       const double sf =
@@ -8504,7 +8511,16 @@ Status RefineQuantFieldClosedLoop(
     }
     double w_sum = 0.0;
     for (size_t m = 0; m < 4; ++m) {
-      weight_m[m] = (slope_m[m] > 1e-9) ? kMetricPrior[m] : 0.0;
+      double prior_m = kMetricPrior[m];
+      if (m == 1) {
+        prior_m *=
+            std::exp(0.013285264745354651 * static_cast<double>(-s_lo));
+      }
+      if (m == 2) {
+        prior_m *=
+            std::exp(-0.010817520227283238 * static_cast<double>(-s_lo));
+      }
+      weight_m[m] = (slope_m[m] > 1e-9) ? prior_m : 0.0;
       w_sum += weight_m[m];
     }
     if (w_sum > 0.0) {
