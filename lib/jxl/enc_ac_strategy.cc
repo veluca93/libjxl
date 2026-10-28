@@ -1046,13 +1046,13 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     const float d2 = std::sqrt(loss2 * inv_npixels);
     float d_blend =
         (config.band_qf_stride > 0)
-            ? (0.644826174f * d8 + 0.355173826f * 2.18f * d2)
+            ? (0.6414263f * d8 + 0.35857368f * 2.18f * d2)
             : d8;
     if (config.band_qf_stride > 0 && !rdo_mode) {
       const float d_ssim2 = std::sqrt(loss_ssim2 * inv_npixels);
       const float d_ssim4 = std::pow(loss_ssim4 * inv_npixels, 0.25f);
-      d_blend = 0.38f * d_blend + 0.613719702f * d_ssim2 +
-                0.362386525f * d_ssim4;
+      d_blend = 0.38f * d_blend + 0.61256397f * d_ssim2 +
+                0.3617041f * d_ssim4;
     }
     out_loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / q_norm;
   };
@@ -1071,7 +1071,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     const float q_minus = std::max(q_min_floor, q_0 - step);
     const float q_plus = std::min(q_max_ceil, q_0 + step);
     const float lambda_q =
-        3.21309137f * config.info_loss_multiplier * d_rdo_norm;
+        3.1797154f * config.info_loss_multiplier * d_rdo_norm;
     const float lambda_reg = 4.2f;
 
     float r_0 = 0.0f;
@@ -1145,7 +1145,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     const float q_minus = std::max(q_min_floor, q_0 - step);
     const float q_plus = std::min(q_max_ceil, q_0 + step);
     const float lambda_q_mb =
-        3.51431847f * dist_scale * config.info_loss_multiplier * d_rdo_norm;
+        3.4778135f * dist_scale * config.info_loss_multiplier * d_rdo_norm;
     const float lambda_reg_mb = 4.2f * static_cast<float>(num_blocks);
 
     float r_0_mb = 0.0f;
@@ -1183,7 +1183,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                                 : (num_blocks >= 4) ? 1.15f
                                                     : 0.85f;
     const float mb_steps = nonflat_mb * mb_d_gate * mb_base_steps *
-                           0.985625684f *
+                           0.9808508f *
                            Clamp1(1.0f + 0.50f * delta_mb, 0.25f, 1.65f);
     q_out = Clamp1(q_0 + 0.40f * delta_mb * step + mb_steps * config.quant_scale,
                    q_min_floor, q_max_ceil);

@@ -943,21 +943,21 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     // (including smooth log(d / 1.85) distance slopes for steepness & chroma).
     static constexpr ChannelQMParams kChannelParams[3] = {
         // c = 0 (X):
-        {4380.35547f, 0.615591586f, -0.185f, 0.055f, 2.09565282f, 0.885f,
+        {4370.1562f, 0.615591586f, -0.185f, 0.055f, 2.1221492f, 0.885f,
          1.10305357f, 1.53f, 0.010f, 0.003f, 0.012f, 0.0218714848f, 0.004f,
-         -0.0135177998f, 0.0230346546f, 0.00512734987f, 0.00285051018f, 0.0f,
+         -0.014482889f, 0.0230346546f, 0.00512734987f, 0.00285051018f, 0.0f,
          0.999176383f},
         // c = 1 (Y):
-        {808.807312f, 0.653820932f, 0.961432993f, 0.245166048f, 1.7416153f,
+        {808.7489f, 0.653820932f, 0.961432993f, 0.245166048f, 1.7802039f,
          1.269f, 0.138599098f, 0.681327343f, 0.000f, 0.004f, 0.007f,
-         0.0286034308f, 0.005f, 0.0f, 0.0208702553f, -0.000636900018f,
-         -0.000346260029f, -0.00363907497f, 1.0056529f},
+         0.0286034308f, 0.005f, 0.0f, 0.023055864f, -0.000636900018f,
+         -0.026484508f, -0.00363907497f, 1.0056529f},
         // c = 2 (B): convex 4-metric compromise — preserve LF/MF blue-yellow
         // contrast for WD_s1 & SSIM2 while retaining S-cone HF roll-off so bits
         // are not wasted on invisible HF blue grain under BA3 & CVVDP.
-        {290.563446f, 0.715576172f, 0.513301969f, 0.115f, 2.04612994f, 1.295f,
+        {290.98782f, 0.715576172f, 0.513301969f, 0.115f, 2.0513363f, 1.295f,
          0.46f, 1.02f, 0.011f, 0.004f, 0.012f, 0.026f, 0.005f,
-         -0.000394175004f, 0.0368712395f, 0.0011156f, -0.00549831009f, 0.0f,
+         -0.0013592651f, 0.0368712395f, 0.0011156f, -0.00549831009f, 0.0f,
          0.993407249f},
     };
 
@@ -980,7 +980,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         frame_dim.xsize_blocks * frame_dim.ysize_blocks > 1) {
       const float hi_d_taper = Clamp1((d - 2.5f) / 7.5f, 0.0f, 1.0f);
       const float w_bd =
-          0.516969919f * (1.0f - 0.30f * hi_d_taper) *
+          0.51926106f * (1.0f - 0.30f * hi_d_taper) *
           Clamp1((d - 0.35f) * 2.0f, 0.0f, 1.0f);
       if (w_bd > 1e-3f) {
         const float inv_w_bd = 1.0f / std::max(w_bd, 0.15f);
@@ -1174,13 +1174,16 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
       // refine Y and B DC precision to preserve multi-scale pyramid structure
       // (SSIM2, CVVDP, WD_s1) and LLF reconstruction while keeping X DC at the
       // WD_s1-safe operating point.
-      const float x_dc_base0 =
+      const float x_dc_base0_lock =
           0.757971644f - 0.143665373f * Clamp1((d - 1.0f) / 3.0f, 0.0f, 1.0f);
-      const float y_dc_base0 =
+      const float y_dc_base0_lock =
           1.17833197f - 0.14812851f * Clamp1((d - 1.0f) / 4.5f, 0.0f, 1.0f);
-      const float b_dc_base0 =
-          y_dc_base0 *
-          (0.957945466f + 0.03f * Clamp1((d - 1.5f) / 4.0f, 0.0f, 1.0f));
+      const float b_dc_ratio_lock =
+          0.957945466f + 0.03f * Clamp1((d - 1.5f) / 4.0f, 0.0f, 1.0f);
+      const float b_dc_base0_lock = y_dc_base0_lock * b_dc_ratio_lock;
+      const float x_dc_base0 = x_dc_base0_lock * 1.0001273f;
+      const float y_dc_base0 = y_dc_base0_lock * 0.9989794f;
+      const float b_dc_base0 = y_dc_base0 * (b_dc_ratio_lock * 1.003439f);
       const float all_m0 = std::exp(0.00649557495f * s_d);
       float all_m = all_m0;
       all_m *= std::exp(-0.00133447594f * s_lo);
@@ -1199,10 +1202,12 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         const float hi_chr = std::log(std::min(d, 16.0f) * 0.5f) * smooth_gate;
         const float x_bokeh_mul = std::exp(0.42f * hi_chr);
         const float b_bokeh_mul = std::exp(0.18f * hi_chr);
-        const float x_bokeh_floor =
-            x_dc_base0 * all_m0 * std::exp(-0.0357682817f * s_d) * x_bokeh_mul;
-        const float b_bokeh_floor =
-            b_dc_base0 * all_m0 * std::exp(-0.00723599782f * s_d) * b_bokeh_mul;
+        const float x_bokeh_floor = x_dc_base0_lock * all_m0 *
+                                    std::exp(-0.0357682817f * s_d) *
+                                    x_bokeh_mul;
+        const float b_bokeh_floor = b_dc_base0_lock * all_m0 *
+                                    std::exp(-0.00723599782f * s_d) *
+                                    b_bokeh_mul;
         x_dc_scale = std::max(x_dc_scale * x_bokeh_mul, x_bokeh_floor);
         b_dc_scale = std::max(b_dc_scale * b_bokeh_mul, b_bokeh_floor);
       }
@@ -2892,9 +2897,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // generation loss.
     const float gab_w =
         enable_rdo
-            ? (0.988f + 0.006f * Clamp1((cparams.butteraugli_distance - 2.5f) /
-                                            5.0f,
-                                        0.0f, 1.0f))
+            ? (0.9878865f + 0.006f * Clamp1((cparams.butteraugli_distance - 2.5f) /
+                                                5.0f,
+                                            0.0f, 1.0f))
             : 1.0f;
     float weight[3] = {
         gab_w,
