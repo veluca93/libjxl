@@ -531,7 +531,8 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
       q_all_c[c] = 0.30f * bq_c[c][0] + 0.30f * bq_c[c][1] +
                    0.25f * bq_c[c][2] + 0.15f * bq_c[c][3];
       ComputeBandThresholds(c, acs.Strategy(), cx, cy, q_all_c[c], bq_c[c],
-                            zero_thres_c[c]);
+                            zero_thres_c[c], 1.0f,
+                            ComputeSharpSigmaLo(config.butteraugli_distance));
       for (size_t s = 0; s < 4; ++s) {
         band_w_c[c][s] =
             Clamp1(1.0f - 2.2f * zero_thres_c[c][4 + s], 0.88f, 1.12f);

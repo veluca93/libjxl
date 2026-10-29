@@ -453,6 +453,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   static constexpr float kBandDistWeight[4] = {0.92f, 1.00f, 1.27829313f,
                                                1.55410683f};
   const float sparse_w = Clamp1((eob_scale - 0.32f) / 0.42f, 0.0f, 1.0f);
+  const float sharp_lo_rdoq = Clamp1(1.0f - eob_scale, 0.0f, 1.0f);
   const float base_ref = (c == 1) ? 2.8215988f : 3.571999f;
   float rdoq_ref_mul = 1.0f;
   if (rdoq_level > 0) {
@@ -464,8 +465,13 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
                        ? 0.5634234f
                        : ((rdoq_level == -3) ? 0.43960217f : 0.33813593f);
   }
+  const float lo_sharp_boost =
+      (!few_colors && rdoq_level >= -1 && c <= 1)
+          ? (((c == 1) ? 0.28f : 0.14f) * sharp_lo_rdoq)
+          : 0.0f;
   const float eff_ref_bits =
-      base_ref * (1.0f + 0.355283588f * eob_scale) * rdoq_ref_mul;
+      base_ref * (1.0f + 0.355283588f * eob_scale + lo_sharp_boost) *
+      rdoq_ref_mul;
   constexpr float kQuadTilt = 0.47541872f;
   const float base_h = 0.58f;
   const float t_ref = 0.60f;
@@ -539,10 +545,15 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
         if (hfix == 0 && s >= 2) {
           w_base *= 1.12768173f;
         } else if (hfix == 3) {
-          w_base *= 0.900313497f;
+          w_base *= (0.900313497f + 0.099686503f * sharp_lo_rdoq);
         }
       }
-      const float band_w = is_partial_block ? 1.0f : kBandDistWeight[s];
+      const float band_w =
+          is_partial_block
+              ? 1.0f
+              : ((s == 0 && c == 1 && !few_colors)
+                     ? (0.92f + 0.08f * sharp_lo_rdoq)
+                     : kBandDistWeight[s]);
       const float w_zero = w_base * (1.0f + sparse_w * (band_w - 1.0f));
       const float d_one_base = b_c * (b_c - 2.0f * abs_ideal);
       const float d_zero_step = (w_zero - w_base) * d_one_base;
@@ -6983,6 +6994,7 @@ Status SolveClosedLoopGroupAcsDP(
   };
 
   const float d_target = cparams.butteraugli_distance;
+  const float sigma_lo_acs = ComputeSharpSigmaLo(d_target);
   const float qf_unit = 0.65f * Clamp1(tcm.qf_block_bits / 1.50f, 0.50f, 2.00f);
   const float lam_bits = 0.8352132f * tcm.bits_to_cost_mul;
   const float expected_table_uses = Clamp1(
@@ -7129,8 +7141,16 @@ Status SolveClosedLoopGroupAcsDP(
         0.98645556f *
         (0.025f * std::max(1.0f, cur_d_rect) +
          0.14f * lam_bits * std::sqrt(static_cast<float>(w * h)));
-    *out_cost =
-        dist + lam_bits * (ac_b + calc_spec_overhead_bits(sp.acs_raw)) + hyst;
+    const float extra_qf_bits =
+        (sigma_lo_acs > 0.05f && w == 1 && h == 1 &&
+         sp.quant_ac != ws->blk_q[y0][x0])
+            ? (0.85f * std::log2(1.0f + static_cast<float>(std::abs(
+                                            sp.quant_ac - ws->blk_q[y0][x0]))))
+            : 0.0f;
+    *out_cost = dist +
+                lam_bits * (ac_b + calc_spec_overhead_bits(sp.acs_raw) +
+                            extra_qf_bits) +
+                hyst;
     return true;
   };
 
@@ -7182,22 +7202,66 @@ Status SolveClosedLoopGroupAcsDP(
         }
       }
       const bool try_sub8 =
-          (ws->w_4m[y0][x0] > 0.98f) || (ws->cur_blk_grad[y0][x0] >= grad_p70) ||
+          (ws->w_4m[y0][x0] > (0.98f - 0.06f * sigma_lo_acs)) ||
+          (ws->cur_blk_grad[y0][x0] >=
+           grad_p70 * (1.0f - 0.18f * sigma_lo_acs)) ||
           (existing_1x1_raw != 255 &&
            existing_1x1_raw != static_cast<uint8_t>(AcStrategyType::DCT));
       if (try_sub8) {
+        AcsSubSpec best_sub8_sp{};
+        float best_sub8_c = 1e30f;
+        bool has_best_sub8 = false;
         for (AcStrategyType st_type : kSub8Types) {
           if (existing_1x1_raw == static_cast<uint8_t>(st_type)) continue;
           const AcsSubSpec sp = make_cand_spec(x0, y0, 1, 1, st_type);
           float c_cand = 1e30f;
           JXL_RETURN_IF_ERROR(eval_cand_cost(x0, y0, 1, 1, sp, &c_cand));
+          if (c_cand < best_sub8_c && st_type != AcStrategyType::DCT4X4) {
+            best_sub8_c = c_cand;
+            best_sub8_sp = sp;
+            has_best_sub8 = true;
+          }
           if (c_cand < best_c) {
             best_c = c_cand;
             best_idx = push_spec(sp, c_cand);
           }
         }
+        if (sigma_lo_acs > 0.05f) {
+          auto eval_scaled_sub8 = [&](AcsSubSpec sp_hi, float mul) -> Status {
+            const int32_t q_old = std::max<int32_t>(1, sp_hi.quant_ac);
+            const int32_t q_new = Clamp1<int32_t>(
+                static_cast<int32_t>(
+                    std::lround(static_cast<float>(q_old) * mul)),
+                q_old + 1, 255);
+            if (q_new <= q_old) return true;
+            const float q_rat =
+                static_cast<float>(q_new) / static_cast<float>(q_old);
+            sp_hi.quant_ac = q_new;
+            for (size_t c_i = 0; c_i < 3; ++c_i) {
+              for (size_t s_i = 0; s_i < 4; ++s_i) {
+                sp_hi.band_q[c_i][s_i] *= q_rat;
+              }
+            }
+            float c_hi = 1e30f;
+            JXL_RETURN_IF_ERROR(eval_cand_cost(x0, y0, 1, 1, sp_hi, &c_hi));
+            if (c_hi < best_c) {
+              best_c = c_hi;
+              best_idx = push_spec(sp_hi, c_hi);
+            }
+            return true;
+          };
+          const AcsSubSpec sp_4x4 =
+              make_cand_spec(x0, y0, 1, 1, AcStrategyType::DCT4X4);
+          JXL_RETURN_IF_ERROR(
+              eval_scaled_sub8(sp_4x4, 1.0f + 0.26f * sigma_lo_acs));
+          if (has_best_sub8) {
+            JXL_RETURN_IF_ERROR(
+                eval_scaled_sub8(best_sub8_sp, 1.0f + 0.20f * sigma_lo_acs));
+          }
+        }
         if (cparams.decoding_speed_tier < 4 &&
-            ws->cur_blk_grad[y0][x0] >= grad_p70 &&
+            ws->cur_blk_grad[y0][x0] >=
+                grad_p70 * (1.0f - 0.18f * sigma_lo_acs) &&
             existing_1x1_raw != static_cast<uint8_t>(AcStrategyType::IDENTITY)) {
           const AcsSubSpec sp =
               make_cand_spec(x0, y0, 1, 1, AcStrategyType::IDENTITY);
@@ -7206,6 +7270,31 @@ Status SolveClosedLoopGroupAcsDP(
           if (c_id < best_c) {
             best_c = c_id;
             best_idx = push_spec(sp, c_id);
+          }
+          if (sigma_lo_acs > 0.15f) {
+            AcsSubSpec sp_id_hi = sp;
+            const int32_t q_old = std::max<int32_t>(1, sp_id_hi.quant_ac);
+            const int32_t q_new = Clamp1<int32_t>(
+                static_cast<int32_t>(std::lround(
+                    static_cast<float>(q_old) * (1.0f + 0.24f * sigma_lo_acs))),
+                q_old + 1, 255);
+            if (q_new > q_old) {
+              const float q_rat =
+                  static_cast<float>(q_new) / static_cast<float>(q_old);
+              sp_id_hi.quant_ac = q_new;
+              for (size_t c_i = 0; c_i < 3; ++c_i) {
+                for (size_t s_i = 0; s_i < 4; ++s_i) {
+                  sp_id_hi.band_q[c_i][s_i] *= q_rat;
+                }
+              }
+              float c_id_hi = 1e30f;
+              JXL_RETURN_IF_ERROR(
+                  eval_cand_cost(x0, y0, 1, 1, sp_id_hi, &c_id_hi));
+              if (c_id_hi < best_c) {
+                best_c = c_id_hi;
+                best_idx = push_spec(sp_id_hi, c_id_hi);
+              }
+            }
           }
         }
       }
@@ -8440,6 +8529,13 @@ Status RefineQuantFieldClosedLoop(
   std::array<double, 4> cur_d = {};
   std::array<double, 4> slope_m = {};
   std::array<double, 4> weight_m = {};
+  const float d_sharp_c = Clamp1(cparams.butteraugli_distance, 0.35f, 2.5f);
+  const float t_sharp_lo =
+      std::log(2.5f / d_sharp_c) * (1.0f / 1.9661128563728327f);
+  const double sigma_lo = static_cast<double>(
+      t_sharp_lo * t_sharp_lo * (3.0f - 2.0f * t_sharp_lo));
+  const std::array<double, 4> pareto_w_m = {
+      1.0 - 0.50 * sigma_lo, 1.0, 1.0, 1.0 - 0.50 * sigma_lo};
 
   epf_sigma->UpdateRect(lf, shared.ac_strategy, quant_scale, rdo_quant_field,
                         rdo_sharpness, full_blk_rect);
@@ -8515,16 +8611,22 @@ Status RefineQuantFieldClosedLoop(
       if (m == 0) {
         prior_m *=
             std::exp(-0.003997480124235154 * static_cast<double>(s_hi));
+        prior_m *= (1.0 - 0.48 * sigma_lo);
       }
       if (m == 1) {
         prior_m *=
             std::exp(0.013285264745354651 * static_cast<double>(-s_lo));
         prior_m *=
             std::exp(0.0017962800338864326 * static_cast<double>(s_hi));
+        prior_m *= (1.0 + 0.45 * sigma_lo);
       }
       if (m == 2) {
         prior_m *=
             std::exp(-0.010817520227283238 * static_cast<double>(-s_lo));
+        prior_m *= (1.0 + 0.58 * sigma_lo);
+      }
+      if (m == 3) {
+        prior_m *= (1.0 - 0.52 * sigma_lo);
       }
       weight_m[m] = (slope_m[m] > 1e-9) ? prior_m : 0.0;
       w_sum += weight_m[m];
@@ -9023,6 +9125,7 @@ Status RefineQuantFieldClosedLoop(
         for (size_t m = 0; m < 4; ++m) {
           if (weight_m[m] <= 0.0) continue;
           const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
+          const double nm_p = (nm < 0.0) ? (pareto_w_m[m] * nm) : nm;
           norm_sum += weight_m[m] * nm;
           if (is_minus || (is_unsig && delta_rate < 0.0)) {
             if (nm - delta_rate < 0.0) {
@@ -9030,16 +9133,16 @@ Status RefineQuantFieldClosedLoop(
             }
           } else if (is_unsig) {
             const double floor_u = is_tr_move ? 0.005 : 0.015;
-            if (nm < -0.16127512455916904 *
-                         std::max(floor_u, delta_rate)) {
+            if (nm_p < -0.16127512455916904 *
+                           std::max(floor_u, delta_rate)) {
               pareto_ok = false;
             }
           } else {
             const double floor_r =
                 is_tr_move ? (is_rdoq_only ? 0.003 : 0.005)
                            : (is_rdoq_only ? 0.015 : 0.025);
-            if (nm < -0.2687918742652817 *
-                         std::max(floor_r, std::abs(delta_rate))) {
+            if (nm_p < -0.2687918742652817 *
+                           std::max(floor_r, std::abs(delta_rate))) {
               pareto_ok = false;
             }
           }
@@ -10037,12 +10140,13 @@ Status RefineQuantFieldClosedLoop(
           for (size_t m = 0; m < 4; ++m) {
             if (weight_m[m] <= 0.0) continue;
             const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
+            const double nm_p = (nm < 0.0) ? (pareto_w_m[m] * nm) : nm;
             norm_sum += weight_m[m] * nm;
             if (is_reclaim) {
               if (nm - delta_rate < 0.0) pareto_ok = false;
             } else {
-              if (nm < -0.21503349941222538 *
-                           std::max(0.015, std::abs(delta_rate))) {
+              if (nm_p < -0.21503349941222538 *
+                             std::max(0.015, std::abs(delta_rate))) {
                 pareto_ok = false;
               }
             }
@@ -10624,12 +10728,13 @@ Status RefineQuantFieldClosedLoop(
       for (size_t m = 0; m < 4; ++m) {
         if (weight_m[m] <= 0.0) continue;
         const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
+        const double nm_p = (nm < 0.0) ? (pareto_w_m[m] * nm) : nm;
         norm_sum += weight_m[m] * nm;
         if (delta_rate < 0.0) {
           if (nm - delta_rate < 0.0) pareto_ok = false;
         } else {
-          if (nm < -0.19353014947100283 *
-                       std::max(0.008, delta_rate)) {
+          if (nm_p < -0.19353014947100283 *
+                         std::max(0.008, delta_rate)) {
             pareto_ok = false;
           }
         }
@@ -11314,12 +11419,13 @@ Status RefineQuantFieldClosedLoop(
           for (size_t m = 0; m < 4; ++m) {
             if (weight_m[m] <= 0.0) continue;
             const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
+            const double nm_p = (nm < 0.0) ? (pareto_w_m[m] * nm) : nm;
             norm_sum += weight_m[m] * nm;
             if (delta_rate < 0.0) {
               if (nm - delta_rate < 0.0) pareto_ok = false;
             } else {
-              if (nm < -0.19353014947100283 *
-                           std::max(0.008, delta_rate)) {
+              if (nm_p < -0.19353014947100283 *
+                             std::max(0.008, delta_rate)) {
                 pareto_ok = false;
               }
             }
@@ -12454,12 +12560,13 @@ Status RefineQuantFieldClosedLoop(
         for (size_t m = 0; m < 4; ++m) {
           if (weight_m[m] <= 0.0) continue;
           const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
+          const double nm_p = (nm < 0.0) ? (pareto_w_m[m] * nm) : nm;
           norm_sum += weight_m[m] * nm;
           if (require_unanimous || delta_rate < 0.0) {
             if (nm - delta_rate < 0.0) pareto_ok = false;
           } else {
-            if (nm < -0.16031291192668531 *
-                         std::max(0.006, delta_rate)) {
+            if (nm_p < -0.16031291192668531 *
+                           std::max(0.006, delta_rate)) {
               pareto_ok = false;
             }
           }
@@ -13030,6 +13137,7 @@ Status RefineQuantFieldClosedLoop(
     const double anchor_tot_oh = anchor_lf_bits + cur_sh_bits;
     JXL_RETURN_IF_ERROR(CopyImageTo(rdo_sharpness, &best_cand_sharp));
     double best_global_j = 0.0;
+    double best_sharp_j = 0.0;
     double best_global_sh_bits = cur_sh_bits;
     bool global_changed = false;
 
@@ -13052,18 +13160,31 @@ Status RefineQuantFieldClosedLoop(
                                 rate_term(cur_bits + anchor_tot_oh);
       double j_gain = 0.0;
       double min_rd_m = 1e30;
+      double sharp_num = 0.0;
+      double sharp_den = 0.0;
       for (size_t m = 0; m < 4; ++m) {
         if (weight_m[m] <= 0.0) continue;
         const double rd_m = (anchor_d[m] - c_d[m]) / slope_m[m] - delta_rate;
+        const double rd_p = (rd_m < 0.0) ? (pareto_w_m[m] * rd_m) : rd_m;
         j_gain += weight_m[m] * rd_m;
-        min_rd_m = std::min(min_rd_m, rd_m);
+        min_rd_m = std::min(min_rd_m, rd_p);
+        if (m == 1 || m == 2) {
+          sharp_num += weight_m[m] * rd_m;
+          sharp_den += weight_m[m];
+        }
       }
       if (out_j != nullptr) *out_j = j_gain;
+      const double sharp_j = (sharp_den > 1e-9) ? (sharp_num / sharp_den) : j_gain;
+      const double sharp_tol = 0.0015 * (1.0 - sigma_lo);
+      const bool sharp_ok =
+          (sigma_lo <= 0.15) ||
+          (sharp_j >= best_sharp_j - sharp_tol && sharp_j >= -sharp_tol);
       const double pareto_tol =
           -std::min(0.25, 0.3539171106187113 * std::max(0.0, j_gain));
-      if (j_gain > best_global_j + 0.009974152461641368 &&
+      if (sharp_ok && j_gain > best_global_j + 0.009974152461641368 &&
           min_rd_m >= pareto_tol) {
         best_global_j = j_gain;
+        best_sharp_j = std::max(best_sharp_j, sharp_j);
         best_global_sh_bits = c_sh_bits;
         st.best_lf = c_lf;
         JXL_RETURN_IF_ERROR(CopyImageTo(cand_s, &best_cand_sharp));
@@ -13157,26 +13278,180 @@ Status RefineQuantFieldClosedLoop(
       }
     }
 
+    // Gentle texture-preserving epf_sigma_custom candidate for epf_iters == 1
+    // at low/medium distance, scored with exact +64 F16 header bits.
+    if (allow_lf_rdo && cparams.butteraugli_distance < 2.5f &&
+        st.best_lf.epf_iters == 1 && !st.best_lf.epf_sigma_custom &&
+        num_blocks >= 128) {
+      LoopFilter elf1 = st.best_lf;
+      elf1.epf_sigma_custom = true;
+      elf1.epf_quant_mul = SnapToExactJxlF16(0.32f);
+      elf1.epf_pass0_sigma_scale = SnapToExactJxlF16(0.9f);
+      elf1.epf_pass2_sigma_scale = SnapToExactJxlF16(6.5f);
+      elf1.epf_border_sad_mul = SnapToExactJxlF16(0.60f);
+      JXL_RETURN_IF_ERROR(CopyImageTo(best_cand_sharp, &cand_sharp));
+      JXL_RETURN_IF_ERROR(eval_lf_sharpness_cand(elf1, cand_sharp, nullptr));
+    }
+
     // Closed-loop F16-exact post-quantization gab_custom de-blurring:
-    // counteracts uncompensated decoder Gaborish blur where mid/high-frequency
-    // AC pre-sharpening was deadzoned to zero, paying exact +96 header bits.
+    // solves per-channel 2x2 Wiener Gaborish weights against orig_opsin (minus
+    // additive features) and competes alongside anchor candidates (+96 bits).
     if (cparams.gaborish == Override::kDefault && st.best_lf.gab &&
-        !st.best_lf.gab_custom && num_blocks >= 256 &&
-        cparams.butteraugli_distance >= 1.2f) {
+        num_blocks >= 64) {
       st.base_gab_lf = st.best_lf;
       JXL_RETURN_IF_ERROR(CopyImageTo(best_cand_sharp, &cand_sharp));
 
-      LoopFilter glf1 = st.base_gab_lf;
-      glf1.gab_custom = true;
-      glf1.gab_x_weight1 = 0.107543945f;
-      glf1.gab_x_weight2 = 0.057617188f;
-      glf1.gab_y_weight1 = 0.0960083f;
-      glf1.gab_y_weight2 = 0.05090332f;
-      glf1.gab_b_weight1 = 0.096069336f;
-      glf1.gab_b_weight2 = 0.05090332f;
-      JXL_RETURN_IF_ERROR(eval_lf_sharpness_cand(glf1, cand_sharp, nullptr));
+      if (st.base_gab_lf.gab_custom &&
+          cparams.butteraugli_distance >= 1.65f) {
+        LoopFilter glf_std = st.base_gab_lf;
+        glf_std.gab_custom = false;
+        glf_std.gab_x_weight1 = 1.1f * 0.104699568f;
+        glf_std.gab_x_weight2 = 1.1f * 0.055680538f;
+        glf_std.gab_y_weight1 = 1.1f * 0.104699568f;
+        glf_std.gab_y_weight2 = 1.1f * 0.055680538f;
+        glf_std.gab_b_weight1 = 1.1f * 0.104699568f;
+        glf_std.gab_b_weight2 = 1.1f * 0.055680538f;
+        JXL_RETURN_IF_ERROR(
+            eval_lf_sharpness_cand(glf_std, cand_sharp, nullptr));
+      }
 
-      if (cparams.butteraugli_distance >= 2.4f) {
+      if (xsize >= 4 && ysize >= 4 && enc_state->orig_opsin != nullptr) {
+        double w1_opt[3] = {0.1075, 0.0960, 0.0961};
+        double w2_opt[3] = {0.0576, 0.0509, 0.0509};
+        for (size_t c = 0; c < 3; ++c) {
+          const double w1_enc =
+              (c == 0) ? st.base_gab_lf.gab_x_weight1
+                       : ((c == 1) ? st.base_gab_lf.gab_y_weight1
+                                   : st.base_gab_lf.gab_b_weight1);
+          const double w2_enc =
+              (c == 0) ? st.base_gab_lf.gab_x_weight2
+                       : ((c == 1) ? st.base_gab_lf.gab_y_weight2
+                                   : st.base_gab_lf.gab_b_weight2);
+          const double z_enc = 1.0 + 4.0 * (w1_enc + w2_enc);
+          const double alpha1_enc = w1_enc / z_enc;
+          const double alpha2_enc = w2_enc / z_enc;
+          double a11 = 0.0;
+          double a12 = 0.0;
+          double a22 = 0.0;
+          double b1 = 0.0;
+          double b2 = 0.0;
+          for (size_t y = 1; y + 1 < ysize; ++y) {
+            const float* JXL_RESTRICT rt = cur_pre_gab.ConstPlaneRow(c, y - 1);
+            const float* JXL_RESTRICT rm = cur_pre_gab.ConstPlaneRow(c, y);
+            const float* JXL_RESTRICT rb = cur_pre_gab.ConstPlaneRow(c, y + 1);
+            const float* JXL_RESTRICT ro =
+                enc_state->orig_opsin->ConstPlaneRow(c, y);
+            const float* JXL_RESTRICT rf =
+                (feat_ptr != nullptr) ? feat_ptr->ConstPlaneRow(c, y) : nullptr;
+            const int32_t* JXL_RESTRICT qf_r = rdo_quant_field.ConstRow(y >> 3);
+            for (size_t x = 1; x + 1 < xsize; ++x) {
+              const double wt = std::sqrt(
+                  static_cast<double>(std::max<int32_t>(1, qf_r[x >> 3])));
+              const double s0 = static_cast<double>(rm[x]);
+              const double s1 = static_cast<double>(rm[x - 1] + rm[x + 1] +
+                                                    rt[x] + rb[x]);
+              const double s2 = static_cast<double>(rt[x - 1] + rt[x + 1] +
+                                                    rb[x - 1] + rb[x + 1]);
+              const double r_tgt =
+                  static_cast<double>(ro[x]) -
+                  ((rf != nullptr) ? static_cast<double>(rf[x]) : 0.0);
+              const double u1 = s1 - 4.0 * s0;
+              const double u2 = s2 - 4.0 * s0;
+              const double err = r_tgt - s0;
+              a11 += wt * u1 * u1;
+              a12 += wt * u1 * u2;
+              a22 += wt * u2 * u2;
+              b1 += wt * u1 * err;
+              b2 += wt * u2 * err;
+            }
+          }
+          const double reg = 1e-3 * (a11 + a22) + 1e-9;
+          a11 += reg;
+          a22 += reg;
+          b1 += reg * alpha1_enc;
+          b2 += reg * alpha2_enc;
+          const double det = a11 * a22 - a12 * a12;
+          double alpha1 = alpha1_enc;
+          double alpha2 = alpha2_enc;
+          if (det > 1e-18) {
+            alpha1 = (a22 * b1 - a12 * b2) / det;
+            alpha2 = (a11 * b2 - a12 * b1) / det;
+          }
+          alpha1 = Clamp1(alpha1, 0.002, 0.080);
+          alpha2 = Clamp1(alpha2, 0.001, 0.046);
+          if (alpha1 + alpha2 > 0.122) {
+            const double sc = 0.122 / (alpha1 + alpha2);
+            alpha1 *= sc;
+            alpha2 *= sc;
+          }
+          const double denom = std::max(0.45, 1.0 - 4.0 * (alpha1 + alpha2));
+          w1_opt[c] = alpha1 / denom;
+          w2_opt[c] = alpha2 / denom;
+        }
+
+        LoopFilter glf_w1 = st.base_gab_lf;
+        glf_w1.gab_custom = true;
+        glf_w1.gab_x_weight1 = SnapToExactJxlF16(static_cast<float>(w1_opt[0]));
+        glf_w1.gab_x_weight2 = SnapToExactJxlF16(static_cast<float>(w2_opt[0]));
+        glf_w1.gab_y_weight1 = SnapToExactJxlF16(static_cast<float>(w1_opt[1]));
+        glf_w1.gab_y_weight2 = SnapToExactJxlF16(static_cast<float>(w2_opt[1]));
+        glf_w1.gab_b_weight1 = SnapToExactJxlF16(static_cast<float>(w1_opt[2]));
+        glf_w1.gab_b_weight2 = SnapToExactJxlF16(static_cast<float>(w2_opt[2]));
+        JXL_RETURN_IF_ERROR(
+            eval_lf_sharpness_cand(glf_w1, cand_sharp, nullptr));
+
+        if (st.base_gab_lf.epf_iters > 0 || sigma_lo > 0.10) {
+          LoopFilter glf_w2 = st.base_gab_lf;
+          glf_w2.gab_custom = true;
+          glf_w2.gab_x_weight1 =
+              SnapToExactJxlF16(static_cast<float>(0.86 * w1_opt[0]));
+          glf_w2.gab_x_weight2 =
+              SnapToExactJxlF16(static_cast<float>(0.86 * w2_opt[0]));
+          glf_w2.gab_y_weight1 =
+              SnapToExactJxlF16(static_cast<float>(0.86 * w1_opt[1]));
+          glf_w2.gab_y_weight2 =
+              SnapToExactJxlF16(static_cast<float>(0.86 * w2_opt[1]));
+          glf_w2.gab_b_weight1 =
+              SnapToExactJxlF16(static_cast<float>(0.86 * w1_opt[2]));
+          glf_w2.gab_b_weight2 =
+              SnapToExactJxlF16(static_cast<float>(0.86 * w2_opt[2]));
+          JXL_RETURN_IF_ERROR(
+              eval_lf_sharpness_cand(glf_w2, cand_sharp, nullptr));
+        }
+
+        if (sigma_lo > 0.15) {
+          LoopFilter glf_w3 = st.base_gab_lf;
+          glf_w3.gab_custom = true;
+          glf_w3.gab_x_weight1 =
+              SnapToExactJxlF16(static_cast<float>(0.72 * w1_opt[0]));
+          glf_w3.gab_x_weight2 =
+              SnapToExactJxlF16(static_cast<float>(0.72 * w2_opt[0]));
+          glf_w3.gab_y_weight1 =
+              SnapToExactJxlF16(static_cast<float>(0.72 * w1_opt[1]));
+          glf_w3.gab_y_weight2 =
+              SnapToExactJxlF16(static_cast<float>(0.72 * w2_opt[1]));
+          glf_w3.gab_b_weight1 =
+              SnapToExactJxlF16(static_cast<float>(0.72 * w1_opt[2]));
+          glf_w3.gab_b_weight2 =
+              SnapToExactJxlF16(static_cast<float>(0.72 * w2_opt[2]));
+          JXL_RETURN_IF_ERROR(
+              eval_lf_sharpness_cand(glf_w3, cand_sharp, nullptr));
+        }
+      }
+
+      if (num_blocks >= 256 && cparams.butteraugli_distance >= 1.2f) {
+        LoopFilter glf1 = st.base_gab_lf;
+        glf1.gab_custom = true;
+        glf1.gab_x_weight1 = 0.107543945f;
+        glf1.gab_x_weight2 = 0.057617188f;
+        glf1.gab_y_weight1 = 0.0960083f;
+        glf1.gab_y_weight2 = 0.05090332f;
+        glf1.gab_b_weight1 = 0.096069336f;
+        glf1.gab_b_weight2 = 0.05090332f;
+        JXL_RETURN_IF_ERROR(eval_lf_sharpness_cand(glf1, cand_sharp, nullptr));
+      }
+
+      if (num_blocks >= 256 && cparams.butteraugli_distance >= 2.4f) {
         LoopFilter glf2 = st.base_gab_lf;
         glf2.gab_custom = true;
         glf2.gab_x_weight1 = 0.10369873f;
@@ -13417,8 +13692,9 @@ Status RefineQuantFieldClosedLoop(
             if (weight_m[m] <= 0.0) continue;
             const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
             const double rd_m = nm - delta_rate;
+            const double rd_p = (rd_m < 0.0) ? (pareto_w_m[m] * rd_m) : rd_m;
             j_gain += weight_m[m] * rd_m;
-            min_rd_m = std::min(min_rd_m, rd_m);
+            min_rd_m = std::min(min_rd_m, rd_p);
           }
           const double pareto_tol =
               started_uniform ? 0.0

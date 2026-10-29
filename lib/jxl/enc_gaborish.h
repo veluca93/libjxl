@@ -21,6 +21,10 @@ namespace jxl {
 Status GaborishInverse(Image3F* in_out, const Rect& rect, const float mul[3],
                        ThreadPool* pool);
 
+Status GaborishInverse(Image3F* in_out, const Rect& rect, const float w1[3],
+                       const float w2[3], const float mul[3],
+                       ThreadPool* pool);
+
 }  // namespace jxl
 
 #endif  // LIB_JXL_GABORISH_H_

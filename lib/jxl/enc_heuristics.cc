@@ -962,6 +962,12 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     };
 
     const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 15.0f);
+    const float sigma_lo = ComputeSharpSigmaLo(cparams.butteraugli_distance);
+    const float sigma_ultra =
+        Clamp1(std::log(0.35f / Clamp1(cparams.butteraugli_distance, 0.05f,
+                                       0.35f)) *
+                   (1.0f / 1.94591015f),
+               0.0f, 1.0f);
     const float t_d = Clamp1((d - 0.5f) / 2.0f, 0.0f, 1.0f);
     const float s_d = Clamp1(std::log(d * (1.0f / 1.85f)), -1.45f, 1.85f);
     const float s_lo = std::min(0.0f, s_d);
@@ -1084,7 +1090,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     const size_t max_bands =
         (frame_blocks < 1024 || d >= 5.0f)
             ? 4
-            : ((frame_blocks < 2500 || d >= 2.5f) ? 5 : 8);
+            : (((frame_blocks < 2500 && d >= 2.0f) || d >= 2.5f) ? 5 : 8);
     std::vector<QuantEncoding> encodings(kNumQuantTables,
                                          QuantEncoding::Library<0>());
     for (size_t idx = 0; idx < 8; ++idx) {
@@ -1142,16 +1148,58 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         target_w[1] = std::exp(ln_w_1);
         const float d_gate = Clamp1((d - 1.05f) / 0.45f, 0.0f, 1.0f) *
                              (1.0f - 0.35f * Clamp1(d - 1.50f, 0.0f, 1.0f));
+        constexpr float kStdGabW1 = 1.1f * 0.104699568f;
+        constexpr float kStdGabW2 = 1.1f * 0.055680538f;
+        const float ch_gab_w1 =
+            frame_header.loop_filter.gab
+                ? ((c == 0) ? frame_header.loop_filter.gab_x_weight1
+                            : ((c == 1) ? frame_header.loop_filter.gab_y_weight1
+                                        : frame_header.loop_filter.gab_b_weight1))
+                : 0.0f;
+        const float ch_gab_w2 =
+            frame_header.loop_filter.gab
+                ? ((c == 0) ? frame_header.loop_filter.gab_x_weight2
+                            : ((c == 1) ? frame_header.loop_filter.gab_y_weight2
+                                        : frame_header.loop_filter.gab_b_weight2))
+                : 0.0f;
+        auto eval_gab_rad = [](float u_r, float w1_g, float w2_g) -> float {
+          const float z_g = 1.0f + 4.0f * (w1_g + w2_g);
+          const float cu = std::cos(3.14159265f * u_r);
+          const float h_ax =
+              std::max(0.10f, (1.0f + 2.0f * w1_g * (cu + 1.0f) +
+                               4.0f * w2_g * cu) /
+                                  z_g);
+          const float h_dg =
+              std::max(0.10f, (1.0f + 4.0f * w1_g * cu +
+                               4.0f * w2_g * cu * cu) /
+                                  z_g);
+          return std::sqrt(h_ax * h_dg);
+        };
+        const float gab_comp_gamma =
+            (c == 1) ? 0.38f : ((c == 0) ? 0.20f : 0.05f);
+        const float ln_gab_ratio_u1 =
+            std::log(eval_gab_rad(u1, ch_gab_w1, ch_gab_w2) /
+                     eval_gab_rad(u1, kStdGabW1, kStdGabW2));
+        const float mb_hf_boost =
+            (c == 1) ? (0.040f * b * sigma_lo + 0.10f * sigma_ultra)
+                     : ((c == 0) ? (0.015f * b * sigma_lo + 0.05f * sigma_ultra)
+                                 : 0.0f);
         const float hf_adapt =
-            d_gate * (0.22307107f * delta_hf[c] + 0.14195432f * delta_chr[c]);
+            d_gate * (0.22307107f * delta_hf[c] + 0.14195432f * delta_chr[c]) +
+            mb_hf_boost;
         const float mf_adapt =
             d_gate * 0.22307107f * delta_mf[c] * std::exp(-0.55f * b);
         for (size_t k = 2; k < out_bands; ++k) {
           const float u =
               static_cast<float>(k) / static_cast<float>(out_bands - 1);
           const float xi = (u - u1) / (1.0f - u1);
-          const float mod =
-              hf_adapt * xi * xi + mf_adapt * 4.0f * xi * (1.0f - xi);
+          const float ln_gab_comp =
+              gab_comp_gamma *
+              (std::log(eval_gab_rad(u, ch_gab_w1, ch_gab_w2) /
+                        eval_gab_rad(u, kStdGabW1, kStdGabW2)) -
+               ln_gab_ratio_u1);
+          const float mod = ln_gab_comp + hf_adapt * xi * xi +
+                            mf_adapt * 4.0f * xi * (1.0f - xi);
           target_w[k] = std::exp(eval_ln_w(u) + mod);
         }
 
@@ -2836,7 +2884,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       cparams.speed_tier <= SpeedTier::kSquirrel &&
       !cparams.disable_perceptual_optimizations &&
       !shared.metadata->m.color_encoding.IsGray() &&
-      cparams.butteraugli_distance >= 0.35f &&
+      cparams.butteraugli_distance >= 0.15f &&
       cparams.butteraugli_distance <= 15.0f && cparams.resampling <= 1 &&
       cparams.ec_resampling <= 1 && cparams.gaborish != Override::kOff &&
       cparams.epf != 3 &&
@@ -2878,6 +2926,12 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
     if (!frame_header.loop_filter.gab) {
       butteraugli_distance_for_iqf *= 0.62f;
+    } else if (frame_header.loop_filter.gab_custom) {
+      const float s_y_eff = Clamp1(
+          frame_header.loop_filter.gab_y_weight1 / (1.1f * 0.104699568f),
+          0.0f, 1.0f);
+      butteraugli_distance_for_iqf *=
+          (0.62f + 0.38f * std::pow(s_y_eff, 0.75f));
     }
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
@@ -2895,18 +2949,29 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   if (frame_header.loop_filter.gab) {
     // Changing the weight here to 0.99f would help to reduce ringing in
     // generation loss.
+    const float d_gab_c = Clamp1(cparams.butteraugli_distance, 0.35f, 2.5f);
+    const float t_gab_lo =
+        std::log(2.5f / d_gab_c) * (1.0f / 1.9661128563728327f);
+    const float sigma_gab_lo = t_gab_lo * t_gab_lo * (3.0f - 2.0f * t_gab_lo);
     const float gab_w =
         enable_rdo
-            ? (0.9878865f + 0.006f * Clamp1((cparams.butteraugli_distance - 2.5f) /
-                                                5.0f,
-                                            0.0f, 1.0f))
+            ? (0.9878865f + 0.0106f * sigma_gab_lo +
+               0.006f * Clamp1((cparams.butteraugli_distance - 2.5f) / 5.0f,
+                               0.0f, 1.0f))
             : 1.0f;
     float weight[3] = {
         gab_w,
         gab_w,
         gab_w,
     };
-    JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
+    const float gab_w1[3] = {frame_header.loop_filter.gab_x_weight1,
+                             frame_header.loop_filter.gab_y_weight1,
+                             frame_header.loop_filter.gab_b_weight1};
+    const float gab_w2[3] = {frame_header.loop_filter.gab_x_weight2,
+                             frame_header.loop_filter.gab_y_weight2,
+                             frame_header.loop_filter.gab_b_weight2};
+    JXL_RETURN_IF_ERROR(
+        GaborishInverse(opsin, rect, gab_w1, gab_w2, weight, pool));
   }
 
   if (initialize_global_state) {

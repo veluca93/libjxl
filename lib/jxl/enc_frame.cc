@@ -294,17 +294,49 @@ uint64_t FrameFlagsFromParams(const CompressParams& cparams) {
   return flags;
 }
 
-Status LoopFilterFromParams(const CompressParams& cparams, bool streaming_mode,
+Status LoopFilterFromParams(size_t xsize, size_t ysize,
+                            const CompressParams& cparams, bool streaming_mode,
                             FrameHeader* JXL_RESTRICT frame_header) {
   LoopFilter* loop_filter = &frame_header->loop_filter;
+
+  const size_t num_blocks = DivCeil(xsize, kBlockDim) * DivCeil(ysize, kBlockDim);
+  const bool use_smooth_gab_ramp =
+      !streaming_mode && cparams.gaborish == Override::kDefault &&
+      cparams.speed_tier <= SpeedTier::kSquirrel &&
+      frame_header->encoding == FrameEncoding::kVarDCT &&
+      cparams.decoding_speed_tier < 4 &&
+      !cparams.disable_perceptual_optimizations && cparams.resampling <= 1 &&
+      cparams.ec_resampling <= 1 && num_blocks >= 128 &&
+      cparams.butteraugli_distance >= 0.15f &&
+      cparams.butteraugli_distance < 1.65f;
 
   // Gaborish defaults to enabled in Hare or slower.
   loop_filter->gab = ApplyOverride(
       cparams.gaborish, cparams.speed_tier <= SpeedTier::kHare &&
                             frame_header->encoding == FrameEncoding::kVarDCT &&
                             cparams.decoding_speed_tier < 4 &&
-                            cparams.butteraugli_distance > 0.5f &&
+                            cparams.butteraugli_distance >
+                                (use_smooth_gab_ramp ? 0.35f : 0.5f) &&
                             !cparams.disable_perceptual_optimizations);
+  if (use_smooth_gab_ramp && loop_filter->gab) {
+    const float t_g =
+        Clamp1(std::log(cparams.butteraugli_distance / 0.30f) *
+                   (1.0f / 1.70474809f),  // ln(1.65 / 0.30)
+               0.0f, 1.0f);
+    const float s_gab = t_g * t_g * (3.0f - 2.0f * t_g);
+    if (s_gab < 0.985f) {
+      constexpr float kStdW1 = 1.1f * 0.104699568f;
+      constexpr float kStdW2 = 1.1f * 0.055680538f;
+      const float s_chr = std::min(1.0f, s_gab * 1.10f);
+      loop_filter->gab_custom = true;
+      loop_filter->gab_x_weight1 = SnapToExactJxlF16(s_chr * kStdW1);
+      loop_filter->gab_x_weight2 = SnapToExactJxlF16(s_chr * kStdW2);
+      loop_filter->gab_y_weight1 = SnapToExactJxlF16(s_gab * kStdW1);
+      loop_filter->gab_y_weight2 = SnapToExactJxlF16(s_gab * kStdW2);
+      loop_filter->gab_b_weight1 = SnapToExactJxlF16(s_chr * kStdW1);
+      loop_filter->gab_b_weight2 = SnapToExactJxlF16(s_chr * kStdW2);
+    }
+  }
 
   if (cparams.epf != -1) {
     loop_filter->epf_iters = cparams.epf;
@@ -397,7 +429,7 @@ Status MakeFrameHeader(size_t xsize, size_t ysize,
   }
 
   JXL_RETURN_IF_ERROR(
-      LoopFilterFromParams(cparams, streaming_mode, frame_header));
+      LoopFilterFromParams(xsize, ysize, cparams, streaming_mode, frame_header));
 
   frame_header->dc_level = frame_info.dc_level;
   if (frame_header->dc_level > 2) {

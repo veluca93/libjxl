@@ -54,6 +54,52 @@ static constexpr size_t kPartialBlockKinds =
     (1 << static_cast<size_t>(AcStrategyType::AFV2)) |
     (1 << static_cast<size_t>(AcStrategyType::AFV3));
 
+static JXL_INLINE float ComputeSharpSigmaLo(float butteraugli_distance) {
+  const float d_c = Clamp1(butteraugli_distance, 0.35f, 2.5f);
+  const float t =
+      std::log(2.5f / d_c) * (1.0f / 1.9661128563728327f);  // ln(2.5 / 0.35)
+  return t * t * (3.0f - 2.0f * t);
+}
+
+static JXL_INLINE float SnapToExactJxlF16(float value) {
+  if (!(value > -65504.0f && value < 65504.0f)) {
+    return (value > 0.0f) ? 65504.0f : ((value < 0.0f) ? -65504.0f : 0.0f);
+  }
+  uint32_t bits32 = 0;
+  memcpy(&bits32, &value, sizeof(bits32));
+  const uint32_t sign = bits32 >> 31;
+  int32_t exp = static_cast<int32_t>((bits32 >> 23) & 0xFF) - 127;
+  uint32_t mantissa32 = bits32 & 0x7FFFFFu;
+  if (exp < -24) return 0.0f;
+  if (exp >= -14) {
+    const uint32_t rounded = bits32 + 0x1000u;
+    if ((static_cast<int32_t>((rounded >> 23) & 0xFF) - 127) <= 15) {
+      bits32 = rounded;
+      exp = static_cast<int32_t>((bits32 >> 23) & 0xFF) - 127;
+      mantissa32 = bits32 & 0x7FFFFFu;
+    }
+  }
+  uint32_t biased_exp16 = 0;
+  uint32_t mantissa16 = 0;
+  if (exp < -14) {
+    const uint32_t sub_exp = static_cast<uint32_t>(-14 - exp);
+    mantissa16 = (1u << (10 - sub_exp)) + (mantissa32 >> (13 + sub_exp));
+  } else {
+    biased_exp16 = static_cast<uint32_t>(exp + 15);
+    mantissa16 = mantissa32 >> 13;
+  }
+  if (biased_exp16 == 0) {
+    const float out =
+        (1.0f / 16384.0f) * (static_cast<float>(mantissa16) * (1.0f / 1024.0f));
+    return sign ? -out : out;
+  }
+  const uint32_t out_bits32 =
+      (sign << 31) | ((biased_exp16 + (127 - 15)) << 23) | (mantissa16 << 13);
+  float out = 0.0f;
+  memcpy(&out, &out_bits32, sizeof(out));
+  return out;
+}
+
 // Computes per-quadrant base thresholds zero_thres[0..3] (indexed by
 // directional quadrant hfix = (v8 >= 4) * 2 + (u8 >= 4)) and jpegli-style
 // per-band deadzone offsets zero_thres[4..7] (indexed by radial scale band
@@ -65,7 +111,8 @@ static JXL_INLINE void ComputeBandThresholds(size_t c,
                                              float q_block,
                                              const float band_q[4],
                                              float zero_thres[8],
-                                             float pos_dz_scale = 1.0f) {
+                                             float pos_dz_scale = 1.0f,
+                                             float sigma_lo = 0.0f) {
   static constexpr float kQuadY[4] = {0.58f, 0.64f, 0.64f, 0.64f};
   static constexpr float kQuadChroma[4] = {0.58f, 0.62f, 0.62f, 0.62f};
   const bool is_partial_block =
@@ -75,8 +122,15 @@ static JXL_INLINE void ComputeBandThresholds(size_t c,
       (!is_partial_block && c == 1 && num_blocks > 1.0f)
           ? Clamp1(0.003f * num_blocks, 0.0f, 0.08f)
           : 0.0f;
+  const float mb_sharp_sub =
+      (!is_partial_block && c == 1 && num_blocks > 1.0f)
+          ? (0.014f * sigma_lo * Clamp1((num_blocks - 1.0f) * 0.25f, 0.0f, 1.0f))
+          : 0.0f;
   for (size_t hfix = 0; hfix < 4; ++hfix) {
     float q_t0 = (c == 1) ? kQuadY[hfix] : kQuadChroma[hfix];
+    if (hfix >= 1 && mb_sharp_sub > 0.0f) {
+      q_t0 -= mb_sharp_sub;
+    }
     if (multi_block_sub > 0.0f) {
       q_t0 = std::max(0.54f, q_t0 - multi_block_sub);
     }
@@ -106,9 +160,10 @@ static JXL_INLINE void ComputeBlockThresholds(
     AcStrategyType quant_kind, size_t xblocks, size_t yblocks, float q_block,
     const float band_q[3][4], float butteraugli_distance, float dz_w,
     float eob_scale, float zero_thres[3][8]) {
+  const float sigma_lo = ComputeSharpSigmaLo(butteraugli_distance);
   for (size_t c = 0; c < 3; ++c) {
     ComputeBandThresholds(c, quant_kind, xblocks, yblocks, q_block, band_q[c],
-                          zero_thres[c], dz_w);
+                          zero_thres[c], dz_w, sigma_lo);
   }
   const bool is_partial_block =
       ((1 << static_cast<size_t>(quant_kind)) & kPartialBlockKinds) != 0;
@@ -118,8 +173,9 @@ static JXL_INLINE void ComputeBlockThresholds(
   const bool q0_sub = (act_bits & 1u) != 0;
   if (eob_scale <= 0.0f) {
     if (!is_partial_block) {
+      const float low_d_keep = 1.0f - 0.70f * sigma_lo;
       for (int i = 1; i < 4; ++i) {
-        zero_thres[1][i] += 0.01f * activity;
+        zero_thres[1][i] += 0.01f * low_d_keep * activity;
       }
     }
     return;
@@ -130,6 +186,12 @@ static JXL_INLINE void ComputeBlockThresholds(
                  1.65f,
              0.0f, 1.0f);
   const float hr_w = 1.0f - dz_w_rt;
+  const float act_dz_keep = 1.0f - 0.72f * sigma_lo;
+  const float struct_hf_sub =
+      (activity >= 3)
+          ? (0.010f * sigma_lo *
+             Clamp1(static_cast<float>(activity - 2) * 0.20f, 0.0f, 1.0f))
+          : 0.0f;
   if (!is_partial_block) {
     if (q0_sub) {
       zero_thres[1][0] -= 0.003f;
@@ -138,13 +200,16 @@ static JXL_INLINE void ComputeBlockThresholds(
     const float raw_act = static_cast<float>(activity);
     const float eff_act = raw_act / (1.0f + 0.032f * dz_w_rt * raw_act);
     if (activity > 0) {
-      const float delta_hf = -0.002f * hr_w + dz_w_rt * (0.0100f * eff_act);
+      const float delta_hf =
+          -0.002f * hr_w - struct_hf_sub +
+          dz_w_rt * act_dz_keep * (0.0100f * eff_act);
       zero_thres[1][1] += delta_hf;
       zero_thres[1][2] += delta_hf;
       luma_hf_dz = std::max(0.0f, delta_hf);
     }
     zero_thres[1][3] +=
-        -0.002f * hr_w + dz_w_rt * (0.0025f + 0.0115f * eff_act);
+        -0.002f * hr_w - struct_hf_sub +
+        dz_w_rt * act_dz_keep * (0.0025f + 0.0115f * eff_act);
     for (int cc : {0, 2}) {
       const float c_mf_ratio = band_q[cc][2] / std::max(q_block, 1e-4f);
       const float c_luma_mask_w =
