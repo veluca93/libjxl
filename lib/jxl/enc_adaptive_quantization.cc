@@ -219,7 +219,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
                          const Rect& rect_in, const float scale,
                          const Rect& rect_out, ImageF* out,
                          ImageF (*band_qf)[4], bool has_noise) {
-  float base_level = 0.48f * scale;
+  float base_level = 0.4810937f * scale;
   float kDampenRampStart = 2.0f;
   float kDampenRampEnd = 14.0f;
   float dampen = 1.0f;
@@ -418,7 +418,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
         const float e_harm = std::max(0.0f, E0_harm[1] - 5e-4f) * gammac;
         const float mask_base =
             -0.115f - 0.56771064f * e_harm / (e_harm + 0.027557747f) +
-            0.400148928f * GetLane(gamma_val);
+            0.39672908f * GetLane(gamma_val);
         const float hf_mod = Clamp1(
             0.42661875f - 49.331444f * E[1][0] / edge_loc_y, -0.45f, 0.0f);
         const float psych_log_q =

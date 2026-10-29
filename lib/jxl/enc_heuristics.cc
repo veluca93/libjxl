@@ -943,22 +943,22 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
     // (including smooth log(d / 1.85) distance slopes for steepness & chroma).
     static constexpr ChannelQMParams kChannelParams[3] = {
         // c = 0 (X):
-        {4370.1562f, 0.615591586f, -0.185f, 0.055f, 2.1221492f, 0.885f,
+        {4370.1562f, 0.6138126f, -0.185f, 0.055f, 2.1221492f, 0.885f,
          1.10305357f, 1.53f, 0.010f, 0.003f, 0.012f, 0.0218714848f, 0.004f,
-         -0.014482889f, 0.0230346546f, 0.00512734987f, 0.00285051018f, 0.0f,
-         0.999176383f},
+         -0.014482889f, 0.0230346546f, 0.00512734987f, 0.00285051018f,
+         0.00338653f, 0.999176383f},
         // c = 1 (Y):
-        {808.7489f, 0.653820932f, 0.961432993f, 0.245166048f, 1.7802039f,
+        {808.7489f, 0.6506217f, 0.9594315f, 0.245166048f, 1.7803674f,
          1.269f, 0.138599098f, 0.681327343f, 0.000f, 0.004f, 0.007f,
          0.0286034308f, 0.005f, 0.0f, 0.023055864f, -0.000636900018f,
-         -0.026484508f, -0.00363907497f, 1.0056529f},
+         -0.026541898f, -0.00363907497f, 1.0056529f},
         // c = 2 (B): convex 4-metric compromise — preserve LF/MF blue-yellow
         // contrast for WD_s1 & SSIM2 while retaining S-cone HF roll-off so bits
         // are not wasted on invisible HF blue grain under BA3 & CVVDP.
-        {290.98782f, 0.715576172f, 0.513301969f, 0.115f, 2.0513363f, 1.295f,
+        {290.98782f, 0.7135083f, 0.513301969f, 0.115f, 2.0513363f, 1.295f,
          0.46f, 1.02f, 0.011f, 0.004f, 0.012f, 0.026f, 0.005f,
-         -0.0013592651f, 0.0368712395f, 0.0011156f, -0.00549831009f, 0.0f,
-         0.993407249f},
+         -0.0013592651f, 0.0368712395f, 0.0011156f, -0.00549831009f,
+         0.00338653f, 0.993407249f},
     };
 
     const float d = Clamp1(cparams.butteraugli_distance, 0.35f, 15.0f);
@@ -1143,9 +1143,9 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         const float d_gate = Clamp1((d - 1.05f) / 0.45f, 0.0f, 1.0f) *
                              (1.0f - 0.35f * Clamp1(d - 1.50f, 0.0f, 1.0f));
         const float hf_adapt =
-            d_gate * (0.22f * delta_hf[c] + 0.14f * delta_chr[c]);
+            d_gate * (0.22307107f * delta_hf[c] + 0.14195432f * delta_chr[c]);
         const float mf_adapt =
-            d_gate * 0.22f * delta_mf[c] * std::exp(-0.55f * b);
+            d_gate * 0.22307107f * delta_mf[c] * std::exp(-0.55f * b);
         for (size_t k = 2; k < out_bands; ++k) {
           const float u =
               static_cast<float>(k) / static_cast<float>(out_bands - 1);

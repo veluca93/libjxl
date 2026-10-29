@@ -466,7 +466,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   }
   const float eff_ref_bits =
       base_ref * (1.0f + 0.355283588f * eob_scale) * rdoq_ref_mul;
-  constexpr float kQuadTilt = 0.494345099f;
+  constexpr float kQuadTilt = 0.47541872f;
   const float base_h = 0.58f;
   const float t_ref = 0.60f;
   const float denom_ref = b_c * (2.0f * t_ref - b_c);
@@ -945,7 +945,7 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
   HWY_ALIGN float t0_row[AcStrategy::kMaxBlockDim];
   HWY_ALIGN float bias_row[AcStrategy::kMaxBlockDim];
   constexpr float scalar_bias_slope = 0.449189574f;
-  const float bias_scale = Clamp1(1.35f * eob_scale, 0.0f, 1.0f);
+  const float bias_scale = Clamp1(1.33272f * eob_scale, 0.0f, 1.0f);
   const float dz_shift =
       (rdoq_level > 0) ? -0.025f : ((rdoq_level == -1) ? 0.028f : 0.0f);
   const float aq_dz_mul =
@@ -8463,11 +8463,11 @@ Status RefineQuantFieldClosedLoop(
       full_px_rect, &cur_lin));
   JXL_RETURN_IF_ERROR(score_full_4m(cur_lin, &cur_d));
 
-  constexpr double kAcsEpfBdryWD = 0.076615785663558644;
-  constexpr double kP2gLocLamMul = 0.8355306854721061;
+  constexpr double kAcsEpfBdryWD = 0.07799340207135852;
+  constexpr double kP2gLocLamMul = 0.8256526086402158;
   {
     static constexpr double kMetricPrior[4] = {
-        0.17723437466700412, 0.3118532281223597, 0.23159173837025046,
+        0.17723437466700412, 0.3118532281223597, 0.23035563601193476,
         0.29831789635209766};
     const double r_plain = rate_term(plain_bits + cur_sh_bits);
     const double r_fine = rate_term(fine_bits + cur_sh_bits);
@@ -8484,7 +8484,7 @@ Status RefineQuantFieldClosedLoop(
     slope_scale_eff *=
         std::exp(-0.0068919500336050987 * static_cast<double>(s_lo));
     slope_scale_eff *=
-        std::exp(0.030910825356841087 * static_cast<double>(s_hi));
+        std::exp(0.029940325394272806 * static_cast<double>(s_hi));
     size_t active_cnt = 0;
     for (size_t m = 0; m < 4; ++m) {
       const double sf =
@@ -8512,9 +8512,15 @@ Status RefineQuantFieldClosedLoop(
     double w_sum = 0.0;
     for (size_t m = 0; m < 4; ++m) {
       double prior_m = kMetricPrior[m];
+      if (m == 0) {
+        prior_m *=
+            std::exp(-0.003997480124235154 * static_cast<double>(s_hi));
+      }
       if (m == 1) {
         prior_m *=
             std::exp(0.013285264745354651 * static_cast<double>(-s_lo));
+        prior_m *=
+            std::exp(0.0017962800338864326 * static_cast<double>(s_hi));
       }
       if (m == 2) {
         prior_m *=
@@ -8638,9 +8644,9 @@ Status RefineQuantFieldClosedLoop(
     Stage2MoveKind kind;
   };
   auto map_alpha_to_rdoq = [](float alpha) -> int8_t {
-    if (alpha < 1.23f) return -1;
-    if (alpha < 1.38f) return -2;
-    if (alpha < 1.55f) return -3;
+    if (alpha < 1.2306579f) return -1;
+    if (alpha < 1.3810871f) return -2;
+    if (alpha < 1.5515734f) return -3;
     return -4;
   };
   size_t unsignal_moves = 0;
@@ -8706,7 +8712,7 @@ Status RefineQuantFieldClosedLoop(
             }
             const float alpha =
                 static_cast<float>(q_tgt) / static_cast<float>(q_low);
-            if (alpha < 1.05f || alpha > 1.72f) continue;
+            if (alpha < 1.05f || alpha > 1.7220597f) continue;
             const int8_t cand_rl = map_alpha_to_rdoq(alpha);
             item.saved_trs.reserve(qe.tr_count);
             for (size_t i = i0; i <= i1; ++i) {
@@ -8763,7 +8769,7 @@ Status RefineQuantFieldClosedLoop(
                 const int32_t cand_q = qe.ref_q;
                 const float alpha =
                     static_cast<float>(cand_q) / static_cast<float>(oq);
-                if (alpha >= 1.05f && alpha <= 1.72f) {
+                if (alpha >= 1.05f && alpha <= 1.7220597f) {
                   nq = cand_q;
                   nrl = map_alpha_to_rdoq(alpha);
                 }
@@ -9208,11 +9214,11 @@ Status RefineQuantFieldClosedLoop(
     }
     if (num_nbr < 2 || num_hi * 4 < 3 * num_nbr || min_hi > 255) return 0;
     const int32_t max_alpha_q =
-        static_cast<int32_t>(std::floor(1.70f * static_cast<float>(q_cur)));
+        static_cast<int32_t>(std::floor(1.7020597f * static_cast<float>(q_cur)));
     const int32_t q_tgt = std::min(min_hi, max_alpha_q);
     if (q_tgt <= q_cur) return 0;
     const float alpha = static_cast<float>(q_tgt) / static_cast<float>(q_cur);
-    if (alpha < 1.05f || alpha > 1.72f) return 0;
+    if (alpha < 1.05f || alpha > 1.7220597f) return 0;
     return static_cast<int16_t>(q_tgt);
   };
 
@@ -9273,7 +9279,7 @@ Status RefineQuantFieldClosedLoop(
           if (q_tgt > q_low) {
             const float alpha =
                 static_cast<float>(q_tgt) / static_cast<float>(q_low);
-            if (alpha >= 1.05f && alpha <= 1.72f) {
+            if (alpha >= 1.05f && alpha <= 1.7220597f) {
               double save = 0.0;
               const int32_t ql_prev = (i > 0) ? q_l : 1;
               save += qf_jump_cost(q_low, ql_prev) - qf_jump_cost(q_tgt, ql_prev);
@@ -12168,8 +12174,9 @@ Status RefineQuantFieldClosedLoop(
             (static_cast<double>(ch_h.hist[tok]) + 0.5) /
             (static_cast<double>(ch_h.tot) + 8.0);
         const double p_leaf =
-            (static_cast<double>(lf_h.hist[tok]) + 6.0 * p_chan) /
-            (static_cast<double>(lf_h.tot) + 6.0);
+            (static_cast<double>(lf_h.hist[tok]) +
+             5.985103842102667 * p_chan) /
+            (static_cast<double>(lf_h.tot) + 5.985103842102667);
         const double new_sym_pen = (ch_h.hist[tok] == 0) ? 2.0 : 0.0;
         *out_bits = static_cast<double>(nb) - std::log2(p_leaf) + new_sym_pen;
         return true;
@@ -12451,7 +12458,7 @@ Status RefineQuantFieldClosedLoop(
           if (require_unanimous || delta_rate < 0.0) {
             if (nm - delta_rate < 0.0) pareto_ok = false;
           } else {
-            if (nm < -0.16127512455916904 *
+            if (nm < -0.16031291192668531 *
                          std::max(0.006, delta_rate)) {
               pareto_ok = false;
             }
@@ -13054,7 +13061,8 @@ Status RefineQuantFieldClosedLoop(
       if (out_j != nullptr) *out_j = j_gain;
       const double pareto_tol =
           -std::min(0.25, 0.3539171106187113 * std::max(0.0, j_gain));
-      if (j_gain > best_global_j + 0.010 && min_rd_m >= pareto_tol) {
+      if (j_gain > best_global_j + 0.009974152461641368 &&
+          min_rd_m >= pareto_tol) {
         best_global_j = j_gain;
         best_global_sh_bits = c_sh_bits;
         st.best_lf = c_lf;
@@ -13093,10 +13101,10 @@ Status RefineQuantFieldClosedLoop(
         st.base_gab_lf = st.anchor_lf;
         st.base_gab_lf.epf_iters = 3;
         st.base_gab_lf.epf_sigma_custom = true;
-        st.base_gab_lf.epf_quant_mul = 0.4375f;
+        st.base_gab_lf.epf_quant_mul = 0.4399414f;
         st.base_gab_lf.epf_pass0_sigma_scale = 3.0f;
         st.base_gab_lf.epf_pass2_sigma_scale = 6.5f;
-        st.base_gab_lf.epf_border_sad_mul = 0.5f;
+        st.base_gab_lf.epf_border_sad_mul = 0.49682617f;
         cand_lfs.push_back(st.base_gab_lf);
       }
     }
