@@ -1052,8 +1052,8 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
     if (config.band_qf_stride > 0 && !rdo_mode) {
       const float d_ssim2 = std::sqrt(loss_ssim2 * inv_npixels);
       const float d_ssim4 = std::pow(loss_ssim4 * inv_npixels, 0.25f);
-      d_blend = 0.38f * d_blend + 0.61256397f * d_ssim2 +
-                0.3617041f * d_ssim4;
+      d_blend = 0.38f * d_blend + 0.61243844f * d_ssim2 +
+                0.361629993f * d_ssim4;
     }
     out_loss_scalar = d_blend * (num_blocks * kDCTBlockSize) / q_norm;
   };

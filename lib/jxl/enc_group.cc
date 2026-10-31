@@ -459,11 +459,11 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   if (rdoq_level > 0) {
     rdoq_ref_mul = 1.4480802f;
   } else if (rdoq_level == -1) {
-    rdoq_ref_mul = 0.7126939f;
+    rdoq_ref_mul = 0.715483427f;
   } else if (rdoq_level <= -2) {
     rdoq_ref_mul = (rdoq_level == -2)
-                       ? 0.5634234f
-                       : ((rdoq_level == -3) ? 0.43960217f : 0.33813593f);
+                       ? 0.565904856f
+                       : ((rdoq_level == -3) ? 0.441753954f : 0.339791059f);
   }
   const float lo_sharp_boost =
       (!few_colors && rdoq_level >= -1 && c <= 1)
@@ -8563,7 +8563,7 @@ Status RefineQuantFieldClosedLoop(
   constexpr double kP2gLocLamMul = 0.8256526086402158;
   {
     static constexpr double kMetricPrior[4] = {
-        0.17723437466700412, 0.3118532281223597, 0.23035563601193476,
+        0.17723437466700412, 0.31189977506645639, 0.23035563601193476,
         0.29831789635209766};
     const double r_plain = rate_term(plain_bits + cur_sh_bits);
     const double r_fine = rate_term(fine_bits + cur_sh_bits);
@@ -8578,7 +8578,7 @@ Status RefineQuantFieldClosedLoop(
         0.9413027437346102 *
         std::exp(0.020764444817852973 * static_cast<double>(s_d));
     slope_scale_eff *=
-        std::exp(-0.0068919500336050987 * static_cast<double>(s_lo));
+        std::exp(-0.0090437780320644368 * static_cast<double>(s_lo));
     slope_scale_eff *=
         std::exp(0.029940325394272806 * static_cast<double>(s_hi));
     size_t active_cnt = 0;
@@ -8746,9 +8746,9 @@ Status RefineQuantFieldClosedLoop(
     Stage2MoveKind kind;
   };
   auto map_alpha_to_rdoq = [](float alpha) -> int8_t {
-    if (alpha < 1.2306579f) return -1;
-    if (alpha < 1.3810871f) return -2;
-    if (alpha < 1.5515734f) return -3;
+    if (alpha < 1.23046005f) return -1;
+    if (alpha < 1.38075924f) return -2;
+    if (alpha < 1.55109715f) return -3;
     return -4;
   };
   size_t unsignal_moves = 0;
@@ -13302,7 +13302,7 @@ Status RefineQuantFieldClosedLoop(
       JXL_RETURN_IF_ERROR(CopyImageTo(best_cand_sharp, &cand_sharp));
 
       if (st.base_gab_lf.gab_custom &&
-          cparams.butteraugli_distance >= 1.65f) {
+          cparams.butteraugli_distance >= 1.63641834f) {
         LoopFilter glf_std = st.base_gab_lf;
         glf_std.gab_custom = false;
         glf_std.gab_x_weight1 = 1.1f * 0.104699568f;

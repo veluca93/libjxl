@@ -948,10 +948,10 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
          -0.014482889f, 0.0230346546f, 0.00512734987f, 0.00285051018f,
          0.00338653f, 0.999176383f},
         // c = 1 (Y):
-        {808.7489f, 0.6506217f, 0.9594315f, 0.245166048f, 1.7803674f,
+        {808.7489f, 0.650417626f, 0.9594315f, 0.245166048f, 1.78029597f,
          1.269f, 0.138599098f, 0.681327343f, 0.000f, 0.004f, 0.007f,
          0.0286034308f, 0.005f, 0.0f, 0.023055864f, -0.000636900018f,
-         -0.026541898f, -0.00363907497f, 1.0056529f},
+         -0.0268254858f, -0.00363907497f, 1.0056529f},
         // c = 2 (B): convex 4-metric compromise — preserve LF/MF blue-yellow
         // contrast for WD_s1 & SSIM2 while retaining S-cone HF roll-off so bits
         // are not wasted on invisible HF blue grain under BA3 & CVVDP.
@@ -1176,19 +1176,23 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
           return std::sqrt(h_ax * h_dg);
         };
         const float gab_comp_gamma =
-            (c == 1) ? 0.38f : ((c == 0) ? 0.20f : 0.05f);
+            (c == 1) ? 0.375980049f
+                     : ((c == 0) ? 0.201288149f : 0.0503220372f);
         const float ln_gab_ratio_u1 =
             std::log(eval_gab_rad(u1, ch_gab_w1, ch_gab_w2) /
                      eval_gab_rad(u1, kStdGabW1, kStdGabW2));
         const float mb_hf_boost =
-            (c == 1) ? (0.040f * b * sigma_lo + 0.10f * sigma_ultra)
-                     : ((c == 0) ? (0.015f * b * sigma_lo + 0.05f * sigma_ultra)
-                                 : 0.0f);
+            (c == 1)
+                ? (0.0402971394f * b * sigma_lo + 0.100075535f * sigma_ultra)
+                : ((c == 0)
+                       ? (0.0151114278f * b * sigma_lo +
+                          0.0500377677f * sigma_ultra)
+                       : 0.0f);
         const float hf_adapt =
-            d_gate * (0.22307107f * delta_hf[c] + 0.14195432f * delta_chr[c]) +
+            d_gate * (0.223255247f * delta_hf[c] + 0.142071515f * delta_chr[c]) +
             mb_hf_boost;
         const float mf_adapt =
-            d_gate * 0.22307107f * delta_mf[c] * std::exp(-0.55f * b);
+            d_gate * 0.223255247f * delta_mf[c] * std::exp(-0.55f * b);
         for (size_t k = 2; k < out_bands; ++k) {
           const float u =
               static_cast<float>(k) / static_cast<float>(out_bands - 1);
@@ -2925,13 +2929,13 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // Call this here, as it relies on pre-gaborish values.
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
     if (!frame_header.loop_filter.gab) {
-      butteraugli_distance_for_iqf *= 0.62f;
+      butteraugli_distance_for_iqf *= 0.620898664f;
     } else if (frame_header.loop_filter.gab_custom) {
       const float s_y_eff = Clamp1(
           frame_header.loop_filter.gab_y_weight1 / (1.1f * 0.104699568f),
           0.0f, 1.0f);
       butteraugli_distance_for_iqf *=
-          (0.62f + 0.38f * std::pow(s_y_eff, 0.75f));
+          (0.620898664f + 0.379101336f * std::pow(s_y_eff, 0.755501032f));
     }
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
@@ -2955,7 +2959,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     const float sigma_gab_lo = t_gab_lo * t_gab_lo * (3.0f - 2.0f * t_gab_lo);
     const float gab_w =
         enable_rdo
-            ? (0.9878865f + 0.0106f * sigma_gab_lo +
+            ? (0.9878865f + 0.0105678942f * sigma_gab_lo +
                0.006f * Clamp1((cparams.butteraugli_distance - 2.5f) / 5.0f,
                                0.0f, 1.0f))
             : 1.0f;

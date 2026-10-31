@@ -308,7 +308,7 @@ Status LoopFilterFromParams(size_t xsize, size_t ysize,
       !cparams.disable_perceptual_optimizations && cparams.resampling <= 1 &&
       cparams.ec_resampling <= 1 && num_blocks >= 128 &&
       cparams.butteraugli_distance >= 0.15f &&
-      cparams.butteraugli_distance < 1.65f;
+      cparams.butteraugli_distance < 1.63641834f;
 
   // Gaborish defaults to enabled in Hare or slower.
   loop_filter->gab = ApplyOverride(
@@ -320,14 +320,14 @@ Status LoopFilterFromParams(size_t xsize, size_t ysize,
                             !cparams.disable_perceptual_optimizations);
   if (use_smooth_gab_ramp && loop_filter->gab) {
     const float t_g =
-        Clamp1(std::log(cparams.butteraugli_distance / 0.30f) *
-                   (1.0f / 1.70474809f),  // ln(1.65 / 0.30)
+        Clamp1(std::log(cparams.butteraugli_distance / 0.300311327f) *
+                   0.589815497f,  // 1 / ln(1.63641834 / 0.300311327)
                0.0f, 1.0f);
     const float s_gab = t_g * t_g * (3.0f - 2.0f * t_g);
     if (s_gab < 0.985f) {
       constexpr float kStdW1 = 1.1f * 0.104699568f;
       constexpr float kStdW2 = 1.1f * 0.055680538f;
-      const float s_chr = std::min(1.0f, s_gab * 1.10f);
+      const float s_chr = std::min(1.0f, s_gab * 1.09117556f);
       loop_filter->gab_custom = true;
       loop_filter->gab_x_weight1 = SnapToExactJxlF16(s_chr * kStdW1);
       loop_filter->gab_x_weight2 = SnapToExactJxlF16(s_chr * kStdW2);

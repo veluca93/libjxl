@@ -124,7 +124,8 @@ static JXL_INLINE void ComputeBandThresholds(size_t c,
           : 0.0f;
   const float mb_sharp_sub =
       (!is_partial_block && c == 1 && num_blocks > 1.0f)
-          ? (0.014f * sigma_lo * Clamp1((num_blocks - 1.0f) * 0.25f, 0.0f, 1.0f))
+          ? (0.0140055781f * sigma_lo *
+             Clamp1((num_blocks - 1.0f) * 0.25f, 0.0f, 1.0f))
           : 0.0f;
   for (size_t hfix = 0; hfix < 4; ++hfix) {
     float q_t0 = (c == 1) ? kQuadY[hfix] : kQuadChroma[hfix];
@@ -189,7 +190,7 @@ static JXL_INLINE void ComputeBlockThresholds(
   const float act_dz_keep = 1.0f - 0.72f * sigma_lo;
   const float struct_hf_sub =
       (activity >= 3)
-          ? (0.010f * sigma_lo *
+          ? (0.00998512469f * sigma_lo *
              Clamp1(static_cast<float>(activity - 2) * 0.20f, 0.0f, 1.0f))
           : 0.0f;
   if (!is_partial_block) {
