@@ -3007,6 +3007,17 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       enc_state->x_qm_multiplier, enc_state->b_qm_multiplier, quantizer.Scale(),
       quantizer.InvGlobalScale()));
 
+  if (initialize_global_state && !streaming_mode && enable_rdo &&
+      cparams.speed_tier <= SpeedTier::kSquirrel &&
+      frame_header.color_transform == ColorTransform::kXYB &&
+      cparams.noise != Override::kOn) {
+    JXL_RETURN_IF_ERROR(matrices.EnsureComputed(memory_manager, 1));
+    OptimizeColorCorrelationParams(
+        *opsin, rect, frame_dim, matrices, quantizer, initial_quant_field,
+        enc_state->x_qm_multiplier, enc_state->b_qm_multiplier,
+        cparams.butteraugli_distance, &cmap);
+  }
+
   const bool use_two_pass_rdo =
       enable_rdo && !streaming_mode && cparams.use_full_image_heuristics;
   ImageF initial_quant_field_base;

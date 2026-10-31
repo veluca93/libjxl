@@ -85,6 +85,14 @@ struct ColorCorrelation {
     ytox_dc_ = ytox_dc;
     RecomputeDCFactors();
   }
+  void SetBaseCorrelationX(float base_x) {
+    base_correlation_x_ = base_x;
+    RecomputeDCFactors();
+  }
+  void SetBaseCorrelationB(float base_b) {
+    base_correlation_b_ = base_b;
+    RecomputeDCFactors();
+  }
 
   int32_t GetYToXDC() const { return ytox_dc_; }
   int32_t GetYToBDC() const { return ytob_dc_; }

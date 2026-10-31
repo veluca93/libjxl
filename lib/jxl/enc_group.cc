@@ -9962,6 +9962,12 @@ Status RefineQuantFieldClosedLoop(
         EstimateCflMapBits(st.rdo_ytob_map, cfl_tiles_x, cfl_tiles_y);
     double cur_cfl_bits = init_cfl_bits;
 
+    const float cf_scale =
+        shared.cmap.base().GetColorFactor() /
+        static_cast<float>(kDefaultColorFactor);
+    const int32_t max_reclaim_diff =
+        std::max<int32_t>(6, static_cast<int32_t>(std::lround(6.0f * cf_scale)));
+
     struct CflQueueEntry {
       size_t ct;
       int8_t cand_q;
@@ -9998,7 +10004,7 @@ Status RefineQuantFieldClosedLoop(
                              : static_cast<int8_t>(0);
               if (target_q == cur_q ||
                   std::abs(static_cast<int>(cur_q) -
-                           static_cast<int>(target_q)) > 6) {
+                           static_cast<int>(target_q)) > max_reclaim_diff) {
                 continue;
               }
             } else if (target_q == cur_q) {
@@ -10248,7 +10254,7 @@ Status RefineQuantFieldClosedLoop(
         const int32_t gp = CflTileGradPred(cmap_ref, ct_x, ct_y);
         const int32_t tgt = (cur_q != gp) ? gp : 0;
         const int32_t diff = std::abs(cur_q - tgt);
-        if (diff == 0 || diff > 6) continue;
+        if (diff == 0 || diff > max_reclaim_diff) continue;
         const double score = 1.0 / (0.01 + st.cfl_tile_err[ct]);
         reclaim_cands.push_back({score, ct, st.cfl_tile_group[ct]});
       }
@@ -10292,7 +10298,9 @@ Status RefineQuantFieldClosedLoop(
       for (int chan = 0; chan < 2; ++chan) {
         const ImageSB& cmap_ref =
             (chan == 0) ? st.rdo_ytox_map : st.rdo_ytob_map;
-        const int32_t step_mag = (chan == 0) ? 2 : 3;
+        const int32_t step_mag = std::max<int32_t>(
+            1, static_cast<int32_t>(
+                   std::lround(((chan == 0) ? 2.0f : 3.0f) * cf_scale)));
         for (int dir : {-1, 1}) {
           std::vector<std::vector<CflQueueEntry>> queues(num_groups);
           for (const CandTile& c : salient_cfl) {

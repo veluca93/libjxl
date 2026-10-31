@@ -192,10 +192,12 @@ DcChannelRdCost EvalChromaDcChannelCost(
 
 void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
                             const ImageI& quant_y, bool has_dc_rdo,
+                            float butteraugli_distance,
                             PassesSharedState* shared) {
   const float inv_dc_x = shared->quantizer.GetInvDcStep(0);
   const float inv_dc_b = shared->quantizer.GetInvDcStep(2);
   const float half_y_step = shared->quantizer.GetDcStep(1) * 0.5f;
+  const float base_x = shared->cmap.base().GetBaseCorrelationX();
   const float base_b = shared->cmap.base().GetBaseCorrelationB();
   const float color_factor = shared->cmap.base().GetColorFactor();
   const float b_y_comp = has_dc_rdo ? 0.751457036f : 0.0f;
@@ -206,8 +208,7 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
 
   // Check if AC CfL already modified the global ColorCorrelation header.
   const bool header_already_paid =
-      color_factor != kDefaultColorFactor ||
-      shared->cmap.base().GetBaseCorrelationX() != 0.0f ||
+      color_factor != kDefaultColorFactor || base_x != 0.0f ||
       base_b != jxl::cms::kYToBRatio;
   const double kHeaderBits = header_already_paid ? 0.0 : 50.0;
 
@@ -247,7 +248,8 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
         const float rx_l = (x > 0) ? rx[x - 1] : (y > 0 ? rx_p[x] : 0.0f);
         const float rx_t = (y > 0) ? rx_p[x] : rx_l;
         const float rx_tl = (x > 0 && y > 0) ? rx_p[x - 1] : rx_l;
-        const float dx = rx[x] - ClampedGradF32(rx_t, rx_l, rx_tl);
+        const float dx =
+            rx[x] - ClampedGradF32(rx_t, rx_l, rx_tl) - base_x * dy;
 
         const float b_cur = rb[x] - b_y_comp * ry[x];
         const float b_l =
@@ -301,10 +303,26 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
   constexpr double kLambdaX = 3.5;
   constexpr double kLambdaB = 4.5;
   const size_t num_blocks = frame_dim.xsize_blocks * frame_dim.ysize_blocks;
-  const double min_ch_gain = 4.0 + 0.002 * static_cast<double>(num_blocks);
+  const double min_ch_gain =
+      header_already_paid ? 1.0 : 2.0;
 
-  auto search_channel = [&](size_t c, float inv_dc, int32_t seed_l2,
-                            int32_t seed_l1, double lambda_d,
+  const int32_t neutral_x = Clamp1<int32_t>(
+      std::lround((0.0f - base_x) * color_factor), -128, 127);
+  const int32_t neutral_b = Clamp1<int32_t>(
+      std::lround((jxl::cms::kYToBRatio - base_b) * color_factor), -128, 127);
+  const double fine_t = static_cast<double>(
+      Clamp1((5.5f - butteraugli_distance) * 0.25f, 0.0f, 1.0f));
+  const double dist_mul = 1.02 + 0.14 * fine_t;
+  const double dist_add = 0.045 * fine_t * static_cast<double>(num_blocks);
+  const double smooth_mul = 1.015 + 0.12 * fine_t;
+  const double smooth_add_per_blk = 0.005 + 0.055 * fine_t;
+  const double smooth_pen = 1.25 - 0.75 * fine_t;
+  const int32_t search_rad = std::max<int32_t>(
+      8, static_cast<int32_t>(
+             std::lround(8.0f * color_factor / kDefaultColorFactor)));
+
+  auto search_channel = [&](size_t c, float inv_dc, int32_t neutral_idx,
+                            int32_t seed_l2, int32_t seed_l1, double lambda_d,
                             double* out_gain) -> int32_t {
     auto eval = [&](int32_t idx) -> DcChannelRdCost {
       const float ratio = (c == 0) ? shared->cmap.base().YtoXRatio(idx)
@@ -312,25 +330,26 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
       return EvalChromaDcChannelCost(frame_dim, dc, dc, quant_y, c, inv_dc,
                                      half_y_step, ratio, b_y_comp, max_abs_q);
     };
-    const DcChannelRdCost base = eval(0);
+    const DcChannelRdCost base = eval(neutral_idx);
     if (!base.valid) {
       *out_gain = 0.0;
-      return 0;
+      return neutral_idx;
     }
     const double base_score = base.total(lambda_d);
     double best_score = base_score;
-    int32_t best_idx = 0;
+    int32_t best_idx = neutral_idx;
     bool seen[256] = {false};
-    seen[128] = true;
+    seen[neutral_idx + 128] = true;
     auto try_cand = [&](int32_t raw_cand) {
       const int32_t cand = Clamp1<int32_t>(raw_cand, -128, 127);
       if (seen[cand + 128]) return;
       seen[cand + 128] = true;
       const DcChannelRdCost cost = eval(cand);
-      if (!cost.valid || cost.dist > base.dist * 1.02) return;
+      if (!cost.valid || cost.dist > base.dist * dist_mul + dist_add) return;
       if (cost.smooth_n >= 64 &&
           cost.smooth_dist >
-              base.smooth_dist * 1.015 + 0.005 * static_cast<double>(cost.smooth_n)) {
+              base.smooth_dist * smooth_mul +
+                  smooth_add_per_blk * static_cast<double>(cost.smooth_n)) {
         return;
       }
       const double smooth_excess =
@@ -338,20 +357,21 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
               ? std::max(0.0, cost.smooth_dist - base.smooth_dist)
               : 0.0;
       const double score =
-          cost.bits + lambda_d * (cost.dist + 1.25 * smooth_excess);
+          cost.bits + lambda_d * (cost.dist + smooth_pen * smooth_excess);
       if (score < best_score) {
         best_score = score;
         best_idx = cand;
       }
     };
-    try_cand(seed_l2 / 2);
-    try_cand((seed_l2 * 3) / 4);
-    for (int32_t d = -8; d <= 8; ++d) try_cand(seed_l2 + d);
-    for (int32_t d = -6; d <= 6; ++d) try_cand(seed_l1 + d);
+    try_cand(0);
+    try_cand(neutral_idx + (seed_l2 - neutral_idx) / 2);
+    try_cand(neutral_idx + ((seed_l2 - neutral_idx) * 3) / 4);
+    for (int32_t d = -search_rad; d <= search_rad; ++d) try_cand(seed_l2 + d);
+    for (int32_t d = -search_rad; d <= search_rad; ++d) try_cand(seed_l1 + d);
     const double gain = base_score - best_score;
     if (gain < min_ch_gain) {
       *out_gain = 0.0;
-      return 0;
+      return neutral_idx;
     }
     *out_gain = gain;
     return best_idx;
@@ -359,12 +379,12 @@ void ComputeClosedLoopDcCfL(const FrameDimensions& frame_dim, const Image3F& dc,
 
   double gain_x = 0.0;
   double gain_b = 0.0;
-  const int32_t best_x =
-      search_channel(0, inv_dc_x, est_x_l2, est_x_l1, kLambdaX, &gain_x);
-  const int32_t best_b =
-      search_channel(2, inv_dc_b, est_b_l2, est_b_l1, kLambdaB, &gain_b);
+  const int32_t best_x = search_channel(0, inv_dc_x, neutral_x, est_x_l2,
+                                        est_x_l1, kLambdaX, &gain_x);
+  const int32_t best_b = search_channel(2, inv_dc_b, neutral_b, est_b_l2,
+                                        est_b_l1, kLambdaB, &gain_b);
 
-  if (gain_x + gain_b > kHeaderBits + 4.0) {
+  if (header_already_paid || gain_x + gain_b > kHeaderBits + 4.0) {
     shared->cmap.base().SetYToXDC(best_x);
     shared->cmap.base().SetYToBDC(best_b);
   }
@@ -591,6 +611,7 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
       }
       if (xsize_blocks * ysize_blocks > 64) {
         ComputeClosedLoopDcCfL(shared.frame_dim, dc, quant_y, has_dc_rdo,
+                               enc_state->cparams.butteraugli_distance,
                                &shared);
       }
     }
