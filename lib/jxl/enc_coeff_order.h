@@ -18,6 +18,7 @@
 #include "lib/jxl/dct_util.h"
 #include "lib/jxl/enc_bit_writer.h"
 #include "lib/jxl/frame_dimensions.h"
+#include "lib/jxl/image.h"
 
 namespace jxl {
 
@@ -28,7 +29,8 @@ enum class LayerType : uint8_t;
 // Orders that are actually used in part of image. `rect` is in block units.
 // Returns {orders that are used, orders that might be made non-default}.
 std::pair<uint32_t, uint32_t> ComputeUsedOrders(
-    SpeedTier speed, const AcStrategyImage& ac_strategy, const Rect& rect);
+    SpeedTier speed, const AcStrategyImage& ac_strategy, const Rect& rect,
+    bool allow_large_orders = false);
 
 // Modify zig-zag order, so that DCT bands with more zeros go later.
 // Order of DCT bands with same number of zeros is untouched, so
@@ -39,7 +41,9 @@ Status ComputeCoeffOrder(SpeedTier speed, const ACImage& acs,
                          uint32_t& all_used_orders, uint32_t prev_used_acs,
                          uint32_t current_used_acs,
                          uint32_t current_used_orders,
-                         coeff_order_t* JXL_RESTRICT order);
+                         coeff_order_t* JXL_RESTRICT order,
+                         const ImageI* raw_quant_field = nullptr,
+                         bool exact_rdo = false);
 
 Status EncodeCoeffOrders(uint16_t used_orders,
                          const coeff_order_t* JXL_RESTRICT order,

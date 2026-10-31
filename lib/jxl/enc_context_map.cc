@@ -148,30 +148,45 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
     HistogramParams::HybridUintMethod uint_method;
     HistogramParams::ANSHistogramStrategy ans_strategy;
     HistogramParams::ClusteringType clustering;
+    bool force_huffman;
   };
 
   std::vector<CandOption> options;
-  const auto base_lz77 = (context_map.size() <= 2)
-                             ? HistogramParams::LZ77Method::kNone
-                             : HistogramParams::LZ77Method::kRLE;
-  for (bool mtf : {false, true}) {
-    options.push_back(
-        {mtf, base_lz77, HistogramParams::HybridUintMethod::kContextMap,
-         HistogramParams::ANSHistogramStrategy::kPrecise,
-         HistogramParams::ClusteringType::kBest});
-  }
-  if (context_map.size() > 64) {
+  for (bool huff : {false, true}) {
     for (bool mtf : {false, true}) {
       options.push_back(
-          {mtf, HistogramParams::LZ77Method::kRLE,
-           HistogramParams::HybridUintMethod::kBest,
+          {mtf, HistogramParams::LZ77Method::kNone,
+           HistogramParams::HybridUintMethod::kContextMap,
            HistogramParams::ANSHistogramStrategy::kPrecise,
-           HistogramParams::ClusteringType::kBest});
-      options.push_back(
-          {mtf, HistogramParams::LZ77Method::kOptc256,
-           HistogramParams::HybridUintMethod::kBest,
-           HistogramParams::ANSHistogramStrategy::kPrecise,
-           HistogramParams::ClusteringType::kBest});
+           HistogramParams::ClusteringType::kBest, huff});
+      if (context_map.size() > 2) {
+        options.push_back(
+            {mtf, HistogramParams::LZ77Method::kRLE,
+             HistogramParams::HybridUintMethod::kContextMap,
+             HistogramParams::ANSHistogramStrategy::kPrecise,
+             HistogramParams::ClusteringType::kBest, huff});
+      }
+    }
+  }
+  if (context_map.size() > 64) {
+    for (bool huff : {false, true}) {
+      for (bool mtf : {false, true}) {
+        options.push_back(
+            {mtf, HistogramParams::LZ77Method::kNone,
+             HistogramParams::HybridUintMethod::kBest,
+             HistogramParams::ANSHistogramStrategy::kPrecise,
+             HistogramParams::ClusteringType::kBest, huff});
+        options.push_back(
+            {mtf, HistogramParams::LZ77Method::kRLE,
+             HistogramParams::HybridUintMethod::kBest,
+             HistogramParams::ANSHistogramStrategy::kPrecise,
+             HistogramParams::ClusteringType::kBest, huff});
+        options.push_back(
+            {mtf, HistogramParams::LZ77Method::kOptc256,
+             HistogramParams::HybridUintMethod::kBest,
+             HistogramParams::ANSHistogramStrategy::kPrecise,
+             HistogramParams::ClusteringType::kBest, huff});
+      }
     }
   }
 
@@ -191,6 +206,7 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
     cand_params.uint_method = opt.uint_method;
     cand_params.ans_histogram_strategy = opt.ans_strategy;
     cand_params.clustering = opt.clustering;
+    cand_params.force_huffman = opt.force_huffman;
     BitWriter cand_writer{memory_manager};
     JXL_RETURN_IF_ERROR(cand_writer.WithMaxBits(
         2 + src.size() * 24 + 1024, LayerType::Header, nullptr,
@@ -237,6 +253,7 @@ Status EncodeContextMap(const std::vector<uint8_t>& context_map,
     params.uint_method = opt.uint_method;
     params.ans_histogram_strategy = opt.ans_strategy;
     params.clustering = opt.clustering;
+    params.force_huffman = opt.force_huffman;
     JXL_RETURN_IF_ERROR(writer->WithMaxBits(
         2 + src.size() * 24 + 1024, layer, aux_out, [&]() -> Status {
           writer->Write(1, 0);
@@ -283,7 +300,8 @@ Status EncodeBlockCtxMap(const BlockCtxMap& block_ctx_map, BitWriter* writer,
           JXL_RETURN_IF_ERROR(U32Coder::Write(kQFThresholdDist, i - 1, writer));
         }
         JXL_RETURN_IF_ERROR(EncodeContextMap(ctx_map, block_ctx_map.num_ctxs,
-                                             writer, LayerType::Ac, aux_out));
+                                             writer, LayerType::Ac, aux_out,
+                                             /*use_rdo_options=*/true));
         return true;
       });
 }

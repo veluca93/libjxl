@@ -117,7 +117,8 @@ struct EntropyEncodingData {
   Status ChooseUintConfigs(JxlMemoryManager* memory_manager,
                            const HistogramParams& params,
                            const std::vector<std::vector<Token>>& tokens,
-                           std::vector<Histogram>& clustered_histograms);
+                           std::vector<Histogram>& clustered_histograms,
+                           bool exact_rdo = false);
 };
 
 // Writes the context map to the bitstream and concatenates the individual

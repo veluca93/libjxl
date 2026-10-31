@@ -1114,16 +1114,21 @@ Status ComputeVarDCTEncodingData(FrameHeader& frame_header,
 
 Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
                              const FrameDimensions& frame_dim) {
+  const bool exact_rdo =
+      !enc_state.streaming_mode &&
+      enc_state.cparams.speed_tier <= SpeedTier::kSquirrel &&
+      enc_state.progressive_splitter.GetNumPasses() == 1;
   auto used_orders_info = ComputeUsedOrders(
       enc_state.cparams.speed_tier, enc_state.shared.ac_strategy,
-      Rect(enc_state.shared.raw_quant_field));
+      Rect(enc_state.shared.raw_quant_field), exact_rdo);
   enc_state.used_orders.resize(enc_state.progressive_splitter.GetNumPasses());
   for (size_t i = 0; i < enc_state.progressive_splitter.GetNumPasses(); i++) {
     JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
         enc_state.cparams.speed_tier, *enc_state.coeffs[i],
         enc_state.shared.ac_strategy, frame_dim, enc_state.used_orders[i],
         enc_state.used_acs, used_orders_info.first, used_orders_info.second,
-        &enc_state.shared.coeff_orders[i * enc_state.shared.coeff_order_size]));
+        &enc_state.shared.coeff_orders[i * enc_state.shared.coeff_order_size],
+        &enc_state.shared.raw_quant_field, exact_rdo));
   }
   enc_state.used_acs |= used_orders_info.first;
   return true;
@@ -1235,18 +1240,23 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
     // Encode histograms.
     HistogramParams hist_params(enc_state->cparams.speed_tier,
                                 shared.block_ctx_map.NumACContexts());
-    if (enc_state->cparams.speed_tier <= SpeedTier::kSquirrel) {
-      hist_params.clustering = HistogramParams::ClusteringType::kBest;
-      hist_params.uint_method = HistogramParams::HybridUintMethod::kBest;
-      hist_params.ans_histogram_strategy =
-          HistogramParams::ANSHistogramStrategy::kPrecise;
-      hist_params.rdo_context_map = enc_state->band_qf[0][0].xsize() > 0;
-    }
-    if (enc_state->cparams.speed_tier > SpeedTier::kTortoise) {
-      hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
-    }
-    if (enc_state->cparams.decoding_speed_tier >= 1) {
-      hist_params.max_histograms = 6;
+    if (i == 0 && enc_state->has_selected_ac_hist_params &&
+        !enc_state->streaming_mode) {
+      hist_params = enc_state->selected_ac_hist_params;
+    } else {
+      if (enc_state->cparams.speed_tier <= SpeedTier::kSquirrel) {
+        hist_params.clustering = HistogramParams::ClusteringType::kBest;
+        hist_params.uint_method = HistogramParams::HybridUintMethod::kBest;
+        hist_params.ans_histogram_strategy =
+            HistogramParams::ANSHistogramStrategy::kPrecise;
+        hist_params.rdo_context_map = enc_state->band_qf[0][0].xsize() > 0;
+      }
+      if (enc_state->cparams.speed_tier > SpeedTier::kTortoise) {
+        hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
+      }
+      if (enc_state->cparams.decoding_speed_tier >= 1) {
+        hist_params.max_histograms = 6;
+      }
     }
     size_t num_histogram_groups = shared.num_histograms;
     if (enc_state->streaming_mode) {
@@ -1628,20 +1638,377 @@ Status ComputeEncodingData(
           mutable_frame_header, linear, &color, group_rect, cms, pool,
           &enc_modular, &enc_state, aux_out));
     }
-    JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(enc_state, frame_dim));
-    if (!enc_state.streaming_mode && !jpeg_data &&
-        enc_state.initialize_global_state &&
-        cparams.speed_tier < SpeedTier::kFalcon) {
-      JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
-          frame_header, shared.coeff_orders.data(), &enc_state,
-          &shared.block_ctx_map));
-    }
-    if (!enc_state.streaming_mode) {
+    const bool can_exact_order_rdo =
+        !enc_state.streaming_mode && !jpeg_data &&
+        enc_state.initialize_global_state && frame_dim.num_groups > 0 &&
+        enc_state.progressive_splitter.GetNumPasses() == 1 &&
+        cparams.speed_tier <= SpeedTier::kSquirrel &&
+        !enc_state.coeffs.empty() &&
+        enc_state.coeffs[0]->Type() == ACType::k32;
+    if (can_exact_order_rdo) {
       shared.num_histograms = 1;
-      enc_state.histogram_idx.resize(frame_dim.num_groups);
+      enc_state.histogram_idx.assign(frame_dim.num_groups, 0);
+      enc_state.used_orders.assign(1, 0);
+      const uint32_t prev_used_acs = enc_state.used_acs;
+      const BlockCtxMap base_bctx = shared.block_ctx_map;
+      const size_t order_buf_len = shared.coeff_order_size;
+
+      auto fill_natural_orders = [&](std::vector<coeff_order_t>* buf,
+                                     uint32_t mask) {
+        buf->assign(order_buf_len, 0);
+        std::vector<coeff_order_t> nat;
+        uint16_t done = 0;
+        for (uint8_t o = 0; o < AcStrategy::kNumValidStrategies; ++o) {
+          const uint8_t ord = kStrategyOrder[o];
+          if (done & (1u << ord)) continue;
+          done |= (1u << ord);
+          if (((mask >> ord) & 1u) == 0) continue;
+          AcStrategy acs = AcStrategy::FromRawStrategy(o);
+          const size_t sz =
+              kDCTBlockSize * acs.covered_blocks_x() * acs.covered_blocks_y();
+          if (nat.size() < sz) nat.resize(sz);
+          acs.ComputeNaturalCoeffOrder(nat.data());
+          for (size_t c = 0; c < 3; ++c) {
+            memcpy(&(*buf)[CoeffOrderOffset(ord, c)], nat.data(),
+                   sz * sizeof(coeff_order_t));
+          }
+        }
+      };
+
+      struct OrderCand {
+        uint32_t used_orders = 0;
+        std::vector<coeff_order_t> orders;
+      };
+      std::vector<OrderCand> cands;
+      auto push_unique_cand = [&](uint32_t uo,
+                                  std::vector<coeff_order_t>&& ords) {
+        for (const auto& ex : cands) {
+          if (ex.used_orders == uo &&
+              memcmp(ex.orders.data(), ords.data(),
+                     order_buf_len * sizeof(coeff_order_t)) == 0) {
+            return;
+          }
+        }
+        cands.push_back(OrderCand{uo, std::move(ords)});
+      };
+
+      const auto uo_std = ComputeUsedOrders(
+          cparams.speed_tier, shared.ac_strategy,
+          Rect(shared.raw_quant_field), /*allow_large_orders=*/false);
+      const auto uo_lrg = ComputeUsedOrders(
+          cparams.speed_tier, shared.ac_strategy,
+          Rect(shared.raw_quant_field), /*allow_large_orders=*/true);
+      const uint32_t full_nat_mask = uo_lrg.first | 0x5Fu;
+
+      // Candidate 0: 100%-sampled standard bucketed orders (ord 0..6).
+      {
+        std::vector<coeff_order_t> ords;
+        fill_natural_orders(&ords, full_nat_mask);
+        uint32_t uo = 0;
+        JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
+            cparams.speed_tier, *enc_state.coeffs[0], shared.ac_strategy,
+            frame_dim, uo, prev_used_acs, uo_std.first, uo_std.second,
+            ords.data(), &shared.raw_quant_field, /*exact_rdo=*/false));
+        push_unique_cand(uo, std::move(ords));
+        if (uo != 0 && (uo & ~0x13u) == 0 && uo != 0x13u) {
+          std::vector<coeff_order_t> ords13 = cands.back().orders;
+          push_unique_cand(0x13u, std::move(ords13));
+        } else if (uo != 0 && (uo & ~0x5Fu) == 0 && uo != 0x5Fu) {
+          std::vector<coeff_order_t> ords5f = cands.back().orders;
+          push_unique_cand(0x5Fu, std::move(ords5f));
+        }
+      }
+
+      // Candidate 1: 100%-sampled standard bucketed orders extended to ord 7..8.
+      if (uo_lrg.second != uo_std.second) {
+        std::vector<coeff_order_t> ords;
+        fill_natural_orders(&ords, full_nat_mask);
+        uint32_t uo = 0;
+        JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
+            cparams.speed_tier, *enc_state.coeffs[0], shared.ac_strategy,
+            frame_dim, uo, prev_used_acs, uo_lrg.first, uo_lrg.second,
+            ords.data(), &shared.raw_quant_field, /*exact_rdo=*/false));
+        push_unique_cand(uo, std::move(ords));
+      }
+
+      // Candidate 2: Pooled-MDL + Lehmer RDO orders across ord 0..8.
+      const size_t tot_blocks =
+          shared.raw_quant_field.xsize() * shared.raw_quant_field.ysize();
+      if (tot_blocks <= 65536) {
+        std::vector<coeff_order_t> ords;
+        fill_natural_orders(&ords, full_nat_mask);
+        uint32_t uo = 0;
+        JXL_RETURN_IF_ERROR(ComputeCoeffOrder(
+            cparams.speed_tier, *enc_state.coeffs[0], shared.ac_strategy,
+            frame_dim, uo, prev_used_acs, uo_lrg.first, uo_lrg.second,
+            ords.data(), &shared.raw_quant_field, /*exact_rdo=*/true));
+        push_unique_cand(uo, std::move(ords));
+      }
+
+      // Candidate 3: Zero-header natural orders fallback on small/medium frames.
+      if (tot_blocks <= 8192) {
+        std::vector<coeff_order_t> ords;
+        fill_natural_orders(&ords, full_nat_mask);
+        push_unique_cand(0, std::move(ords));
+      }
+
+      HistogramParams hist_params(cparams.speed_tier, 16);
+      hist_params.clustering = HistogramParams::ClusteringType::kBest;
+      hist_params.uint_method = HistogramParams::HybridUintMethod::kBest;
+      hist_params.ans_histogram_strategy =
+          HistogramParams::ANSHistogramStrategy::kPrecise;
+      hist_params.rdo_context_map = enc_state.band_qf[0][0].xsize() > 0;
+      if (cparams.speed_tier > SpeedTier::kTortoise) {
+        hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
+      }
+      if (cparams.decoding_speed_tier >= 1) {
+        hist_params.max_histograms = 6;
+      }
+      hist_params.streaming_mode = false;
+      hist_params.initialize_global_state = true;
+
+      const bool pad_ac_groups =
+          (frame_dim.num_groups > 1 && extra_channels.empty());
+      auto eval_ac_bitstream =
+          [&](const BlockCtxMap& bctx, uint32_t uo,
+              const coeff_order_t* orders,
+              const std::vector<std::vector<Token>>& ac_toks,
+              const HistogramParams& hp) -> StatusOr<size_t> {
+        BitWriter bw_hdr{memory_manager};
+        JXL_RETURN_IF_ERROR(EncodeBlockCtxMap(bctx, &bw_hdr, nullptr));
+        size_t ord_mask_bits = 0;
+        JXL_RETURN_IF_ERROR(U32Coder::CanEncode(kOrderEnc, uo, &ord_mask_bits));
+        JXL_RETURN_IF_ERROR(
+            bw_hdr.WithMaxBits(ord_mask_bits, LayerType::Order, nullptr, [&] {
+              return U32Coder::Write(kOrderEnc, uo, &bw_hdr);
+            }));
+        JXL_RETURN_IF_ERROR(
+            EncodeCoeffOrders(uo, orders, &bw_hdr, LayerType::Order, nullptr));
+
+        std::vector<std::vector<Token>> trial_tokens = ac_toks;
+        EntropyEncodingData trial_codes;
+        JXL_ASSIGN_OR_RETURN(
+            size_t hcost,
+            BuildAndEncodeHistograms(
+                memory_manager, hp, shared.num_histograms * bctx.NumACContexts(),
+                trial_tokens, &trial_codes, &bw_hdr, LayerType::Ac, nullptr));
+        (void)hcost;
+
+        size_t total_bits = bw_hdr.BitsWritten();
+        for (size_t g = 0; g < frame_dim.num_groups; ++g) {
+          BitWriter bw_grp{memory_manager};
+          JXL_RETURN_IF_ERROR(
+              WriteTokens(trial_tokens[g], trial_codes, 0, &bw_grp,
+                          LayerType::AcTokens, nullptr));
+          const size_t gbits = bw_grp.BitsWritten();
+          total_bits += pad_ac_groups ? ((gbits + 7) & ~size_t{7}) : gbits;
+        }
+        return total_bits;
+      };
+
+      size_t best_bits = std::numeric_limits<size_t>::max();
+      size_t best_ci = 0;
+      BlockCtxMap best_bctx = base_bctx;
+      std::vector<std::vector<Token>> best_ac_tokens;
+
+      for (size_t ci = 0; ci < cands.size(); ++ci) {
+        shared.block_ctx_map = base_bctx;
+        enc_state.passes[0].ac_tokens.resize(frame_dim.num_groups);
+        memcpy(shared.coeff_orders.data(), cands[ci].orders.data(),
+               order_buf_len * sizeof(coeff_order_t));
+        enc_state.used_orders[0] = cands[ci].used_orders;
+        JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
+            frame_header, shared.coeff_orders.data(), &enc_state,
+            &shared.block_ctx_map));
+        JXL_RETURN_IF_ERROR(
+            TokenizeAllCoefficients(frame_header, pool, &enc_state));
+
+        JXL_ASSIGN_OR_RETURN(
+            size_t total_bits,
+            eval_ac_bitstream(shared.block_ctx_map, cands[ci].used_orders,
+                              shared.coeff_orders.data(),
+                              enc_state.passes[0].ac_tokens, hist_params));
+        if (total_bits < best_bits) {
+          best_bits = total_bits;
+          best_ci = ci;
+          best_bctx = shared.block_ctx_map;
+          best_ac_tokens.swap(enc_state.passes[0].ac_tokens);
+        }
+      }
+
+      enc_state.used_orders[0] = cands[best_ci].used_orders;
+      memcpy(shared.coeff_orders.data(), cands[best_ci].orders.data(),
+             order_buf_len * sizeof(coeff_order_t));
+
+      ImageB orig_qdc;
+      JXL_ASSIGN_OR_RETURN(orig_qdc,
+                           ImageB::Create(memory_manager,
+                                          shared.quant_dc.xsize(),
+                                          shared.quant_dc.ysize()));
+      JXL_RETURN_IF_ERROR(CopyImageTo(shared.quant_dc, &orig_qdc));
+      ImageB best_qdc;
+      JXL_ASSIGN_OR_RETURN(best_qdc,
+                           ImageB::Create(memory_manager,
+                                          shared.quant_dc.xsize(),
+                                          shared.quant_dc.ysize()));
+      JXL_RETURN_IF_ERROR(CopyImageTo(orig_qdc, &best_qdc));
+
+      // Stage B: Arbitrate richer BlockCtxMap qf/merge & Luma DC splits on
+      // the winning coefficient scan order.
+      if (cparams.decoding_speed_tier == 0 && tot_blocks >= 64) {
+        {
+          shared.block_ctx_map = base_bctx;
+          JXL_RETURN_IF_ERROR(CopyImageTo(orig_qdc, &shared.quant_dc));
+          JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
+              frame_header, shared.coeff_orders.data(), &enc_state,
+              &shared.block_ctx_map, /*merge_lambda=*/220.0,
+              /*min_qf_split_bits=*/110.0, /*min_blocks_for_qf_split=*/1024));
+          if (shared.block_ctx_map.qf_thresholds != best_bctx.qf_thresholds ||
+              shared.block_ctx_map.ctx_map != best_bctx.ctx_map) {
+            enc_state.passes[0].ac_tokens.resize(frame_dim.num_groups);
+            JXL_RETURN_IF_ERROR(
+                TokenizeAllCoefficients(frame_header, pool, &enc_state));
+            JXL_ASSIGN_OR_RETURN(
+                size_t bbits,
+                eval_ac_bitstream(shared.block_ctx_map, enc_state.used_orders[0],
+                                  shared.coeff_orders.data(),
+                                  enc_state.passes[0].ac_tokens, hist_params));
+            if (bbits < best_bits) {
+              best_bits = bbits;
+              best_bctx = shared.block_ctx_map;
+              best_ac_tokens.swap(enc_state.passes[0].ac_tokens);
+            }
+          }
+        }
+
+        if ((frame_header.flags & FrameHeader::kUseDcFrame) == 0 &&
+            base_bctx.num_dc_ctxs == 1 && base_bctx.dc_thresholds[0].empty() &&
+            base_bctx.dc_thresholds[1].empty() &&
+            base_bctx.dc_thresholds[2].empty() && tot_blocks >= 512) {
+          bool dc_ok = (frame_dim.num_dc_groups > 0);
+          std::vector<int32_t> y_dc_vals;
+          y_dc_vals.reserve(tot_blocks);
+          const auto& cs = frame_header.chroma_subsampling;
+          for (size_t dc_g = 0; dc_g < frame_dim.num_dc_groups; ++dc_g) {
+            const Image* dc_img = enc_modular.VarDCTDCImage(dc_g);
+            if (dc_img == nullptr || dc_img->channel.size() < 3 ||
+                !dc_img->transform.empty()) {
+              dc_ok = false;
+              break;
+            }
+            const Rect r = frame_dim.DCGroupRect(dc_g);
+            for (size_t y = 0; y < r.ysize(); ++y) {
+              const int32_t* row_y =
+                  dc_img->channel[0].plane.ConstRow(y >> cs.VShift(1));
+              for (size_t x = 0; x < r.xsize(); ++x) {
+                y_dc_vals.push_back(row_y[x >> cs.HShift(1)]);
+              }
+            }
+          }
+          if (dc_ok && y_dc_vals.size() >= 64) {
+            auto mm = std::minmax_element(y_dc_vals.begin(), y_dc_vals.end());
+            if (*mm.first < *mm.second) {
+              const size_t mid = y_dc_vals.size() / 2;
+              std::nth_element(y_dc_vals.begin(), y_dc_vals.begin() + mid,
+                               y_dc_vals.end());
+              int thr = y_dc_vals[mid];
+              if (thr >= *mm.second) thr = *mm.second - 1;
+              shared.block_ctx_map = base_bctx;
+              shared.block_ctx_map.dc_thresholds[1] = {thr};
+              shared.block_ctx_map.num_dc_ctxs = 2;
+              for (size_t dc_g = 0; dc_g < frame_dim.num_dc_groups; ++dc_g) {
+                const Image* dc_img = enc_modular.VarDCTDCImage(dc_g);
+                const Rect r = frame_dim.DCGroupRect(dc_g);
+                for (size_t y = 0; y < r.ysize(); ++y) {
+                  uint8_t* qdc_row = r.Row(&shared.quant_dc, y);
+                  const int32_t* row_y =
+                      dc_img->channel[0].plane.ConstRow(y >> cs.VShift(1));
+                  for (size_t x = 0; x < r.xsize(); ++x) {
+                    qdc_row[x] = (row_y[x >> cs.HShift(1)] > thr) ? 1 : 0;
+                  }
+                }
+              }
+              JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
+                  frame_header, shared.coeff_orders.data(), &enc_state,
+                  &shared.block_ctx_map, /*merge_lambda=*/320.0,
+                  /*min_qf_split_bits=*/140.0,
+                  /*min_blocks_for_qf_split=*/1024));
+              enc_state.passes[0].ac_tokens.resize(frame_dim.num_groups);
+              JXL_RETURN_IF_ERROR(
+                  TokenizeAllCoefficients(frame_header, pool, &enc_state));
+              JXL_ASSIGN_OR_RETURN(
+                  size_t dcbits,
+                  eval_ac_bitstream(
+                      shared.block_ctx_map, enc_state.used_orders[0],
+                      shared.coeff_orders.data(), enc_state.passes[0].ac_tokens,
+                      hist_params));
+              if (dcbits < best_bits) {
+                best_bits = dcbits;
+                best_bctx = shared.block_ctx_map;
+                best_ac_tokens.swap(enc_state.passes[0].ac_tokens);
+                JXL_RETURN_IF_ERROR(CopyImageTo(shared.quant_dc, &best_qdc));
+              }
+            }
+          }
+        }
+      }
+
+      JXL_RETURN_IF_ERROR(CopyImageTo(best_qdc, &shared.quant_dc));
+      shared.block_ctx_map = std::move(best_bctx);
+      enc_state.passes[0].ac_tokens = std::move(best_ac_tokens);
+
+      // Stage C: Arbitrate AC HistogramParams (finer initial clustering & RLE).
+      HistogramParams best_hp = hist_params;
+      best_hp.max_histograms =
+          std::min<size_t>(kClustersLimit, shared.block_ctx_map.NumACContexts());
+      if (cparams.decoding_speed_tier >= 1) {
+        best_hp.max_histograms = std::min<size_t>(best_hp.max_histograms, 6);
+      }
+      {
+        HistogramParams hp_fine = best_hp;
+        hp_fine.cluster_min_distance = 16.0f;
+        JXL_ASSIGN_OR_RETURN(
+            size_t fbits,
+            eval_ac_bitstream(shared.block_ctx_map, enc_state.used_orders[0],
+                              shared.coeff_orders.data(),
+                              enc_state.passes[0].ac_tokens, hp_fine));
+        if (fbits < best_bits) {
+          best_bits = fbits;
+          best_hp = hp_fine;
+        }
+      }
+      if (tot_blocks <= 32768) {
+        HistogramParams hp_rle = best_hp;
+        hp_rle.lz77_method = HistogramParams::LZ77Method::kRLE;
+        JXL_ASSIGN_OR_RETURN(
+            size_t rbits,
+            eval_ac_bitstream(shared.block_ctx_map, enc_state.used_orders[0],
+                              shared.coeff_orders.data(),
+                              enc_state.passes[0].ac_tokens, hp_rle));
+        if (rbits < best_bits) {
+          best_bits = rbits;
+          best_hp = hp_rle;
+        }
+      }
+      enc_state.has_selected_ac_hist_params = true;
+      enc_state.selected_ac_hist_params = best_hp;
+      enc_state.used_acs = prev_used_acs | uo_lrg.first;
+    } else {
+      JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(enc_state, frame_dim));
+      if (!enc_state.streaming_mode && !jpeg_data &&
+          enc_state.initialize_global_state &&
+          cparams.speed_tier < SpeedTier::kFalcon) {
+        JXL_RETURN_IF_ERROR(FindBestBlockEntropyModelFromCoeffs(
+            frame_header, shared.coeff_orders.data(), &enc_state,
+            &shared.block_ctx_map));
+      }
+      if (!enc_state.streaming_mode) {
+        shared.num_histograms = 1;
+        enc_state.histogram_idx.resize(frame_dim.num_groups);
+      }
+      JXL_RETURN_IF_ERROR(
+          TokenizeAllCoefficients(frame_header, pool, &enc_state));
     }
-    JXL_RETURN_IF_ERROR(
-        TokenizeAllCoefficients(frame_header, pool, &enc_state));
   }
 
   if (cparams.modular_mode || !extra_channels.empty()) {

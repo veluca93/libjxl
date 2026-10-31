@@ -113,6 +113,7 @@ struct HistogramParams {
   bool add_missing_symbols = false;
   bool add_fixed_histograms = false;
   bool rdo_context_map = false;
+  float cluster_min_distance = 48.0f;
 };
 
 struct Histogram {

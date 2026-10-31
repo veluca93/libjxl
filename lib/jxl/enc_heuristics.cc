@@ -222,10 +222,11 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
       *std::max_element(ctx_map.begin(), ctx_map.end()) + 1;
 }
 
-Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
-                                           const coeff_order_t* coeff_orders,
-                                           PassesEncoderState* enc_state,
-                                           BlockCtxMap* block_ctx_map) {
+Status FindBestBlockEntropyModelFromCoeffs(
+    const FrameHeader& frame_header, const coeff_order_t* coeff_orders,
+    PassesEncoderState* enc_state, BlockCtxMap* block_ctx_map,
+    double merge_lambda, double min_qf_split_bits,
+    size_t min_blocks_for_qf_split) {
   const CompressParams& cparams = enc_state->cparams;
   if (cparams.decoding_speed_tier >= 1) {
     static constexpr uint8_t kSimpleCtxMap[] = {
@@ -273,21 +274,28 @@ Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
   // blocks and pick optimal qf_thresholds via 1D dynamic programming.
   const double d_target = std::max<double>(0.25, cparams.butteraugli_distance);
   const double size_for_ctx_model = 1024.0 * d_target;
-  const size_t max_luma_ctxs =
+  size_t max_luma_ctxs =
       (tot_blocks < size_for_ctx_model)
           ? 2
           : static_cast<size_t>(
                 Clamp1(static_cast<int>(tot_blocks / size_for_ctx_model / 2.0),
                        2, 10));
-  const size_t max_chroma_ctxs =
+  size_t max_chroma_ctxs =
       (tot_blocks < size_for_ctx_model)
           ? 1
           : static_cast<size_t>(
                 Clamp1(static_cast<int>(tot_blocks / size_for_ctx_model / 3.0),
                        1, 6));
+  if (min_blocks_for_qf_split > 0 && tot_blocks >= min_blocks_for_qf_split) {
+    max_luma_ctxs = std::max<size_t>(max_luma_ctxs, 8);
+    max_chroma_ctxs = std::max<size_t>(max_chroma_ctxs, 4);
+  }
 
   const size_t num_dc_ctxs = std::max<size_t>(1, block_ctx_map->num_dc_ctxs);
-  const double size_for_qf_split = 8192.0 * d_target;
+  const double size_for_qf_split =
+      (min_blocks_for_qf_split > 0)
+          ? static_cast<double>(min_blocks_for_qf_split)
+          : (8192.0 * d_target);
   const size_t max_q_segs_by_size =
       (tot_blocks < size_for_qf_split)
           ? 1
@@ -461,12 +469,11 @@ Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
       }
     }
 
-    constexpr double kMinBitsPerQfSplit = 250.0;
     size_t best_s = 1;
     double cur_best_cost = dp[1 * K + (K - 1)];
     for (size_t s = 2; s <= max_s; ++s) {
       const double cand = dp[s * K + (K - 1)];
-      if (cand < kInf * 0.5 && cur_best_cost - cand > kMinBitsPerQfSplit) {
+      if (cand < kInf * 0.5 && cur_best_cost - cand > min_qf_split_bits) {
         best_s = s;
         cur_best_cost = cand;
       } else {
@@ -675,7 +682,7 @@ Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
   }
 
   constexpr double kMergeNullBias = 0.70;
-  constexpr double kMergeLambda = 1000.0;
+  const double kMergeLambda = merge_lambda;
   constexpr double kInfCost = 1e30;
 
   const auto merge_cost = [&](size_t a, size_t b) -> double {

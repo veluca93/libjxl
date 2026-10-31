@@ -45,10 +45,11 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
 
 void FindBestBlockEntropyModel(PassesEncoderState& enc_state);
 
-Status FindBestBlockEntropyModelFromCoeffs(const FrameHeader& frame_header,
-                                           const coeff_order_t* coeff_orders,
-                                           PassesEncoderState* enc_state,
-                                           BlockCtxMap* block_ctx_map);
+Status FindBestBlockEntropyModelFromCoeffs(
+    const FrameHeader& frame_header, const coeff_order_t* coeff_orders,
+    PassesEncoderState* enc_state, BlockCtxMap* block_ctx_map,
+    double merge_lambda = 1000.0, double min_qf_split_bits = 250.0,
+    size_t min_blocks_for_qf_split = 0);
 
 Status BuildPass2FrozenTokenCostModel(const FrameHeader& frame_header,
                                       const Image3F& opsin, const Rect& rect,

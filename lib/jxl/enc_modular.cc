@@ -1336,6 +1336,7 @@ Status ModularFrameEncoder::ComputeTokensInternal(ThreadPool* pool) {
 
 Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
   use_selected_modular_params_ = false;
+  local_streams_.clear();
   if (cparams_.modular_mode || cparams_.speed_tier > SpeedTier::kSquirrel ||
       cparams_.decoding_speed_tier >= 2 || !cparams_.custom_fixed_tree.empty() ||
       tree_tokens_.empty() || tree_tokens_[0].empty() || tokens_.empty()) {
@@ -1343,7 +1344,9 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
   }
   size_t total_toks = 0;
   for (const auto& st : tokens_) total_toks += st.size();
-  if (total_toks == 0 || total_toks > 500000) return true;
+  if (total_toks == 0) return true;
+  const bool large_frame = total_toks > 180000;
+  const bool huge_frame = total_toks > 800000;
 
   const uint32_t dc_start = ModularStreamId::VarDCTDC(0).ID(frame_dim_);
   const uint32_t dc_stop = ModularStreamId::ModularDC(0).ID(frame_dim_);
@@ -1370,30 +1373,86 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
     }
   }
 
-  auto eval_bitstream =
-      [&](const Tree& tr, const std::vector<std::vector<Token>>& tr_toks,
-          const std::vector<GroupHeader>& hdrs,
-          const std::vector<std::vector<Token>>& raw_toks,
-          const std::vector<size_t>& img_w, const HistogramParams& base_hp,
+  const HistogramParams hp_base =
+      HistogramParams::ForModular(cparams_, extra_dc_precision, false);
+  HistogramParams tree_hp_cands[5] = {hp_base, hp_base, hp_base, hp_base,
+                                      hp_base};
+  tree_hp_cands[1].lz77_method = HistogramParams::LZ77Method::kNone;
+  tree_hp_cands[1].rdo_context_map = true;
+  tree_hp_cands[2].lz77_method = HistogramParams::LZ77Method::kRLE;
+  tree_hp_cands[2].rdo_context_map = true;
+  tree_hp_cands[3].lz77_method = HistogramParams::LZ77Method::kNone;
+  tree_hp_cands[3].rdo_context_map = true;
+  tree_hp_cands[3].force_huffman = true;
+  tree_hp_cands[4].lz77_method = HistogramParams::LZ77Method::kRLE;
+  tree_hp_cands[4].rdo_context_map = true;
+  tree_hp_cands[4].force_huffman = true;
+
+  const auto opt_lz77 = large_frame ? HistogramParams::LZ77Method::kOptc8
+                                    : HistogramParams::LZ77Method::kOptc256;
+  HistogramParams hp_cands[8] = {hp_base, hp_base, hp_base, hp_base,
+                                 hp_base, hp_base, hp_base, hp_base};
+  hp_cands[1].lz77_method = HistogramParams::LZ77Method::kNone;
+  hp_cands[1].rdo_context_map = true;
+  hp_cands[2].lz77_method = HistogramParams::LZ77Method::kRLE;
+  hp_cands[2].rdo_context_map = true;
+  hp_cands[3].lz77_method = opt_lz77;
+  hp_cands[3].rdo_context_map = true;
+  hp_cands[4].lz77_method = opt_lz77;
+  hp_cands[4].rdo_context_map = true;
+  hp_cands[4].force_huffman = true;
+  hp_cands[5].lz77_method = opt_lz77;
+  hp_cands[5].rdo_context_map = true;
+  hp_cands[5].clustering = HistogramParams::ClusteringType::kFast;
+  hp_cands[6].lz77_method = HistogramParams::LZ77Method::kNone;
+  hp_cands[6].rdo_context_map = true;
+  hp_cands[6].force_huffman = true;
+  hp_cands[7].lz77_method = HistogramParams::LZ77Method::kRLE;
+  hp_cands[7].rdo_context_map = true;
+  hp_cands[7].force_huffman = true;
+
+  auto eval_best_tree_bits =
+      [&](const std::vector<std::vector<Token>>& tr_toks,
+          bool include_has_tree_flag, HistogramParams* out_hp,
           size_t* out_bits) -> Status {
-    BitWriter bw(memory_manager_);
-    JXL_RETURN_IF_ERROR(bw.WithMaxBits(1, LayerType::ModularTree, nullptr, [&] {
-      bw.Write(1, 1);
-      return true;
-    }));
-    HistogramParams hp = base_hp;
-    {
+    size_t best_tb = std::numeric_limits<size_t>::max();
+    HistogramParams best_thp = hp_base;
+    for (size_t ti = 0; ti < 5; ++ti) {
+      BitWriter bw(memory_manager_);
+      if (include_has_tree_flag) {
+        JXL_RETURN_IF_ERROR(
+            bw.WithMaxBits(1, LayerType::ModularTree, nullptr, [&] {
+              bw.Write(1, 1);
+              return true;
+            }));
+      }
       EntropyEncodingData tree_code;
       std::vector<std::vector<Token>> tr_toks_copy = tr_toks;
       JXL_ASSIGN_OR_RETURN(
           size_t tcost,
-          BuildAndEncodeHistograms(memory_manager_, hp, kNumTreeContexts,
-                                   tr_toks_copy, &tree_code, &bw,
-                                   LayerType::ModularTree, nullptr));
+          BuildAndEncodeHistograms(memory_manager_, tree_hp_cands[ti],
+                                   kNumTreeContexts, tr_toks_copy, &tree_code,
+                                   &bw, LayerType::ModularTree, nullptr));
       (void)tcost;
       JXL_RETURN_IF_ERROR(WriteTokens(tr_toks_copy[0], tree_code, 0, &bw,
                                       LayerType::ModularTree, nullptr));
+      if (bw.BitsWritten() < best_tb) {
+        best_tb = bw.BitsWritten();
+        best_thp = tree_hp_cands[ti];
+      }
     }
+    *out_hp = best_thp;
+    *out_bits = best_tb;
+    return true;
+  };
+
+  auto eval_global_data_bits =
+      [&](const Tree& tr, const std::vector<GroupHeader>& hdrs,
+          const std::vector<std::vector<Token>>& raw_toks,
+          const std::vector<size_t>& img_w, const HistogramParams& base_hp,
+          size_t* out_bits) -> Status {
+    BitWriter bw(memory_manager_);
+    HistogramParams hp = base_hp;
     hp.streaming_mode = false;
     hp.add_missing_symbols = false;
     hp.image_widths = img_w;
@@ -1415,38 +1474,31 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
     return true;
   };
 
-  const HistogramParams hp_base =
-      HistogramParams::ForModular(cparams_, extra_dc_precision, false);
-  HistogramParams hp_cands[6] = {hp_base, hp_base, hp_base,
-                                 hp_base, hp_base, hp_base};
-  hp_cands[1].lz77_method = HistogramParams::LZ77Method::kNone;
-  hp_cands[1].rdo_context_map = true;
-  hp_cands[2].lz77_method = HistogramParams::LZ77Method::kRLE;
-  hp_cands[2].rdo_context_map = true;
-  hp_cands[3].lz77_method = HistogramParams::LZ77Method::kOptc256;
-  hp_cands[3].rdo_context_map = true;
-  hp_cands[4].lz77_method = HistogramParams::LZ77Method::kOptc256;
-  hp_cands[4].rdo_context_map = true;
-  hp_cands[4].force_huffman = true;
-  hp_cands[5].lz77_method = HistogramParams::LZ77Method::kOptc256;
-  hp_cands[5].rdo_context_map = true;
-  hp_cands[5].clustering = HistogramParams::ClusteringType::kFast;
-
   Tree best_tree = tree_;
   std::vector<std::vector<Token>> best_tree_tokens = tree_tokens_;
   std::vector<GroupHeader> best_headers = stream_headers_;
   std::vector<std::vector<Token>> best_raw_tokens = tokens_;
   std::vector<size_t> best_widths = image_widths_;
+  HistogramParams best_tree_hp = hp_base;
   HistogramParams best_hp = hp_base;
+  std::vector<LocalStreamData> best_local_streams;
   size_t best_bits = std::numeric_limits<size_t>::max();
 
+  const size_t h_end =
+      huge_frame ? 3 : (large_frame ? 4 : ((total_toks <= 64000) ? 8 : 6));
   auto test_current_tree = [&](bool include_raw_baseline) -> Status {
+    HistogramParams cur_tree_hp = hp_base;
+    size_t cur_tree_bits = 0;
+    JXL_RETURN_IF_ERROR(eval_best_tree_bits(
+        tree_tokens_, /*include_has_tree_flag=*/true, &cur_tree_hp,
+        &cur_tree_bits));
     const size_t h_start = include_raw_baseline ? 0 : 1;
-    for (size_t hi = h_start; hi < 6; ++hi) {
-      size_t bits = 0;
-      JXL_RETURN_IF_ERROR(eval_bitstream(tree_, tree_tokens_, stream_headers_,
-                                         tokens_, image_widths_, hp_cands[hi],
-                                         &bits));
+    for (size_t hi = h_start; hi < h_end; ++hi) {
+      size_t data_bits = 0;
+      JXL_RETURN_IF_ERROR(eval_global_data_bits(
+          tree_, stream_headers_, tokens_, image_widths_, hp_cands[hi],
+          &data_bits));
+      const size_t bits = cur_tree_bits + data_bits;
       if (bits < best_bits) {
         best_bits = bits;
         best_tree = tree_;
@@ -1454,7 +1506,9 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
         best_headers = stream_headers_;
         best_raw_tokens = tokens_;
         best_widths = image_widths_;
+        best_tree_hp = cur_tree_hp;
         best_hp = hp_cands[hi];
+        best_local_streams.clear();
       }
     }
     return true;
@@ -1464,13 +1518,15 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
 
   if (!dc_sids.empty() || !acm_sids.empty()) {
     static constexpr float kThreshPairs[7][2] = {{90.0f, 96.0f},
-                                                 {38.0f, 44.0f},
                                                  {52.0f, 56.0f},
+                                                 {145.0f, 145.0f},
+                                                 {38.0f, 44.0f},
                                                  {68.0f, 72.0f},
-                                                 {125.0f, 125.0f},
-                                                 {175.0f, 170.0f},
+                                                 {190.0f, 180.0f},
                                                  {260.0f, 240.0f}};
-    for (const auto& pair : kThreshPairs) {
+    const size_t num_pairs = huge_frame ? 2 : (large_frame ? 3 : 7);
+    for (size_t pi = 0; pi < num_pairs; ++pi) {
+      const auto& pair = kThreshPairs[pi];
       for (uint32_t s : dc_sids) {
         stream_options_[s].splitting_heuristics_node_threshold = pair[0];
         stream_options_[s].polish_leaves = true;
@@ -1491,6 +1547,213 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
       JXL_RETURN_IF_ERROR(ComputeTokensInternal(pool));
       JXL_RETURN_IF_ERROR(test_current_tree(/*include_raw_baseline=*/false));
     }
+
+    // Test decoupling VarDCTDC (Global Tree) from ACMetadata (local per-stream
+    // tree + histograms with independent LZ77 / HybridUint / log_alpha_size).
+    bool only_dc_and_acm = !large_frame && !dc_sids.empty() &&
+                           acm_sids.size() == 1;
+    if (only_dc_and_acm) {
+      for (uint32_t s = 0; s < stream_images_.size(); ++s) {
+        if (stream_images_[s].channel.empty()) continue;
+        const bool in_dc =
+            std::find(dc_sids.begin(), dc_sids.end(), s) != dc_sids.end();
+        const bool in_acm =
+            std::find(acm_sids.begin(), acm_sids.end(), s) != acm_sids.end();
+        if (!in_dc && !in_acm) {
+          only_dc_and_acm = false;
+          break;
+        }
+      }
+    }
+    if (only_dc_and_acm) {
+      size_t best_dc_bits = std::numeric_limits<size_t>::max();
+      Tree split_dc_tree;
+      std::vector<std::vector<Token>> split_dc_tr_toks;
+      std::vector<GroupHeader> split_dc_hdrs;
+      std::vector<std::vector<Token>> split_dc_toks;
+      std::vector<size_t> split_dc_widths;
+      HistogramParams split_dc_tr_hp = hp_base;
+      HistogramParams split_dc_hp = hp_base;
+
+      std::vector<Image> saved_acm_imgs;
+      saved_acm_imgs.reserve(acm_sids.size());
+      for (uint32_t s : acm_sids) {
+        saved_acm_imgs.emplace_back(memory_manager_);
+        std::swap(stream_images_[s], saved_acm_imgs.back());
+      }
+      const size_t dc_h_cands[5] = {1, 2, 6, 7, 3};
+      const size_t dc_h_count = large_frame ? 2 : 5;
+      static constexpr float kDcThresholds[4] = {42.0f, 68.0f, 100.0f, 155.0f};
+      const size_t num_dc_thr = large_frame ? 2 : 4;
+      for (size_t di = 0; di < num_dc_thr; ++di) {
+        for (uint32_t s : dc_sids) {
+          stream_options_[s].splitting_heuristics_node_threshold =
+              kDcThresholds[di];
+          stream_options_[s].polish_leaves = true;
+        }
+        Status st_tr = ComputeTree(pool);
+        if (!st_tr) {
+          for (size_t k = 0; k < acm_sids.size(); ++k) {
+            std::swap(stream_images_[acm_sids[k]], saved_acm_imgs[k]);
+          }
+          return st_tr;
+        }
+        if (tree_tokens_.empty() || tree_tokens_[0].empty()) continue;
+        Status st_tk = ComputeTokensInternal(pool);
+        if (!st_tk) {
+          for (size_t k = 0; k < acm_sids.size(); ++k) {
+            std::swap(stream_images_[acm_sids[k]], saved_acm_imgs[k]);
+          }
+          return st_tk;
+        }
+        HistogramParams cur_tr_hp = hp_base;
+        size_t cur_tr_bits = 0;
+        Status st_eb = eval_best_tree_bits(
+            tree_tokens_, /*include_has_tree_flag=*/true, &cur_tr_hp,
+            &cur_tr_bits);
+        if (!st_eb) {
+          for (size_t k = 0; k < acm_sids.size(); ++k) {
+            std::swap(stream_images_[acm_sids[k]], saved_acm_imgs[k]);
+          }
+          return st_eb;
+        }
+        for (size_t hc = 0; hc < dc_h_count; ++hc) {
+          const size_t hi = dc_h_cands[hc];
+          size_t data_b = 0;
+          Status st_gd = eval_global_data_bits(
+              tree_, stream_headers_, tokens_, image_widths_, hp_cands[hi],
+              &data_b);
+          if (!st_gd) {
+            for (size_t k = 0; k < acm_sids.size(); ++k) {
+              std::swap(stream_images_[acm_sids[k]], saved_acm_imgs[k]);
+            }
+            return st_gd;
+          }
+          if (cur_tr_bits + data_b < best_dc_bits) {
+            best_dc_bits = cur_tr_bits + data_b;
+            split_dc_tree = tree_;
+            split_dc_tr_toks = tree_tokens_;
+            split_dc_hdrs = stream_headers_;
+            split_dc_toks = tokens_;
+            split_dc_widths = image_widths_;
+            split_dc_tr_hp = cur_tr_hp;
+            split_dc_hp = hp_cands[hi];
+          }
+        }
+      }
+      for (size_t k = 0; k < acm_sids.size(); ++k) {
+        std::swap(stream_images_[acm_sids[k]], saved_acm_imgs[k]);
+      }
+
+      if (best_dc_bits < best_bits) {
+        std::vector<LocalStreamData> cand_locals(stream_images_.size());
+        size_t sum_acm_bits = 0;
+        bool acm_ok = true;
+        static constexpr float kAcmThresholds[4] = {44.0f, 72.0f, 120.0f,
+                                                    185.0f};
+        const size_t num_acm_thr = large_frame ? 2 : 4;
+        const size_t acm_h_end = large_frame ? 4 : 8;
+        for (uint32_t s_acm : acm_sids) {
+          stream_options_[s_acm].polish_leaves = true;
+          if (cparams_.decoding_speed_tier < 3) {
+            stream_options_[s_acm].predictor = Predictor::Variable;
+          }
+          stream_options_[s_acm].max_properties = 1;
+          stream_options_[s_acm].splitting_heuristics_properties = {
+              0,  1,  2,  3,  6,  7,  4,  5,  8,  9,
+              10, 11, 12, 13, 14, 16, 17, 18, 19};
+
+          size_t best_s_bits = std::numeric_limits<size_t>::max();
+          LocalStreamData best_ls;
+          for (size_t ai = 0; ai < num_acm_thr; ++ai) {
+            stream_options_[s_acm].splitting_heuristics_node_threshold =
+                kAcmThresholds[ai];
+            JXL_ASSIGN_OR_RETURN(
+                Tree raw_acm_tr,
+                LearnTree(stream_images_.data(), stream_options_.data(), s_acm,
+                          s_acm + 1));
+            for (const auto& node : raw_acm_tr) {
+              JXL_ENSURE(node.property != static_cast<int>(kWPProp));
+              JXL_ENSURE(node.property != -1 ||
+                         node.predictor != Predictor::Weighted);
+            }
+            std::vector<std::vector<Token>> acm_tr_toks(1);
+            Tree dec_acm_tr;
+            JXL_RETURN_IF_ERROR(
+                TokenizeTree(raw_acm_tr, acm_tr_toks.data(), &dec_acm_tr));
+            GroupHeader acm_hdr;
+            std::vector<std::vector<Token>> acm_toks(1);
+            size_t acm_w = 0;
+            JXL_RETURN_IF_ERROR(ModularCompress(
+                stream_images_[s_acm], stream_options_[s_acm], s_acm,
+                dec_acm_tr, acm_hdr, acm_toks[0], &acm_w));
+            acm_hdr.use_global_tree = false;
+
+            HistogramParams acm_tr_hp = hp_base;
+            size_t acm_tr_bits = 0;
+            JXL_RETURN_IF_ERROR(eval_best_tree_bits(
+                acm_tr_toks, /*include_has_tree_flag=*/false, &acm_tr_hp,
+                &acm_tr_bits));
+            BitWriter hdr_bw(memory_manager_);
+            JXL_RETURN_IF_ERROR(
+                Bundle::Write(acm_hdr, &hdr_bw, LayerType::Ac, nullptr));
+            const size_t hdr_and_tr_bits = hdr_bw.BitsWritten() + acm_tr_bits;
+            const size_t num_ctx = (dec_acm_tr.size() + 1) / 2;
+
+            for (size_t hi = 1; hi < acm_h_end; ++hi) {
+              BitWriter st_bw(memory_manager_);
+              HistogramParams hp = hp_cands[hi];
+              hp.streaming_mode = false;
+              hp.add_missing_symbols = false;
+              hp.image_widths = {acm_w};
+              EntropyEncodingData st_code;
+              std::vector<std::vector<Token>> toks_copy = acm_toks;
+              JXL_ASSIGN_OR_RETURN(
+                  size_t scost,
+                  BuildAndEncodeHistograms(memory_manager_, hp, num_ctx,
+                                           toks_copy, &st_code, &st_bw,
+                                           LayerType::Ac, nullptr));
+              (void)scost;
+              JXL_RETURN_IF_ERROR(WriteTokens(toks_copy[0], st_code, 0, &st_bw,
+                                              LayerType::Ac, nullptr));
+              const size_t tot_s = hdr_and_tr_bits + st_bw.BitsWritten();
+              if (tot_s < best_s_bits) {
+                best_s_bits = tot_s;
+                best_ls.active = true;
+                best_ls.num_contexts = num_ctx;
+                best_ls.header = acm_hdr;
+                best_ls.tree_tokens = acm_tr_toks;
+                best_ls.tree_params = acm_tr_hp;
+                best_ls.tokens = acm_toks;
+                best_ls.histo_params = hp;
+              }
+            }
+          }
+          if (!best_ls.active) {
+            acm_ok = false;
+            break;
+          }
+          sum_acm_bits += best_s_bits;
+          cand_locals[s_acm] = std::move(best_ls);
+          if (best_dc_bits + sum_acm_bits >= best_bits) {
+            acm_ok = false;
+            break;
+          }
+        }
+        if (acm_ok && best_dc_bits + sum_acm_bits < best_bits) {
+          best_bits = best_dc_bits + sum_acm_bits;
+          best_tree = std::move(split_dc_tree);
+          best_tree_tokens = std::move(split_dc_tr_toks);
+          best_headers = std::move(split_dc_hdrs);
+          best_raw_tokens = std::move(split_dc_toks);
+          best_widths = std::move(split_dc_widths);
+          best_tree_hp = split_dc_tr_hp;
+          best_hp = split_dc_hp;
+          best_local_streams = std::move(cand_locals);
+        }
+      }
+    }
+
     for (size_t k = 0; k < dc_sids.size(); ++k) {
       stream_options_[dc_sids[k]] = orig_dc_opts[k];
     }
@@ -1504,7 +1767,9 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
   stream_headers_ = std::move(best_headers);
   tokens_ = std::move(best_raw_tokens);
   image_widths_ = std::move(best_widths);
+  selected_tree_params_ = best_tree_hp;
   selected_modular_params_ = best_hp;
+  local_streams_ = std::move(best_local_streams);
   use_selected_modular_params_ = true;
   return true;
 }
@@ -1534,21 +1799,27 @@ Status ModularFrameEncoder::EncodeGlobalInfo(bool streaming_mode,
   if (skip_rest) return true;
 
   // Write tree
-  HistogramParams params =
+  HistogramParams tree_params =
       (use_selected_modular_params_ && !streaming_mode)
-          ? selected_modular_params_
+          ? selected_tree_params_
           : HistogramParams::ForModular(cparams_, extra_dc_precision,
                                         streaming_mode);
   {
     EntropyEncodingData tree_code;
     JXL_ASSIGN_OR_RETURN(
-        size_t cost, BuildAndEncodeHistograms(
-                         memory_manager, params, kNumTreeContexts, tree_tokens_,
-                         &tree_code, writer, LayerType::ModularTree, aux_out));
+        size_t cost,
+        BuildAndEncodeHistograms(memory_manager, tree_params, kNumTreeContexts,
+                                 tree_tokens_, &tree_code, writer,
+                                 LayerType::ModularTree, aux_out));
     (void)cost;
     JXL_RETURN_IF_ERROR(WriteTokens(tree_tokens_[0], tree_code, 0, writer,
                                     LayerType::ModularTree, aux_out));
   }
+  HistogramParams params =
+      (use_selected_modular_params_ && !streaming_mode)
+          ? selected_modular_params_
+          : HistogramParams::ForModular(cparams_, extra_dc_precision,
+                                        streaming_mode);
   params.streaming_mode = streaming_mode;
   params.add_missing_symbols = streaming_mode;
   params.image_widths = image_widths_;
@@ -1568,6 +1839,34 @@ Status ModularFrameEncoder::EncodeStream(BitWriter* writer, AuxOut* aux_out,
   if (stream_images_[stream_id].channel.empty()) {
     JXL_DEBUG_V(10, "Modular stream %" PRIuS " is empty.", stream_id);
     return true;  // Image with no channels, header never gets decoded.
+  }
+  if (stream_id < local_streams_.size() && local_streams_[stream_id].active) {
+    const LocalStreamData& ls = local_streams_[stream_id];
+    JxlMemoryManager* memory_manager = writer->memory_manager();
+    JXL_RETURN_IF_ERROR(Bundle::Write(ls.header, writer, layer, aux_out));
+    {
+      EntropyEncodingData tr_code;
+      std::vector<std::vector<Token>> tr_toks = ls.tree_tokens;
+      JXL_ASSIGN_OR_RETURN(
+          size_t tcost,
+          BuildAndEncodeHistograms(memory_manager, ls.tree_params,
+                                   kNumTreeContexts, tr_toks, &tr_code, writer,
+                                   LayerType::ModularTree, aux_out));
+      (void)tcost;
+      JXL_RETURN_IF_ERROR(WriteTokens(tr_toks[0], tr_code, 0, writer,
+                                      LayerType::ModularTree, aux_out));
+    }
+    EntropyEncodingData st_code;
+    std::vector<std::vector<Token>> st_toks = ls.tokens;
+    JXL_ASSIGN_OR_RETURN(
+        size_t scost,
+        BuildAndEncodeHistograms(memory_manager, ls.histo_params,
+                                 ls.num_contexts, st_toks, &st_code, writer,
+                                 layer, aux_out));
+    (void)scost;
+    JXL_RETURN_IF_ERROR(
+        WriteTokens(st_toks[0], st_code, 0, writer, layer, aux_out));
+    return true;
   }
   if (tokens_.empty()) {
     JXL_RETURN_IF_ERROR(ModularGenericCompress(

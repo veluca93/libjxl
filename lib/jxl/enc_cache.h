@@ -152,6 +152,8 @@ struct PassesEncoderState {
   ImageI base_raw_quant_field;
   ImageSB rdoq_level_field;
   bool epf_optimized_in_rdo = false;
+  bool has_selected_ac_hist_params = false;
+  HistogramParams selected_ac_hist_params;
 
   std::unique_ptr<AcTokenCostModel> token_cost_model;
 

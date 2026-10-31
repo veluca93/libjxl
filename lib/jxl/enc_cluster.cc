@@ -136,6 +136,7 @@ float HistogramKLDivergence(const Histogram& actual, const Histogram& coding) {
 // First step of a k-means clustering with a fancy distance metric.
 Status FastClusterHistograms(const std::vector<Histogram>& in,
                              size_t max_histograms, bool is_best,
+                             float min_distance,
                              std::vector<Histogram>* out,
                              std::vector<uint32_t>* histogram_symbols) {
   const size_t prev_histograms = out->size();
@@ -209,7 +210,6 @@ Status FastClusterHistograms(const std::vector<Histogram>& in,
     }
   }
 
-  constexpr float kMinDistanceForDistinct = 48.0f;
   while (out->size() < max_histograms &&
          (out->empty() || dists[largest_idx] > 0.0f)) {
     (*histogram_symbols)[largest_idx] = out->size();
@@ -221,7 +221,7 @@ Status FastClusterHistograms(const std::vector<Histogram>& in,
       dists[i] = std::min(HistogramDistance(in[i], out->back()), dists[i]);
       if (dists[i] > dists[largest_idx]) largest_idx = i;
     }
-    if (dists[largest_idx] < kMinDistanceForDistinct) break;
+    if (dists[largest_idx] < min_distance) break;
   }
 
   for (size_t i = 0; i < in.size(); i++) {
@@ -311,7 +311,8 @@ Status ClusterHistograms(const HistogramParams& params,
   const bool is_best =
       (params.clustering == HistogramParams::ClusteringType::kBest);
   JXL_RETURN_IF_ERROR(HWY_DYNAMIC_DISPATCH(FastClusterHistograms)(
-      in, prev_histograms + max_histograms, is_best, out, histogram_symbols));
+      in, prev_histograms + max_histograms, is_best,
+      params.cluster_min_distance, out, histogram_symbols));
 
   if (prev_histograms == 0 && is_best) {
     for (auto& histo : *out) {

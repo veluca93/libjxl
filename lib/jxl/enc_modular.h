@@ -142,7 +142,18 @@ class ModularFrameEncoder {
   std::vector<std::vector<uint32_t>> gi_channel_;
   std::vector<size_t> image_widths_;
   bool use_selected_modular_params_ = false;
+  HistogramParams selected_tree_params_;
   HistogramParams selected_modular_params_;
+  struct LocalStreamData {
+    bool active = false;
+    size_t num_contexts = 0;
+    GroupHeader header;
+    std::vector<std::vector<Token>> tree_tokens;
+    HistogramParams tree_params;
+    std::vector<std::vector<Token>> tokens;
+    HistogramParams histo_params;
+  };
+  std::vector<LocalStreamData> local_streams_;
 
   struct GroupParams {
     Rect rect;

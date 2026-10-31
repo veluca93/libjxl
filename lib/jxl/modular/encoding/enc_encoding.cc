@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -687,7 +688,7 @@ StatusOr<Tree> LearnTree(
 
   if (options[start].polish_leaves &&
       options[start].wp_tree_mode == ModularOptions::TreeMode::kNoWP &&
-      tree.size() > 1) {
+      !tree.empty()) {
     std::vector<size_t> leaf_nodes;
     for (size_t n = 0; n < tree.size(); ++n) {
       if (tree[n].property == -1) {
@@ -751,12 +752,14 @@ StatusOr<Tree> LearnTree(
       }
     }
 
-    const HybridUintConfig cfgs[2] = {HybridUintConfig(4, 2, 0),
-                                      HybridUintConfig(4, 1, 2)};
-    auto eval_offset_cost = [&](const std::vector<int32_t> &rs,
-                                int32_t off) -> double {
+    const HybridUintConfig cfgs[3] = {HybridUintConfig(4, 2, 0),
+                                      HybridUintConfig(4, 1, 2),
+                                      HybridUintConfig(0, 0, 0)};
+    auto eval_leaf_cost = [&](const std::vector<int32_t> &rs, int32_t off,
+                              uint32_t mul) -> double {
       const double inv_n = 1.0 / static_cast<double>(rs.size());
       const double min_p = 1.0 / static_cast<double>(ANS_TAB_SIZE);
+      const int32_t imul = static_cast<int32_t>(mul);
       double best_c = std::numeric_limits<double>::max();
       for (const HybridUintConfig &cfg : cfgs) {
         uint32_t counts[256] = {};
@@ -765,7 +768,8 @@ StatusOr<Tree> LearnTree(
           uint32_t tok = 0;
           uint32_t nb = 0;
           uint32_t eb = 0;
-          cfg.Encode(PackSigned(r - off), &tok, &nb, &eb);
+          const int32_t q = (imul == 1) ? (r - off) : ((r - off) / imul);
+          cfg.Encode(PackSigned(q), &tok, &nb, &eb);
           counts[std::min<uint32_t>(tok, 255u)]++;
           extra += nb;
         }
@@ -781,23 +785,100 @@ StatusOr<Tree> LearnTree(
       return best_c;
     };
 
+    bool any_mul_gt1 = false;
+    for (size_t lid = 0; lid < num_leaves; ++lid) {
+      if (tree[leaf_nodes[lid]].multiplier > 1) any_mul_gt1 = true;
+    }
+
     for (size_t lid = 0; lid < num_leaves; ++lid) {
       const size_t node_idx = leaf_nodes[lid];
+      const std::vector<int32_t> &rs = leaf_res[lid];
       if (leaf_overflow[lid] || tree[node_idx].multiplier != 1 ||
-          leaf_res[lid].size() < 24) {
+          rs.size() < 6) {
         continue;
       }
-      const double cost0 = eval_offset_cost(leaf_res[lid], 0);
-      double best_cost = cost0 - 5.5;
+
+      std::vector<int32_t> cand_offs = {0,  -1, 1,  -2, 2,  -3, 3,  -4, 4,
+                                        -5, 5,  -6, 6,  -7, 7,  -8, 8};
+      int32_t min_r = rs[0];
+      int32_t max_r = rs[0];
+      for (int32_t r : rs) {
+        min_r = std::min(min_r, r);
+        max_r = std::max(max_r, r);
+      }
+      auto add_cand_off = [&](int64_t v) {
+        if (v < -16384 || v > 16384) return;
+        const int32_t iv = static_cast<int32_t>(v);
+        if (std::find(cand_offs.begin(), cand_offs.end(), iv) ==
+            cand_offs.end()) {
+          cand_offs.push_back(iv);
+        }
+      };
+      add_cand_off(min_r);
+      add_cand_off(max_r);
+      add_cand_off((static_cast<int64_t>(min_r) + max_r) / 2);
+      {
+        std::vector<int32_t> sub;
+        const size_t step = std::max<size_t>(1, rs.size() / 129);
+        sub.reserve(std::min<size_t>(rs.size(), 130));
+        for (size_t k = 0; k < rs.size(); k += step) sub.push_back(rs[k]);
+        const size_t mid = sub.size() / 2;
+        std::nth_element(sub.begin(), sub.begin() + mid, sub.end());
+        const int32_t med = sub[mid];
+        add_cand_off(static_cast<int64_t>(med) - 1);
+        add_cand_off(med);
+        add_cand_off(static_cast<int64_t>(med) + 1);
+      }
+
+      const int64_t orig_off = tree[node_idx].predictor_offset;
+      const double cost0 = eval_leaf_cost(rs, 0, 1);
+      double best_cost = cost0 - 1.5;
       int32_t best_off = 0;
-      for (int32_t off : {-4, -3, -2, -1, 1, 2, 3, 4}) {
-        const double c = eval_offset_cost(leaf_res[lid], off);
-        if (c < best_cost) {
-          best_cost = c;
-          best_off = off;
+      uint32_t best_mul = 1;
+
+      for (int32_t off : cand_offs) {
+        const int64_t new_abs_off = orig_off + off;
+        const double off_pen =
+            (new_abs_off == 0)
+                ? 0.0
+                : (3.5 + std::log2(1.0 + static_cast<double>(
+                                             PackSigned(new_abs_off))));
+        uint32_t g = 0;
+        for (int32_t r : rs) {
+          const uint32_t a = static_cast<uint32_t>(
+              std::abs(static_cast<int64_t>(r) - static_cast<int64_t>(off)));
+          g = (g == 0) ? a : std::gcd(g, a);
+          if (g == 1) break;
+        }
+        if (g == 0) g = 1;
+
+        if (off != 0) {
+          const double c1 = eval_leaf_cost(rs, off, 1) + off_pen;
+          if (c1 < best_cost) {
+            best_cost = c1;
+            best_off = off;
+            best_mul = 1;
+          }
+        }
+        if (g > 1 && g <= 4096) {
+          const uint32_t mul_log = Num0BitsBelowLS1Bit_Nonzero(g);
+          const uint32_t mul_bits = (g >> mul_log) - 1;
+          const double first_mul_pen =
+              any_mul_gt1 ? 0.0 : ((mul_bits == 0) ? 5.5 : 11.0);
+          const double mul_pen =
+              first_mul_pen + 2.5 + std::log2(1.0 + mul_log) +
+              ((mul_bits > 0) ? (2.5 + std::log2(1.0 + mul_bits)) : 0.0);
+          const double cg = eval_leaf_cost(rs, off, g) + off_pen + mul_pen;
+          if (cg < best_cost) {
+            best_cost = cg;
+            best_off = off;
+            best_mul = g;
+          }
         }
       }
-      tree[node_idx].predictor_offset = best_off;
+      tree[node_idx].predictor_offset = orig_off + best_off;
+      tree[node_idx].multiplier = best_mul;
+      if (best_mul > 1) any_mul_gt1 = true;
     }
   }
   return tree;
