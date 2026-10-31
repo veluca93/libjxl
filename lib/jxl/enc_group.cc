@@ -173,7 +173,7 @@ using hwy::HWY_NAMESPACE::ZeroIfNegative;
 static constexpr size_t kMaxNzeroDelta = 6;
 static constexpr size_t kBandWidth = 2 * kMaxNzeroDelta + 2;  // 14
 static constexpr size_t kBandStride = 2 * kBandWidth;         // 28
-static constexpr size_t kMaxRdoqWindow = 1024;
+static constexpr size_t kMaxRdoqWindow = 4096;
 static constexpr size_t kMaxCandidates = 5;
 
 static JXL_INLINE float ReconstructedLevel(int32_t level, float bias_one) {
@@ -340,37 +340,6 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
 
   const bool is_partial_block =
       ((1 << static_cast<size_t>(quant_kind)) & kPartialBlockKinds) != 0;
-  auto rescue_quad0 = [&]() -> int32_t {
-    if (is_partial_block || c != 1 || covered_blocks > 4 || eob_scale <= 0.0f) {
-      return 0;
-    }
-    const float rescue_mul =
-        (rdoq_level <= -2)
-            ? ((rdoq_level == -2) ? 1.25f
-                                  : ((rdoq_level == -3) ? 1.42f : 1.60f))
-            : 1.0f;
-    float best_abs = (few_colors ? 0.54f : 0.46f) * rescue_mul;
-    int best_pos = -1;
-    int32_t best_sign = 1;
-    for (size_t y = 0; y < 4 * ysize; ++y) {
-      for (size_t x = 0; x < 4 * xsize; ++x) {
-        if (x < xsize && y < ysize) continue;
-        const size_t pos = y * dim + x;
-        const float val = block_in[pos] * (qm[pos] * qac);
-        const float abs_val = std::abs(val);
-        if (abs_val > best_abs) {
-          best_abs = abs_val;
-          best_pos = static_cast<int>(pos);
-          best_sign = (val >= 0.0f) ? 1 : -1;
-        }
-      }
-    }
-    if (best_pos >= 0) {
-      block_out[best_pos] = best_sign;
-      return 1;
-    }
-    return 0;
-  };
 
   const size_t window_cap =
       (covered_blocks == 1)
@@ -388,6 +357,64 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   }
   const size_t window_len = search_end - covered_blocks;
 
+  auto rescue_quad0 = [&]() -> int32_t {
+    if (is_partial_block || c != 1 || covered_blocks > 4 || eob_scale <= 0.0f) {
+      return 0;
+    }
+    const float rescue_mul =
+        (rdoq_level < 0)
+            ? ((rdoq_level == -1)
+                   ? 1.06f
+                   : ((rdoq_level == -2)
+                          ? 1.25f
+                          : ((rdoq_level == -3) ? 1.42f : 1.60f)))
+            : 1.0f;
+    float best_score = (few_colors ? 0.54f : 0.46f) * rescue_mul;
+    int best_pos = -1;
+    int32_t best_sign = 1;
+    const float nzero1_delta = std::max(
+        0.0f, tcm.ValBits(cl_nzero, 1) - tcm.ValBits(cl_nzero, 0));
+    float zero_run_bits = 0.0f;
+    size_t prev_nz = 1;
+    for (size_t wi = 0; wi < window_len; ++wi) {
+      if (zero_run_bits > 8.5f) break;
+      const size_t k = covered_blocks + wi;
+      const size_t pos = order[k];
+      const uint32_t ctx0 =
+          static_cast<uint32_t>(histo_offset) +
+          ZeroDensityContext(/*nonzeros_left=*/1, k, covered_blocks,
+                             log2_covered_blocks, 0);
+      float z0 = 0.0f;
+      float z1 = 0.0f;
+      tcm.ValBitsPair(ctx0, 0, &z0, &z1);
+      const size_t y = pos / dim;
+      const size_t x = pos % dim;
+      if (y < 4 * ysize && x < 4 * xsize && !(x < xsize && y < ysize)) {
+        const float val = block_in[pos] * (qm[pos] * qac);
+        const float abs_val = std::abs(val);
+        if (abs_val > best_score) {
+          const int32_t sgn = (val >= 0.0f) ? 1 : -1;
+          const float rate_pen =
+              0.018f * std::max(0.0f, zero_run_bits - 2.0f) +
+              0.015f * std::max(0.0f, nzero1_delta - 4.0f);
+          const float eff_score = abs_val - rate_pen;
+          if (eff_score > best_score) {
+            best_score = eff_score;
+            best_pos = static_cast<int>(pos);
+            best_sign = sgn;
+          }
+        }
+      }
+      zero_run_bits += prev_nz ? z1 : z0;
+      prev_nz = 0;
+    }
+    if (best_pos >= 0) {
+      block_out[best_pos] = best_sign;
+      return 1;
+    }
+    return 0;
+  };
+
   size_t suffix_nzeros = 0;
   for (size_t k = search_end; k < size; ++k) {
     suffix_nzeros += static_cast<size_t>(block_out[order[k]] != 0);
@@ -395,6 +422,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   size_t window_orig_nzeros = 0;
   size_t scalar_lf_nz = 0;
   bool any_near_dz_cand = false;
+  size_t last_active_wi = 0;
   for (size_t wi = 0; wi < window_len; ++wi) {
     const size_t k = covered_blocks + wi;
     const size_t pos = order[k];
@@ -405,10 +433,11 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
     const uint8_t s = kCoeffBand[v8][u8];
     if (block_out[pos] != 0) {
       ++window_orig_nzeros;
+      last_active_wi = wi;
       if (is_partial_block ? (k <= 8) : (s >= 2)) {
         ++scalar_lf_nz;
       }
-    } else if (!any_near_dz_cand) {
+    } else {
       const size_t hfix =
           (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
       const float t0_full = quad_thres[hfix] + zero_thres[4 + s];
@@ -422,12 +451,15 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
       if ((can_restore && abs_ideal >= restore_floor) ||
           (!few_colors && abs_ideal >= near_dz_floor)) {
         any_near_dz_cand = true;
+        last_active_wi = wi;
       }
     }
   }
   if (suffix_nzeros == 0 && window_orig_nzeros == 0 && !any_near_dz_cand) {
     return rescue_quad0();
   }
+  const size_t dp_window_len =
+      (suffix_nzeros > 0) ? window_len : (last_active_wi + 1);
 
   float suffix_cost[2] = {0.0f, 0.0f};
   if (suffix_nzeros > 0) {
@@ -490,8 +522,8 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   size_t next_max = suffix_nzeros;
   size_t original_after_nzeros = 0;
 
-  for (size_t rev = 0; rev < window_len; ++rev) {
-    const size_t wi = window_len - 1 - rev;
+  for (size_t rev = 0; rev < dp_window_len; ++rev) {
+    const size_t wi = dp_window_len - 1 - rev;
     const size_t k = covered_blocks + wi;
     const size_t pos = order[k];
     const int32_t current = block_out[pos];
@@ -565,7 +597,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
       }
     }
 
-    const size_t processed_after = window_len - 1 - wi;
+    const size_t processed_after = dp_window_len - 1 - wi;
     const size_t min_rem =
         suffix_nzeros +
         ((original_after_nzeros > kMaxNzeroDelta)
@@ -576,7 +608,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
         std::min(original_after_nzeros + kMaxNzeroDelta, processed_after);
     const size_t current_min = min_rem;
     const size_t current_max =
-        std::min(max_rem + 1, suffix_nzeros + window_len);
+        std::min(max_rem + 1, suffix_nzeros + dp_window_len);
 
     const size_t cur_row = 1 - next_row;
     float* JXL_RESTRICT cur_dp = cost_buf[cur_row];
@@ -694,7 +726,7 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   size_t cur_rem = best_remaining;
   size_t cur_prev = (best_remaining > size / 16) ? 0 : 1;
   size_t orig_after = window_orig_nzeros;
-  for (size_t wi = 0; wi < window_len; ++wi) {
+  for (size_t wi = 0; wi < dp_window_len; ++wi) {
     const size_t k = covered_blocks + wi;
     const size_t pos = order[k];
     const int32_t current = block_out[pos];
@@ -753,10 +785,10 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
 static bool ContinueSaturatedBlock(
     const PassesEncoderState* enc_state, AcStrategy acs, size_t cov_x,
     size_t cov_y, size_t xblocks, size_t yblocks, int32_t quant_ac,
-    const float* const JXL_RESTRICT opsin_rows[3], size_t opsin_stride,
-    size_t bx_px_offset, size_t frame_px0, size_t frame_py0,
-    float* JXL_RESTRICT scratch_space, float* JXL_RESTRICT clip_work,
-    float* JXL_RESTRICT shift_out) {
+    bool dc_is_frozen, const float* const JXL_RESTRICT opsin_rows[3],
+    size_t opsin_stride, size_t bx_px_offset, size_t frame_px0,
+    size_t frame_py0, float* JXL_RESTRICT scratch_space,
+    float* JXL_RESTRICT clip_work, float* JXL_RESTRICT shift_out) {
   const size_t covered = cov_x * cov_y;
   if (covered > 16) return false;
   if (enc_state->cparams.speed_tier > SpeedTier::kSquirrel ||
@@ -875,9 +907,34 @@ static bool ContinueSaturatedBlock(
   const float bias_one = kDefaultQuantBias[1];
   const size_t wc = xblocks * kBlockDim;
   constexpr float kMaxShift = 0.025f;
+  const size_t frame_bx0 = frame_px0 / kBlockDim;
+  const size_t frame_by0 = frame_py0 / kBlockDim;
+  const bool has_frozen_dc =
+      dc_is_frozen &&
+      shared.dc_storage.xsize() >= frame_bx0 + cov_x &&
+      shared.dc_storage.ysize() >= frame_by0 + cov_y;
+  const float dc_mul =
+      (enc_state->cparams.speed_tier < SpeedTier::kFalcon) ? 0.5f : 1.0f;
+  const float step_y = shared.quantizer.GetDcStep(1) * dc_mul;
+  const float inv_step_y = shared.quantizer.GetInvDcStep(1) / dc_mul;
+  float dc_tmp[16];
 
   for (size_t iter = 0; iter < 3; ++iter) {
     TransformFromPixels(acs.Strategy(), tgt_y, pw, coeff, scratch_space);
+    if (has_frozen_dc) {
+      LowestFrequenciesFromDC(
+          acs.Strategy(),
+          shared.dc_storage.ConstPlaneRow(1, frame_by0) + frame_bx0,
+          shared.dc_storage.PixelsPerRow(), coeff, scratch_space);
+    } else {
+      DCFromLowestFrequencies(acs.Strategy(), coeff, dc_tmp, cov_x,
+                              scratch_space);
+      for (size_t i = 0; i < covered; ++i) {
+        dc_tmp[i] = std::round(dc_tmp[i] * inv_step_y) * step_y;
+      }
+      LowestFrequenciesFromDC(acs.Strategy(), dc_tmp, cov_x, coeff,
+                              scratch_space);
+    }
     for (size_t cy = 0; cy < yblocks * kBlockDim; ++cy) {
       const size_t x_start = (cy < yblocks) ? xblocks : 0;
       for (size_t cx = x_start; cx < wc; ++cx) {
@@ -1483,8 +1540,9 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           // DCT all channels, roundtrip-quantize Y and set DC.
           const bool has_clip_shift = ContinueSaturatedBlock(
               enc_state, acs, cov_x, cov_y, xblocks, yblocks,
-              row_clip_quant_ac[bx], opsin_rows, opsin_stride, bx * kBlockDim,
-              frame_px0, frame_py0, scratch_space, clip_work, clip_shift);
+              row_clip_quant_ac[bx], /*dc_is_frozen=*/(dc == nullptr),
+              opsin_rows, opsin_stride, bx * kBlockDim, frame_px0, frame_py0,
+              scratch_space, clip_work, clip_shift);
           if (has_clip_shift) {
             const size_t pw = cov_x * kBlockDim;
             const size_t ph = cov_y * kBlockDim;
@@ -1749,8 +1807,9 @@ Status InitAcGroupCacheImpl(size_t group_idx,
               : false;
       const bool has_clip_shift = ContinueSaturatedBlock(
           enc_state, acs, cov_x, cov_y, xblocks, yblocks, tr.base_quant_ac,
-          opsin_rows, opsin_stride, bx * kBlockDim, (gx0 + bx) * kBlockDim,
-          (gy0 + by) * kBlockDim, scratch_space, clip_work, clip_shift);
+          /*dc_is_frozen=*/true, opsin_rows, opsin_stride, bx * kBlockDim,
+          (gx0 + bx) * kBlockDim, (gy0 + by) * kBlockDim, scratch_space,
+          clip_work, clip_shift);
       if (has_clip_shift) {
         const size_t pw = cov_x * kBlockDim;
         const size_t ph = cov_y * kBlockDim;
@@ -2368,9 +2427,10 @@ Status EvalAcsBoxCandidateImpl(const PassesEncoderState* enc_state,
                                         sby)[sbx]
             : sp.quant_ac;
     const bool has_clip_shift = ContinueSaturatedBlock(
-        enc_state, acs, cov_x, cov_y, xblocks, yblocks, clip_q, opsin_rows,
-        opsin_stride, lx0, (gx0 + sbx) * kBlockDim, (gy0 + sby) * kBlockDim,
-        scratch_space, clip_work, clip_shift);
+        enc_state, acs, cov_x, cov_y, xblocks, yblocks, clip_q,
+        /*dc_is_frozen=*/true, opsin_rows, opsin_stride, lx0,
+        (gx0 + sbx) * kBlockDim, (gy0 + sby) * kBlockDim, scratch_space,
+        clip_work, clip_shift);
 
     memset(dc_src_sub, 0, 192 * sizeof(float));
     memset(dc_err_sub, 0, 192 * sizeof(float));
