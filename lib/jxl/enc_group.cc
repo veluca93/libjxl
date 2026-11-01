@@ -8047,6 +8047,7 @@ Status RefineQuantFieldClosedLoop(
     ImageB best_cand_sharp;
     ImageB cand_sharp;
     std::array<ImageF, 8> ar_err_imgs;
+    ImageF ar_mask;
     ImageF ar_bdry_err0;
     ImageF ar_target_grad;
     size_t ar_histo[9][8] = {};
@@ -8223,6 +8224,32 @@ Status RefineQuantFieldClosedLoop(
                        Image3F::Create(memory_manager, xsize, ysize));
   JXL_ASSIGN_OR_RETURN(cur_lin,
                        Image3F::Create(memory_manager, xsize, ysize));
+  JXL_ASSIGN_OR_RETURN(st.ar_mask,
+                       ImageF::Create(memory_manager, xsize_blocks * kBlockDim,
+                                      ysize_blocks * kBlockDim));
+  {
+    const float* const orig_rows[3] = {
+        enc_state->orig_opsin->ConstPlaneRow(0, 0),
+        enc_state->orig_opsin->ConstPlaneRow(1, 0),
+        enc_state->orig_opsin->ConstPlaneRow(2, 0),
+    };
+    const size_t orig_stride = enc_state->orig_opsin->PixelsPerRow();
+    const size_t orig_w = enc_state->orig_opsin->xsize();
+    const size_t orig_h = enc_state->orig_opsin->ysize();
+    std::vector<float> raw_buf(260 * 260);
+    const size_t mask_w = xsize_blocks * kBlockDim;
+    const size_t mask_h = ysize_blocks * kBlockDim;
+    for (size_t my = 0; my < mask_h; my += 256) {
+      const size_t mh = std::min<size_t>(256, mask_h - my);
+      for (size_t mx = 0; mx < mask_w; mx += 256) {
+        const size_t mw = std::min<size_t>(256, mask_w - mx);
+        ComputeOpponentMaskRect(orig_rows, orig_stride, orig_w, orig_h, mx, my,
+                                mw, mh, 1.0f, raw_buf.data(),
+                                st.ar_mask.Row(my) + mx,
+                                st.ar_mask.PixelsPerRow());
+      }
+    }
+  }
 
   const Rect full_px_rect(0, 0, xsize, ysize);
   const Rect full_blk_rect(0, 0, xsize_blocks, ysize_blocks);
@@ -8302,12 +8329,19 @@ Status RefineQuantFieldClosedLoop(
           float grad_b = 0.0f;
           float err = ComputeLocalBlockEpfError(
               *enc_state->orig_opsin, st.post_xyb, by, bx, asym_def_w, &bdry_b,
-              &grad_a, &grad_b);
+              &grad_a, &grad_b,
+              st.ar_mask.ConstRow(by * kBlockDim) + bx * kBlockDim,
+              st.ar_mask.PixelsPerRow());
           if (val == 0) {
             bdry0_row[bx] = bdry_b;
             target_grad_row[bx] = std::min(grad_a, grad_b);
           } else {
-            const float tw = (val >= 7) ? tex_weight_7 : tex_weight_2;
+            const float tw =
+                (val >= 7)
+                    ? tex_weight_7
+                    : ((cur_lf.epf_iters >= 2 && val >= 5)
+                           ? (0.65f * tex_weight_7)
+                           : tex_weight_2);
             err += kBdryWeight * (bdry_b - bdry0_row[bx]) +
                    tw * std::max(0.0f, target_grad_row[bx] - grad_b);
           }
@@ -11269,11 +11303,15 @@ Status RefineQuantFieldClosedLoop(
                   double cur_loc_err = 0.0;
                   for (size_t iy = 0; iy < bh; ++iy) {
                     for (size_t ix = 0; ix < bw; ++ix) {
+                      const size_t gby = cache.gy0 + by0 + iy;
+                      const size_t gbx = cache.gx0 + bx0 + ix;
                       float bdry_b = 0.0f;
                       cur_loc_err += ComputeLocalBlockEpfError(
-                          *enc_state->orig_opsin, fine_pre_gab,
-                          cache.gy0 + by0 + iy, cache.gx0 + bx0 + ix, 1.20f,
-                          &bdry_b, nullptr, nullptr);
+                          *enc_state->orig_opsin, fine_pre_gab, gby, gbx, 1.20f,
+                          &bdry_b, nullptr, nullptr,
+                          st.ar_mask.ConstRow(gby * kBlockDim) +
+                              gbx * kBlockDim,
+                          st.ar_mask.PixelsPerRow());
                       cur_loc_err += kAcsEpfBdryWD * bdry_b;
                     }
                   }
@@ -11318,11 +11356,15 @@ Status RefineQuantFieldClosedLoop(
                     double cand_loc_err = 0.0;
                     for (size_t iy = 0; iy < bh; ++iy) {
                       for (size_t ix = 0; ix < bw; ++ix) {
+                        const size_t gby = cache.gy0 + by0 + iy;
+                        const size_t gbx = cache.gx0 + bx0 + ix;
                         float bdry_b = 0.0f;
                         cand_loc_err += ComputeLocalBlockEpfError(
-                            *enc_state->orig_opsin, fine_pre_gab,
-                            cache.gy0 + by0 + iy, cache.gx0 + bx0 + ix, 1.20f,
-                            &bdry_b, nullptr, nullptr);
+                            *enc_state->orig_opsin, fine_pre_gab, gby, gbx,
+                            1.20f, &bdry_b, nullptr, nullptr,
+                            st.ar_mask.ConstRow(gby * kBlockDim) +
+                                gbx * kBlockDim,
+                            st.ar_mask.PixelsPerRow());
                         cand_loc_err += kAcsEpfBdryWD * bdry_b;
                       }
                     }
@@ -12934,7 +12976,9 @@ Status RefineQuantFieldClosedLoop(
                   float bdry_b = 0.0f;
                   cur_loc_err += ComputeLocalBlockEpfError(
                       *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f,
-                      &bdry_b, nullptr, nullptr);
+                      &bdry_b, nullptr, nullptr,
+                      st.ar_mask.ConstRow(ey * kBlockDim) + ex * kBlockDim,
+                      st.ar_mask.PixelsPerRow());
                   cur_loc_err += kAcsEpfBdryWD * bdry_b;
                 }
               }
@@ -12947,7 +12991,9 @@ Status RefineQuantFieldClosedLoop(
                   float bdry_b = 0.0f;
                   cand_loc_err += ComputeLocalBlockEpfError(
                       *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f,
-                      &bdry_b, nullptr, nullptr);
+                      &bdry_b, nullptr, nullptr,
+                      st.ar_mask.ConstRow(ey * kBlockDim) + ex * kBlockDim,
+                      st.ar_mask.PixelsPerRow());
                   cand_loc_err += kAcsEpfBdryWD * bdry_b;
                 }
               }
@@ -13724,6 +13770,18 @@ Status RefineQuantFieldClosedLoop(
                   return (a.err != b.err) ? (a.err > b.err) : (a.tile < b.tile);
                 });
 
+      bool all_even_pre3b = !started_uniform;
+      if (all_even_pre3b) {
+        for (size_t by = 0; by < ysize_blocks && all_even_pre3b; ++by) {
+          const uint8_t* srow = rdo_sharpness.ConstRow(by);
+          for (size_t bx = 0; bx < xsize_blocks; ++bx) {
+            if ((srow[bx] & 1u) != 0u) {
+              all_even_pre3b = false;
+              break;
+            }
+          }
+        }
+      }
       const size_t max_epf_tiles = std::min<size_t>(
           (started_uniform ? 48 : 64) * group_cap_scale, epf_ranks.size());
       auto& saved_sharp = st.saved_sharp;
@@ -13737,34 +13795,112 @@ Status RefineQuantFieldClosedLoop(
         const size_t bh = std::min<size_t>(kTileBlocks, ysize_blocks - by0);
         if (bw == 0 || bh == 0) continue;
 
-        saved_sharp.resize(bw * bh);
+        const size_t n_tile_blk = bw * bh;
+        saved_sharp.resize(n_tile_blk);
         size_t sum_s = 0;
+        uint8_t min_sv = 7;
+        uint8_t max_sv = 0;
         for (size_t iy = 0; iy < bh; ++iy) {
           const uint8_t* srow = rdo_sharpness.ConstRow(by0 + iy) + bx0;
           for (size_t ix = 0; ix < bw; ++ix) {
             const uint8_t sv = srow[ix];
             saved_sharp[iy * bw + ix] = sv;
             sum_s += sv;
+            min_sv = std::min(min_sv, sv);
+            max_sv = std::max(max_sv, sv);
           }
         }
         const int mean_s = static_cast<int>(
-            (sum_s + (bw * bh) / 2) / std::max<size_t>(1, bw * bh));
-        uint8_t tile_s_cands[7] = {};
-        size_t num_s_cands = 0;
-        auto push_s_cand = [&](int v) {
-          const uint8_t uv = static_cast<uint8_t>(Clamp1(v, 0, 7));
-          for (size_t k = 0; k < num_s_cands; ++k) {
-            if (tile_s_cands[k] == uv) return;
+            (sum_s + n_tile_blk / 2) / std::max<size_t>(1, n_tile_blk));
+        std::array<uint8_t, 16> tile_pats[12] = {};
+        bool pat_is_rel[12] = {};
+        size_t num_pats = 0;
+        auto push_pat = [&](const std::array<uint8_t, 16>& pat, bool is_rel) {
+          bool same_as_cur = true;
+          for (size_t k = 0; k < n_tile_blk; ++k) {
+            if (pat[k] != saved_sharp[k]) {
+              same_as_cur = false;
+              break;
+            }
           }
-          tile_s_cands[num_s_cands++] = uv;
+          if (same_as_cur) return;
+          for (size_t pi = 0; pi < num_pats; ++pi) {
+            bool dup = true;
+            for (size_t k = 0; k < n_tile_blk; ++k) {
+              if (tile_pats[pi][k] != pat[k]) {
+                dup = false;
+                break;
+              }
+            }
+            if (dup) return;
+          }
+          if (num_pats < 12) {
+            pat_is_rel[num_pats] = is_rel;
+            tile_pats[num_pats++] = pat;
+          }
         };
-        push_s_cand(0);
-        push_s_cand(std::max(1, mean_s - 2));
-        push_s_cand(std::max(1, mean_s - 1));
-        push_s_cand(mean_s);
-        push_s_cand(std::min(7, mean_s + 1));
-        push_s_cand(std::min(7, mean_s + 2));
-        if (started_uniform) push_s_cand(7);
+        auto push_uniform_cand = [&](int v) {
+          uint8_t uv = static_cast<uint8_t>(Clamp1(v, 0, 7));
+          if (all_even_pre3b && (uv & 1u) != 0u) {
+            uv = static_cast<uint8_t>(Clamp1(uv + 1, 2, 6));
+          }
+          std::array<uint8_t, 16> pat = {};
+          for (size_t k = 0; k < n_tile_blk; ++k) pat[k] = uv;
+          push_pat(pat, /*is_rel=*/false);
+        };
+        if (all_even_pre3b) {
+          push_uniform_cand(0);
+          push_uniform_cand(2);
+          push_uniform_cand(4);
+          push_uniform_cand(6);
+        } else {
+          push_uniform_cand(0);
+          push_uniform_cand(std::max(1, mean_s - 2));
+          push_uniform_cand(std::max(1, mean_s - 1));
+          push_uniform_cand(mean_s);
+          push_uniform_cand(std::min(7, mean_s + 1));
+          push_uniform_cand(std::min(7, mean_s + 2));
+          if (started_uniform) push_uniform_cand(7);
+        }
+
+        if (min_sv < max_sv) {
+          if (all_even_pre3b) {
+            static constexpr int kEvenDeltas[4] = {-4, -2, 2, 4};
+            for (int delta : kEvenDeltas) {
+              std::array<uint8_t, 16> pat = {};
+              for (size_t k = 0; k < n_tile_blk; ++k) {
+                const uint8_t sv = saved_sharp[k];
+                pat[k] = (sv == 0)
+                             ? 0
+                             : static_cast<uint8_t>(
+                                   Clamp1(static_cast<int>(sv) + delta, 2, 6));
+              }
+              push_pat(pat, /*is_rel=*/true);
+            }
+          } else {
+            static constexpr int kRelDeltas[4] = {-3, -2, 2, 3};
+            for (int delta : kRelDeltas) {
+              std::array<uint8_t, 16> pat = {};
+              for (size_t k = 0; k < n_tile_blk; ++k) {
+                const uint8_t sv = saved_sharp[k];
+                pat[k] = (sv == 0)
+                             ? 0
+                             : static_cast<uint8_t>(
+                                   Clamp1(static_cast<int>(sv) + delta, 1, 7));
+              }
+              push_pat(pat, /*is_rel=*/true);
+            }
+            if (min_sv == 0 && cparams.butteraugli_distance >= 2.0f) {
+              std::array<uint8_t, 16> pat = {};
+              for (size_t k = 0; k < n_tile_blk; ++k) {
+                const uint8_t sv = saved_sharp[k];
+                pat[k] = (sv == 0) ? 2 : sv;
+              }
+              push_pat(pat, /*is_rel=*/true);
+            }
+          }
+        }
+        if (num_pats == 0) continue;
 
         // Include up to 7 blocks top/left so UpdateRect visits IsFirstBlock()
         // of any transform (up to 64x64 = 8x8 blocks) covering [bx0..bx0+bw).
@@ -13797,25 +13933,18 @@ Status RefineQuantFieldClosedLoop(
         }
 
         bool has_best_s = false;
-        uint8_t best_s_val = 0;
+        std::array<uint8_t, 16> best_pat = {};
         double best_s_j = 0.002;
         double best_s_raw_bits = cur_sh_bits;
         double best_s_eff_bits = cur_eff_sh_bits;
 
-        for (size_t sci = 0; sci < num_s_cands; ++sci) {
-          const uint8_t s_val = tile_s_cands[sci];
-          bool same_as_cur = true;
-          for (size_t k = 0; k < bw * bh; ++k) {
-            if (saved_sharp[k] != s_val) {
-              same_as_cur = false;
-              break;
-            }
-          }
-          if (same_as_cur) continue;
-
+        for (size_t sci = 0; sci < num_pats; ++sci) {
+          const auto& pat = tile_pats[sci];
           for (size_t iy = 0; iy < bh; ++iy) {
             uint8_t* srow = rdo_sharpness.Row(by0 + iy) + bx0;
-            for (size_t ix = 0; ix < bw; ++ix) srow[ix] = s_val;
+            for (size_t ix = 0; ix < bw; ++ix) {
+              srow[ix] = pat[iy * bw + ix];
+            }
           }
           double cand_raw_bits = 0.0;
           const double cand_eff_bits =
@@ -13856,11 +13985,12 @@ Status RefineQuantFieldClosedLoop(
             min_rd_m = std::min(min_rd_m, rd_p);
           }
           const double pareto_tol =
-              started_uniform ? 0.0
-                              : -std::min(0.020, 0.35 * std::max(0.0, j_gain));
+              (started_uniform || pat_is_rel[sci])
+                  ? 0.0
+                  : -std::min(0.020, 0.35 * std::max(0.0, j_gain));
           if (j_gain > best_s_j && min_rd_m >= pareto_tol) {
             has_best_s = true;
-            best_s_val = s_val;
+            best_pat = pat;
             best_s_j = j_gain;
             best_s_raw_bits = cand_raw_bits;
             best_s_eff_bits = cand_eff_bits;
@@ -13870,7 +14000,9 @@ Status RefineQuantFieldClosedLoop(
         if (has_best_s) {
           for (size_t iy = 0; iy < bh; ++iy) {
             uint8_t* srow = rdo_sharpness.Row(by0 + iy) + bx0;
-            for (size_t ix = 0; ix < bw; ++ix) srow[ix] = best_s_val;
+            for (size_t ix = 0; ix < bw; ++ix) {
+              srow[ix] = best_pat[iy * bw + ix];
+            }
           }
           epf_sigma->UpdateRect(lf, shared.ac_strategy, quant_scale,
                                 rdo_quant_field, rdo_sharpness, sigma_upd_rect);
@@ -13891,6 +14023,168 @@ Status RefineQuantFieldClosedLoop(
           }
           epf_sigma->UpdateRect(lf, shared.ac_strategy, quant_scale,
                                 rdo_quant_field, rdo_sharpness, sigma_upd_rect);
+        }
+      }
+
+      if (!started_uniform || accepted_3b > 0) {
+        const uint8_t sub_hi =
+            (all_even_pre3b || cparams.butteraugli_distance <= 1.6f) ? 6 : 5;
+        const uint8_t sub_cands[3] = {0, 2, sub_hi};
+        const size_t max_sub_tiles =
+            std::min<size_t>(16 * group_cap_scale, epf_ranks.size());
+        for (size_t ri = 0; ri < max_sub_tiles; ++ri) {
+          const size_t t = epf_ranks[ri].tile;
+          const size_t tx = t % tiles_x;
+          const size_t ty = t / tiles_x;
+          const size_t bx0 = tx * kTileBlocks;
+          const size_t by0 = ty * kTileBlocks;
+          const size_t bw = std::min<size_t>(kTileBlocks, xsize_blocks - bx0);
+          const size_t bh = std::min<size_t>(kTileBlocks, ysize_blocks - by0);
+          if (bw < 3 || bh < 3) continue;
+
+          for (size_t qy = 0; qy < bh; qy += 2) {
+            const size_t qh = std::min<size_t>(2, bh - qy);
+            for (size_t qx = 0; qx < bw; qx += 2) {
+              const size_t qw = std::min<size_t>(2, bw - qx);
+              const size_t sbx = bx0 + qx;
+              const size_t sby = by0 + qy;
+              uint8_t q_saved[4] = {};
+              for (size_t iy = 0; iy < qh; ++iy) {
+                const uint8_t* srow = rdo_sharpness.ConstRow(sby + iy) + sbx;
+                for (size_t ix = 0; ix < qw; ++ix) {
+                  q_saved[iy * qw + ix] = srow[ix];
+                }
+              }
+
+              const size_t sx0 = (sbx > 7) ? (sbx - 7) : 0;
+              const size_t sy0 = (sby > 7) ? (sby - 7) : 0;
+              const Rect sigma_upd_rect(sx0, sy0, sbx + qw - sx0,
+                                        sby + qh - sy0);
+              const size_t px0 = sbx * kBlockDim;
+              const size_t py0 = sby * kBlockDim;
+              const size_t px1 = std::min(xsize, (sbx + qw) * kBlockDim);
+              const size_t py1 = std::min(ysize, (sby + qh) * kBlockDim);
+              const size_t lx0 =
+                  (px0 > cur_sigma_px_pad) ? (px0 - cur_sigma_px_pad) : 0;
+              const size_t ly0 =
+                  (py0 > cur_sigma_px_pad) ? (py0 - cur_sigma_px_pad) : 0;
+              const size_t lx1 = std::min(xsize, px1 + cur_sigma_px_pad);
+              const size_t ly1 = std::min(ysize, py1 + cur_sigma_px_pad);
+              if (lx0 >= lx1 || ly0 >= ly1) continue;
+              const Rect dirty_lin(lx0, ly0, lx1 - lx0, ly1 - ly0);
+
+              const size_t lw = dirty_lin.xsize();
+              const size_t lh = dirty_lin.ysize();
+              saved_lin.resize(3 * lw * lh);
+              for (size_t c = 0; c < 3; ++c) {
+                for (size_t y = 0; y < lh; ++y) {
+                  memcpy(saved_lin.data() + (c * lh + y) * lw,
+                         cur_lin.ConstPlaneRow(c, dirty_lin.y0() + y) +
+                             dirty_lin.x0(),
+                         lw * sizeof(float));
+                }
+              }
+
+              bool has_best_q = false;
+              uint8_t best_q_val = 0;
+              double best_q_j = 0.0020;
+              double best_q_raw_bits = cur_sh_bits;
+              double best_q_eff_bits = cur_eff_sh_bits;
+
+              for (uint8_t s_val : sub_cands) {
+                bool same_q = true;
+                for (size_t k = 0; k < qw * qh; ++k) {
+                  if (q_saved[k] != s_val) {
+                    same_q = false;
+                    break;
+                  }
+                }
+                if (same_q) continue;
+
+                for (size_t iy = 0; iy < qh; ++iy) {
+                  uint8_t* srow = rdo_sharpness.Row(sby + iy) + sbx;
+                  for (size_t ix = 0; ix < qw; ++ix) srow[ix] = s_val;
+                }
+                double cand_raw_bits = 0.0;
+                const double cand_eff_bits =
+                    eval_3b_sh_bits(rdo_sharpness, &cand_raw_bits);
+                const double delta_rate =
+                    rate_term(cur_bits + cur_lf_bits + cand_eff_bits) -
+                    rate_term(cur_bits + cur_lf_bits + cur_eff_sh_bits);
+
+                epf_sigma->UpdateRect(lf, shared.ac_strategy, quant_scale,
+                                      rdo_quant_field, rdo_sharpness,
+                                      sigma_upd_rect);
+                JXL_RETURN_IF_ERROR(ReconstructLinearRgb(
+                    memory_manager, lf, shared, cur_pre_gab, feat_ptr,
+                    epf_sigma, epf_ws, dirty_lin, &cur_lin));
+
+                std::array<double, 4> cand_d = {};
+                JXL_RETURN_IF_ERROR(
+                    update_4m_checkpointed(cur_lin, dirty_lin, &cand_d));
+
+                wd->Rollback(cp_wd);
+                ssim2->Rollback(cp_ss2);
+                ba3->Rollback(cp_ba3);
+                cvvdp->Rollback(cp_cv);
+                for (size_t c = 0; c < 3; ++c) {
+                  for (size_t y = 0; y < lh; ++y) {
+                    memcpy(cur_lin.PlaneRow(c, dirty_lin.y0() + y) +
+                               dirty_lin.x0(),
+                           saved_lin.data() + (c * lh + y) * lw,
+                           lw * sizeof(float));
+                  }
+                }
+
+                double j_gain = 0.0;
+                double min_rd_m = 1e30;
+                for (size_t m = 0; m < 4; ++m) {
+                  if (weight_m[m] <= 0.0) continue;
+                  const double nm = (cur_d[m] - cand_d[m]) / slope_m[m];
+                  const double rd_m = nm - delta_rate;
+                  const double rd_p =
+                      (rd_m < 0.0) ? (pareto_w_m[m] * rd_m) : rd_m;
+                  j_gain += weight_m[m] * rd_m;
+                  min_rd_m = std::min(min_rd_m, rd_p);
+                }
+                if (j_gain > best_q_j && min_rd_m >= 0.0) {
+                  has_best_q = true;
+                  best_q_val = s_val;
+                  best_q_j = j_gain;
+                  best_q_raw_bits = cand_raw_bits;
+                  best_q_eff_bits = cand_eff_bits;
+                }
+              }
+
+              if (has_best_q) {
+                for (size_t iy = 0; iy < qh; ++iy) {
+                  uint8_t* srow = rdo_sharpness.Row(sby + iy) + sbx;
+                  for (size_t ix = 0; ix < qw; ++ix) srow[ix] = best_q_val;
+                }
+                epf_sigma->UpdateRect(lf, shared.ac_strategy, quant_scale,
+                                      rdo_quant_field, rdo_sharpness,
+                                      sigma_upd_rect);
+                JXL_RETURN_IF_ERROR(ReconstructLinearRgb(
+                    memory_manager, lf, shared, cur_pre_gab, feat_ptr,
+                    epf_sigma, epf_ws, dirty_lin, &cur_lin));
+                JXL_RETURN_IF_ERROR(
+                    update_4m_checkpointed(cur_lin, dirty_lin, &cur_d));
+                cur_sh_bits = best_q_raw_bits;
+                cur_eff_sh_bits = best_q_eff_bits;
+                ++accepted_3b;
+              } else {
+                for (size_t iy = 0; iy < qh; ++iy) {
+                  uint8_t* srow = rdo_sharpness.Row(sby + iy) + sbx;
+                  for (size_t ix = 0; ix < qw; ++ix) {
+                    srow[ix] = q_saved[iy * qw + ix];
+                  }
+                }
+                epf_sigma->UpdateRect(lf, shared.ac_strategy, quant_scale,
+                                      rdo_quant_field, rdo_sharpness,
+                                      sigma_upd_rect);
+              }
+            }
+          }
         }
       }
 
