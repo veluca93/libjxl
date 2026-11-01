@@ -1993,8 +1993,12 @@ Status EvalAcGroupCacheImpl(const PassesEncoderState* enc_state,
     const size_t size = kDCTBlockSize * covered_blocks;
     const AcStrategy acs = AcStrategy::FromRawStrategy(tr.acs_raw);
     const size_t ord = kStrategyOrder[tr.acs_raw];
+    const int32_t eff_qf_step =
+        (qf_step_override == -999)
+            ? (((((bx >> 2) + (by >> 2)) & 1u) == 0u) ? -1 : 0)
+            : qf_step_override;
     const int32_t quant_ac =
-        Clamp1<int32_t>(tr.cur_quant_ac + qf_step_override, 1, 255);
+        Clamp1<int32_t>(tr.cur_quant_ac + eff_qf_step, 1, 255);
 
     int32_t pred_nz[3];
     for (size_t c = 0; c < 3; ++c) {
@@ -3566,6 +3570,10 @@ void XybRowToLinearRgb(const float* JXL_RESTRICT row_x,
 float EstimateGroupQfBits(const AcGroupBlockCache& cache,
                           const AcTokenCostModel& tcm, int32_t qf_step_override,
                           float* out_tile_bits) {
+  if (qf_step_override == -999) {
+    return 0.5f * (EstimateGroupQfBits(cache, tcm, -1, nullptr) +
+                   EstimateGroupQfBits(cache, tcm, 0, nullptr));
+  }
   const float qf_scale = Clamp1(tcm.qf_block_bits / 1.50f, 0.50f, 2.00f);
   int32_t prev_qf = 0;
   double total_bits = 0.0;
@@ -8515,10 +8523,20 @@ Status RefineQuantFieldClosedLoop(
     JXL_RETURN_IF_ERROR(RunOnPool(
         pool, 0, static_cast<uint32_t>(num_groups), ThreadPool::NoInit,
         [&](uint32_t g, size_t /*thread*/) -> Status {
-          const int32_t qf_step =
-              (step_mode == 1)
-                  ? 1
-                  : (step_mode == -1 ? ((g % 2 == 0) ? -1 : 0) : 0);
+          int32_t qf_step = 0;
+          if (step_mode == 1) {
+            qf_step = 1;
+          } else if (step_mode == -1) {
+            if (num_groups <= 1) {
+              qf_step = -999;
+            } else {
+              const size_t xsize_groups =
+                  std::max<size_t>(1, shared.frame_dim.xsize_groups);
+              const size_t gx = g % xsize_groups;
+              const size_t gy = g / xsize_groups;
+              qf_step = (((gx + gy) & 1u) == 0u) ? -1 : 0;
+            }
+          }
           float ac_bits = 0.0f;
           float* tile_ptr =
               (out_tile_bits != nullptr) ? out_tile_bits->data() : nullptr;
@@ -8749,8 +8767,12 @@ Status RefineQuantFieldClosedLoop(
   // active dirty-rect EPF (Pass 2A reclaims bits on masked q>=6 tiles under
   // unanimous 4-metric RD agreement; Pass 2B invests +1/+2 steps on salient tiles).
   constexpr size_t kMaxPlusIters = 2;
-  constexpr size_t kMaxPlusGreedy = 280;
-  constexpr size_t kMaxMinusGreedy = 180;
+  const size_t group_cap_scale = Clamp1<size_t>(
+      static_cast<size_t>(
+          std::sqrt(static_cast<double>(std::max<size_t>(1, num_groups)) / 9.0)),
+      1, 4);
+  const size_t kMaxPlusGreedy = 280 * group_cap_scale;
+  const size_t kMaxMinusGreedy = 180 * group_cap_scale;
   constexpr size_t kMaxPlusPerGroup = 14;
   constexpr size_t kMaxMinusPerGroup = 10;
   const size_t max_plus_moves = std::min<size_t>(
@@ -8804,6 +8826,7 @@ Status RefineQuantFieldClosedLoop(
     uint16_t tr_count;
     int16_t ref_q;
     Stage2MoveKind kind;
+    double score;
   };
   auto map_alpha_to_rdoq = [](float alpha) -> int8_t {
     if (alpha < 1.23046005f) return -1;
@@ -8828,6 +8851,7 @@ Status RefineQuantFieldClosedLoop(
         size_t group;
         uint32_t target_idx;
         Stage2MoveKind kind;
+        double score;
         float cand_bits;
         Rect dirty_px;
         std::vector<SavedTrState> saved_trs;
@@ -8843,6 +8867,7 @@ Status RefineQuantFieldClosedLoop(
           item.group = g;
           item.target_idx = qe.target_idx;
           item.kind = qe.kind;
+          item.score = qe.score;
           item.cand_bits = 0.0f;
           item.dirty_px = Rect(0, 0, 0, 0);
           item.any_qf_changed = false;
@@ -9006,6 +9031,14 @@ Status RefineQuantFieldClosedLoop(
           },
           "EvalCandBatch"));
       JXL_ENSURE(batch_ok.load());
+
+      if (*pass_moves + batch.size() > max_moves_cap) {
+        std::sort(batch.begin(), batch.end(),
+                  [](const BatchItem& a, const BatchItem& b) {
+                    return (a.score != b.score) ? (a.score > b.score)
+                                                : (a.group < b.group);
+                  });
+      }
 
       for (BatchItem& item : batch) {
         const size_t g = item.group;
@@ -9463,8 +9496,9 @@ Status RefineQuantFieldClosedLoop(
                                               : (a.i0 < b.i0);
                 });
       for (size_t k = 0; k < std::min<size_t>(12, dips.size()); ++k) {
-        unsig_queues[g].push_back(
-            {dips[k].i0, dips[k].cnt, 0, Stage2MoveKind::kUnsignalDip});
+        unsig_queues[g].push_back({dips[k].i0, dips[k].cnt, 0,
+                                   Stage2MoveKind::kUnsignalDip,
+                                   dips[k].score});
       }
 
       if (q_med >= 4) {
@@ -9494,12 +9528,14 @@ Status RefineQuantFieldClosedLoop(
         for (size_t k = 0; k < std::min<size_t>(6, hi_aq_tiles.size()); ++k) {
           unsig_queues[g].push_back(
               {static_cast<uint32_t>(hi_aq_tiles[k].tile), 0,
-               static_cast<int16_t>(q_med), Stage2MoveKind::kUnsignalTile});
+               static_cast<int16_t>(q_med), Stage2MoveKind::kUnsignalTile,
+               hi_aq_tiles[k].score});
         }
       }
     }
     const size_t max_unsig_moves = std::min<size_t>(
-        240, std::max<size_t>(4, static_cast<size_t>(0.35f * num_tiles)));
+        240 * group_cap_scale,
+        std::max<size_t>(4, static_cast<size_t>(0.35f * num_tiles)));
     JXL_RETURN_IF_ERROR(
         run_stage2_queue(max_unsig_moves, unsig_queues, &unsignal_moves));
 
@@ -9542,14 +9578,14 @@ Status RefineQuantFieldClosedLoop(
       for (size_t k = 0; k < std::min<size_t>(10, tdips.size()); ++k) {
         tr_unsig_queues[g].push_back(
             {tdips[k].tr_idx, 0, tdips[k].ref_q,
-             Stage2MoveKind::kTrUnsignalDip});
+             Stage2MoveKind::kTrUnsignalDip, tdips[k].score});
         any_tr_dip = true;
       }
     }
     if (any_tr_dip) {
       size_t tr_unsig_moves = 0;
-      const size_t max_tr_unsig =
-          std::min<size_t>(240, std::max<size_t>(4, num_tiles));
+      const size_t max_tr_unsig = std::min<size_t>(
+          240 * group_cap_scale, std::max<size_t>(4, num_tiles));
       JXL_RETURN_IF_ERROR(
           run_stage2_queue(max_tr_unsig, tr_unsig_queues, &tr_unsig_moves));
       unsignal_moves += tr_unsig_moves;
@@ -9561,7 +9597,8 @@ Status RefineQuantFieldClosedLoop(
   // before testing signaled qf - 1 in Pass 2A.
   if (eob_scale_s2 > 0.0f) {
     const size_t max_rdoq_minus = std::min<size_t>(
-        220, std::max<size_t>(1, static_cast<size_t>(0.25f * num_tiles)));
+        220 * group_cap_scale,
+        std::max<size_t>(1, static_cast<size_t>(0.25f * num_tiles)));
     for (int iter_rm = 0; iter_rm < 2 && rdoq_minus_moves < max_rdoq_minus;
          ++iter_rm) {
       const size_t prev_rm = rdoq_minus_moves;
@@ -9603,7 +9640,7 @@ Status RefineQuantFieldClosedLoop(
         if (group_queues[c.group].size() < 12) {
           group_queues[c.group].push_back(
               {static_cast<uint32_t>(c.tile), 0, 0,
-               Stage2MoveKind::kRdoqMinus});
+               Stage2MoveKind::kRdoqMinus, c.score});
         }
       }
       JXL_RETURN_IF_ERROR(
@@ -9631,19 +9668,27 @@ Status RefineQuantFieldClosedLoop(
       if (tile_tr_indices[t].empty() || tile_step[t] != 0) continue;
       const size_t g = tile_group[t];
       bool all_above_floor = true;
+      bool any_at_ceil = false;
       for (size_t idx : tile_tr_indices[t]) {
-        if (group_caches[g].transforms[idx].cur_quant_ac < 6) {
+        const int32_t qt = group_caches[g].transforms[idx].cur_quant_ac;
+        if (qt < 6) {
           all_above_floor = false;
           break;
         }
+        if (qt >= 255) any_at_ceil = true;
       }
       if (!all_above_floor) continue;
       const double rdoq_disc = (tile_rdoq[t] < 0) ? 0.65 : 1.0;
+      const float fine_delta = fine_tile_bits[t] - plain_tile_bits[t];
+      const float est_save =
+          (fine_delta > 0.5f)
+              ? fine_delta
+              : ((!any_at_ceil && cur_tile_bits[t] >= 5.0f &&
+                  cur_tile_bits[t] <= 22.0f)
+                     ? (0.28f * cur_tile_bits[t])
+                     : 0.0f);
       const double dbits_save =
-          rdoq_disc *
-          static_cast<double>(std::min(
-              cur_tile_bits[t],
-              std::max(0.0f, fine_tile_bits[t] - plain_tile_bits[t])));
+          rdoq_disc * static_cast<double>(std::min(cur_tile_bits[t], est_save));
       if (dbits_save <= 1.5) continue;
       const double drate_save =
           rate_term(cur_bits + cur_sh_bits) -
@@ -9663,7 +9708,8 @@ Status RefineQuantFieldClosedLoop(
       for (const CandTile& c : minus_cands) {
         if (group_queues[c.group].size() < kMaxMinusPerGroup) {
           group_queues[c.group].push_back(
-              {static_cast<uint32_t>(c.tile), 0, 0, Stage2MoveKind::kQfMinus});
+              {static_cast<uint32_t>(c.tile), 0, 0, Stage2MoveKind::kQfMinus,
+               c.score});
         }
       }
       JXL_RETURN_IF_ERROR(
@@ -9707,10 +9753,11 @@ Status RefineQuantFieldClosedLoop(
         }
       }
       if (!can_step) continue;
+      const float raw_dbits = fine_tile_bits[t] - plain_tile_bits[t];
+      if (raw_dbits <= 0.05f && cur_tile_bits[t] < 2.0f) continue;
       const double step_mul = (tile_step[t] > 0) ? 1.15 : 1.0;
       const double dbits =
-          step_mul * static_cast<double>(
-                         std::max(0.0f, fine_tile_bits[t] - plain_tile_bits[t]));
+          step_mul * static_cast<double>(std::max(0.25f, raw_dbits));
       const double drate = rate_term(cur_bits + cur_sh_bits + dbits) -
                            rate_term(cur_bits + cur_sh_bits);
       const double proxy_j = tile_err[t] - drate;
@@ -9730,7 +9777,8 @@ Status RefineQuantFieldClosedLoop(
     for (const CandTile& c : all_cands) {
       if (group_queues[c.group].size() < kMaxPlusPerGroup) {
         group_queues[c.group].push_back(
-            {static_cast<uint32_t>(c.tile), 0, 0, Stage2MoveKind::kQfPlus});
+            {static_cast<uint32_t>(c.tile), 0, 0, Stage2MoveKind::kQfPlus,
+             c.score});
       }
     }
     JXL_RETURN_IF_ERROR(
@@ -9741,7 +9789,8 @@ Status RefineQuantFieldClosedLoop(
   // Pass 2D: Zero-bitstream-overhead +1 RDOQ fidelity boost on salient tiles.
   if (eob_scale_s2 > 0.0f) {
     const size_t max_rdoq_plus = std::min<size_t>(
-        260, std::max<size_t>(1, static_cast<size_t>(0.30f * num_tiles)));
+        260 * group_cap_scale,
+        std::max<size_t>(1, static_cast<size_t>(0.30f * num_tiles)));
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     tile_err.assign(num_tiles, 0.0);
     for (size_t by = 0; by < ysize_blocks; ++by) {
@@ -9778,7 +9827,8 @@ Status RefineQuantFieldClosedLoop(
       for (const CandTile& c : rdoq_plus_cands) {
         if (group_queues[c.group].size() < 12) {
           group_queues[c.group].push_back(
-              {static_cast<uint32_t>(c.tile), 0, 0, Stage2MoveKind::kRdoqPlus});
+              {static_cast<uint32_t>(c.tile), 0, 0, Stage2MoveKind::kRdoqPlus,
+               c.score});
         }
       }
       JXL_RETURN_IF_ERROR(
@@ -9803,7 +9853,8 @@ Status RefineQuantFieldClosedLoop(
     // unanimous 4-metric agreement.
     size_t tr_rm_moves = 0;
     const size_t max_tr_rm = std::min<size_t>(
-        480, std::max<size_t>(4, static_cast<size_t>(1.5f * num_tiles)));
+        480 * group_cap_scale,
+        std::max<size_t>(4, static_cast<size_t>(1.5f * num_tiles)));
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     std::vector<CandTransform> tr_rm_cands;
     for (size_t g = 0; g < num_groups; ++g) {
@@ -9844,7 +9895,7 @@ Status RefineQuantFieldClosedLoop(
       for (const CandTransform& c : tr_rm_cands) {
         if (group_queues[c.group].size() < 20) {
           group_queues[c.group].push_back(
-              {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqMinus});
+              {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqMinus, c.score});
         }
       }
       JXL_RETURN_IF_ERROR(
@@ -9855,7 +9906,8 @@ Status RefineQuantFieldClosedLoop(
     // edge/contour transforms inside mixed tiles.
     size_t tr_rp_moves = 0;
     const size_t max_tr_rp = std::min<size_t>(
-        400, std::max<size_t>(4, static_cast<size_t>(1.25f * num_tiles)));
+        400 * group_cap_scale,
+        std::max<size_t>(4, static_cast<size_t>(1.25f * num_tiles)));
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     double sum_blk_err = 0.0;
     for (size_t b = 0; b < num_blocks; ++b) sum_blk_err += blk_err_cur[b];
@@ -9905,7 +9957,7 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTransform& c : tr_rp_cands) {
           if (group_queues[c.group].size() < 18) {
             group_queues[c.group].push_back(
-                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus});
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus, c.score});
           }
         }
         JXL_RETURN_IF_ERROR(
@@ -9917,7 +9969,7 @@ Status RefineQuantFieldClosedLoop(
     // (pricing exact out_qf transition bits + localized epf_sigma shrinkage).
     size_t tr_qp_moves = 0;
     const size_t max_tr_qp = std::min<size_t>(
-        280, std::max<size_t>(4, num_tiles));
+        280 * group_cap_scale, std::max<size_t>(4, num_tiles));
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     sum_blk_err = 0.0;
     for (size_t b = 0; b < num_blocks; ++b) sum_blk_err += blk_err_cur[b];
@@ -9970,7 +10022,7 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTransform& c : tr_qp_cands) {
           if (group_queues[c.group].size() < 12) {
             group_queues[c.group].push_back(
-                {c.tr_idx, 0, 0, Stage2MoveKind::kTrQfPlus});
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrQfPlus, c.score});
           }
         }
         JXL_RETURN_IF_ERROR(
@@ -10031,6 +10083,7 @@ Status RefineQuantFieldClosedLoop(
     struct CflQueueEntry {
       size_t ct;
       int8_t cand_q;
+      double score;
     };
     auto run_cfl_batch_queue =
         [&](int chan, bool is_reclaim, size_t max_moves_cap,
@@ -10044,6 +10097,7 @@ Status RefineQuantFieldClosedLoop(
           size_t ct;
           int8_t old_q;
           int8_t cand_q;
+          double score;
           float cand_bits;
           Rect dirty_px;
         };
@@ -10070,8 +10124,8 @@ Status RefineQuantFieldClosedLoop(
             } else if (target_q == cur_q) {
               continue;
             }
-            CflBatchItem item{g,    ct,   cur_q,           target_q,
-                              0.0f, Rect(0, 0, 0, 0)};
+            CflBatchItem item{g,        ct,   cur_q, target_q,
+                              qe.score, 0.0f, Rect(0, 0, 0, 0)};
             for (size_t idx : st.cfl_tile_trs[ct]) {
               if (chan == 0) {
                 group_caches[g].transforms[idx].cur_ytox_q = target_q;
@@ -10106,6 +10160,14 @@ Status RefineQuantFieldClosedLoop(
             },
             "EvalCflCandBatch"));
         JXL_ENSURE(batch_ok.load());
+
+        if (*pass_moves + batch.size() > max_moves_cap) {
+          std::sort(batch.begin(), batch.end(),
+                    [](const CflBatchItem& a, const CflBatchItem& b) {
+                      return (a.score != b.score) ? (a.score > b.score)
+                                                  : (a.group < b.group);
+                    });
+        }
 
         for (CflBatchItem& item : batch) {
           const size_t g = item.group;
@@ -10327,7 +10389,7 @@ Status RefineQuantFieldClosedLoop(
         std::vector<std::vector<CflQueueEntry>> queues(num_groups);
         for (const CandTile& c : reclaim_cands) {
           if (queues[c.group].size() < 6) {
-            queues[c.group].push_back({c.tile, 0});
+            queues[c.group].push_back({c.tile, 0, c.score});
           }
         }
         size_t reclaim_moves = 0;
@@ -10354,7 +10416,8 @@ Status RefineQuantFieldClosedLoop(
                                               : (a.tile < b.tile);
                 });
       const size_t max_cfl_ref = std::min<size_t>(
-          64, std::max<size_t>(1, static_cast<size_t>(0.35f * num_cfl_tiles)));
+          64 * group_cap_scale,
+          std::max<size_t>(1, static_cast<size_t>(0.35f * num_cfl_tiles)));
       for (int chan = 0; chan < 2; ++chan) {
         const ImageSB& cmap_ref =
             (chan == 0) ? st.rdo_ytox_map : st.rdo_ytob_map;
@@ -10373,7 +10436,7 @@ Status RefineQuantFieldClosedLoop(
             const int8_t cand_q = static_cast<int8_t>(
                 Clamp1<int32_t>(cur_q + dir * step_mag, -128, 127));
             if (cand_q == static_cast<int8_t>(cur_q)) continue;
-            queues[c.group].push_back({c.tile, cand_q});
+            queues[c.group].push_back({c.tile, cand_q, c.score});
           }
           size_t ref_moves = 0;
           JXL_RETURN_IF_ERROR(run_cfl_batch_queue(
@@ -12990,11 +13053,13 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTr2H& c : dip_cands) {
           if (queues[c.group].size() < 12) {
             queues[c.group].push_back(
-                {c.tr_idx, 0, c.ref_q, Stage2MoveKind::kTrUnsignalDip});
+                {c.tr_idx, 0, c.ref_q, Stage2MoveKind::kTrUnsignalDip,
+                 c.score});
           }
         }
         size_t dip_moves_2h = 0;
-        const size_t cap = std::min<size_t>(180, std::max<size_t>(4, num_tiles));
+        const size_t cap = std::min<size_t>(
+            180 * group_cap_scale, std::max<size_t>(4, num_tiles));
         JXL_RETURN_IF_ERROR(run_stage2_queue(cap, queues, &dip_moves_2h));
         unsignal_moves += dip_moves_2h;
       }
@@ -13043,12 +13108,12 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTr2H& c : rm_cands) {
           if (queues[c.group].size() < 16) {
             queues[c.group].push_back(
-                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqMinus});
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqMinus, c.score});
           }
         }
         size_t rm_moves_2h = 0;
         const size_t cap = std::min<size_t>(
-            320, std::max<size_t>(4, num_tiles));
+            320 * group_cap_scale, std::max<size_t>(4, num_tiles));
         JXL_RETURN_IF_ERROR(run_stage2_queue(cap, queues, &rm_moves_2h));
       }
     }
@@ -13101,12 +13166,12 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTr2H& c : rp_cands) {
           if (queues[c.group].size() < 16) {
             queues[c.group].push_back(
-                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus});
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus, c.score});
           }
         }
         size_t rp_moves_2h = 0;
         const size_t cap = std::min<size_t>(
-            280, std::max<size_t>(4, num_tiles));
+            280 * group_cap_scale, std::max<size_t>(4, num_tiles));
         JXL_RETURN_IF_ERROR(run_stage2_queue(cap, queues, &rp_moves_2h));
       }
     }
@@ -13159,12 +13224,12 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTr2H& c : qp_cands) {
           if (queues[c.group].size() < 10) {
             queues[c.group].push_back(
-                {c.tr_idx, 0, 0, Stage2MoveKind::kTrQfPlus});
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrQfPlus, c.score});
           }
         }
         size_t qp_moves_2h = 0;
         const size_t cap = std::min<size_t>(
-            180, std::max<size_t>(4, num_tiles));
+            180 * group_cap_scale, std::max<size_t>(4, num_tiles));
         JXL_RETURN_IF_ERROR(run_stage2_queue(cap, queues, &qp_moves_2h));
       }
     }
@@ -13633,8 +13698,8 @@ Status RefineQuantFieldClosedLoop(
                   return (a.err != b.err) ? (a.err > b.err) : (a.tile < b.tile);
                 });
 
-      const size_t max_epf_tiles =
-          std::min<size_t>(started_uniform ? 48 : 64, epf_ranks.size());
+      const size_t max_epf_tiles = std::min<size_t>(
+          (started_uniform ? 48 : 64) * group_cap_scale, epf_ranks.size());
       auto& saved_sharp = st.saved_sharp;
       for (size_t ri = 0; ri < max_epf_tiles; ++ri) {
         const size_t t = epf_ranks[ri].tile;
@@ -13888,12 +13953,12 @@ Status RefineQuantFieldClosedLoop(
         for (const CandTr3C& c : rp_cands) {
           if (queues[c.group].size() < 12) {
             queues[c.group].push_back(
-                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus});
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus, c.score});
           }
         }
         size_t rp_moves_3c = 0;
         const size_t cap = std::min<size_t>(
-            180, std::max<size_t>(4, num_tiles / 2));
+            180 * group_cap_scale, std::max<size_t>(4, num_tiles / 2));
         JXL_RETURN_IF_ERROR(run_stage2_queue(cap, queues, &rp_moves_3c));
       }
     }
