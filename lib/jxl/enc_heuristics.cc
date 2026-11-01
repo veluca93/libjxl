@@ -878,6 +878,7 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
                                const ImageF (*band_qf)[4],
                                const AcStrategyImage* ac_strategy,
                                ModularFrameEncoder* modular_frame_encoder,
+                               Quantizer* quantizer,
                                DequantMatrices* dequant_matrices) {
   // TODO(veluca): quant matrices for no-gaborish.
   // TODO(veluca): heuristics for in-bitstream quant tables.
@@ -1270,10 +1271,18 @@ Status FindBestDequantMatrices(JxlMemoryManager* memory_manager,
         x_dc_scale = std::max(x_dc_scale * x_bokeh_mul, x_bokeh_floor);
         b_dc_scale = std::max(b_dc_scale * b_bokeh_mul, b_bokeh_floor);
       }
+      float dc_gauge = 1.0f;
+      if (quantizer != nullptr && cparams.speed_tier > SpeedTier::kKitten &&
+          cparams.quant_ac_rescale == 1.0f && quantizer->Scale() > 0.0f) {
+        const float target_quant_dc =
+            InitialQuantDC(cparams.butteraugli_distance);
+        dc_gauge = target_quant_dc / (16.0f * quantizer->Scale());
+        quantizer->SetQuantDc(16);
+      }
       const float custom_inv_dc[3] = {
-          kInvDCQuant[0] * x_dc_scale,
-          kInvDCQuant[1] * y_dc_scale,
-          kInvDCQuant[2] * b_dc_scale,
+          kInvDCQuant[0] * x_dc_scale * dc_gauge,
+          kInvDCQuant[1] * y_dc_scale * dc_gauge,
+          kInvDCQuant[2] * b_dc_scale * dc_gauge,
       };
       JXL_RETURN_IF_ERROR(DequantMatricesSetCustomDC(
           memory_manager, dequant_matrices, custom_inv_dc));
@@ -2951,7 +2960,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                           1.0f, enable_rdo ? enc_state->band_qf : nullptr,
                           (frame_header.flags & FrameHeader::kNoise) != 0,
                           &initial_base_quant));
-    float q = 0.39 / cparams.butteraugli_distance;
+    float q = 0.39f / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
 
@@ -2990,7 +2999,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
         memory_manager, cparams, frame_header, frame_dim, enable_rdo,
         initial_quant_field, /*band_qf=*/nullptr, /*ac_strategy=*/nullptr,
-        modular_frame_encoder, &matrices));
+        modular_frame_encoder, &quantizer, &matrices));
     quantizer.RecomputeFromGlobalScale();
   }
 
@@ -3167,7 +3176,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
           memory_manager, cparams, frame_header, frame_dim, enable_rdo,
           initial_quant_field, enc_state->band_qf, &ac_strategy,
-          modular_frame_encoder, &matrices));
+          modular_frame_encoder, &quantizer, &matrices));
       quantizer.RecomputeFromGlobalScale();
       const uint32_t all_acs_64_mask =
           (1u << static_cast<uint32_t>(AcStrategyType::DCT128X128)) - 1u;
@@ -3347,13 +3356,23 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
           memory_manager, cparams, frame_header, frame_dim, enable_rdo,
           initial_quant_field, enc_state->band_qf, &ac_strategy,
-          modular_frame_encoder, &matrices));
+          modular_frame_encoder, &quantizer, &matrices));
       quantizer.RecomputeFromGlobalScale();
     }
     const bool defer_prune =
         use_two_pass_rdo && enc_state->progressive_splitter.GetNumPasses() == 1;
     if (!defer_prune) {
       matrices.PruneUnusedEncodings(used_tables_mask);
+      if (modular_frame_encoder != nullptr) {
+        const auto& encs = matrices.encodings();
+        for (size_t i = 0; i < kNumQuantTables && i < encs.size(); ++i) {
+          if (encs[i].mode != QuantEncoding::kQuantModeRAW) {
+            JXL_ASSIGN_OR_RETURN(ModularStreamId qt,
+                                 ModularStreamId::QuantTable(i));
+            modular_frame_encoder->ClearStreamData(qt);
+          }
+        }
+      }
     }
     if (enable_rdo) {
       const uint32_t ensure_mask =

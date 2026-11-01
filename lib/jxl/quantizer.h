@@ -148,6 +148,12 @@ class Quantizer {
   void ComputeGlobalScaleAndQuant(float quant_dc, float quant_median,
                                   float quant_median_absd);
 
+  void SetQuantDc(int quant_dc) {
+    quant_dc_ = quant_dc;
+    RecomputeFromGlobalScale();
+  }
+  int QuantDc() const { return quant_dc_; }
+
  private:
   float mul_dc_[4];
   float inv_mul_dc_[4];

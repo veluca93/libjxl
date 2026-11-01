@@ -217,6 +217,9 @@ Status DequantMatricesSetCustom(DequantMatrices* matrices,
       JXL_RETURN_IF_ERROR(encoder->AddQuantTable(
           DequantMatrices::required_size_x[i] * kBlockDim,
           DequantMatrices::required_size_y[i] * kBlockDim, encodings[i], i));
+    } else {
+      JXL_ASSIGN_OR_RETURN(ModularStreamId qt, ModularStreamId::QuantTable(i));
+      encoder->ClearStreamData(qt);
     }
   }
   JXL_RETURN_IF_ERROR(DequantMatricesRoundtrip(memory_manager, matrices));

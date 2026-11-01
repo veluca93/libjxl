@@ -1365,12 +1365,16 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
   }
   std::vector<uint32_t> acm_sids;
   std::vector<ModularOptions> orig_acm_opts;
-  for (uint32_t s = acm_start; s < acm_stop && s < stream_images_.size(); ++s) {
+  for (uint32_t s = acm_start; s < stream_images_.size(); ++s) {
     if (!stream_images_[s].empty() &&
         stream_options_[s].tree_kind == ModularOptions::TreeKind::kLearn) {
       acm_sids.push_back(s);
       orig_acm_opts.push_back(stream_options_[s]);
     }
+  }
+  size_t num_acm_only = 0;
+  for (uint32_t s : acm_sids) {
+    if (s < acm_stop) num_acm_only++;
   }
 
   const HistogramParams hp_base =
@@ -1548,10 +1552,10 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
       JXL_RETURN_IF_ERROR(test_current_tree(/*include_raw_baseline=*/false));
     }
 
-    // Test decoupling VarDCTDC (Global Tree) from ACMetadata (local per-stream
-    // tree + histograms with independent LZ77 / HybridUint / log_alpha_size).
+    // Test decoupling VarDCTDC (Global Tree) from ACMetadata / QuantTable
+    // (local per-stream tree + histograms with independent LZ77 / HybridUint).
     bool only_dc_and_acm = !large_frame && !dc_sids.empty() &&
-                           acm_sids.size() == 1;
+                           num_acm_only == 1;
     if (only_dc_and_acm) {
       for (uint32_t s = 0; s < stream_images_.size(); ++s) {
         if (stream_images_[s].channel.empty()) continue;
@@ -1649,8 +1653,8 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
         std::vector<LocalStreamData> cand_locals(stream_images_.size());
         size_t sum_acm_bits = 0;
         bool acm_ok = true;
-        static constexpr float kAcmThresholds[4] = {44.0f, 72.0f, 120.0f,
-                                                    185.0f};
+        static constexpr float kAcmThresholds[5] = {44.0f, 72.0f, 120.0f,
+                                                    185.0f, 1024.0f};
         const size_t num_acm_thr = large_frame ? 2 : 4;
         const size_t acm_h_end = large_frame ? 4 : 8;
         for (uint32_t s_acm : acm_sids) {
@@ -1665,7 +1669,8 @@ Status ModularFrameEncoder::OptimizeVarDCTModularEncoding(ThreadPool* pool) {
 
           size_t best_s_bits = std::numeric_limits<size_t>::max();
           LocalStreamData best_ls;
-          for (size_t ai = 0; ai < num_acm_thr; ++ai) {
+          const size_t cur_num_thr = (s_acm >= acm_stop) ? 5 : num_acm_thr;
+          for (size_t ai = 0; ai < cur_num_thr; ++ai) {
             stream_options_[s_acm].splitting_heuristics_node_threshold =
                 kAcmThresholds[ai];
             JXL_ASSIGN_OR_RETURN(
@@ -1883,6 +1888,7 @@ Status ModularFrameEncoder::EncodeStream(BitWriter* writer, AuxOut* aux_out,
 
 void ModularFrameEncoder::ClearStreamData(const ModularStreamId& stream) {
   size_t stream_id = stream.ID(frame_dim_);
+  if (stream_id >= stream_images_.size()) return;
   Image empty_image(stream_images_[stream_id].memory_manager());
   std::swap(stream_images_[stream_id], empty_image);
 }
@@ -2803,6 +2809,9 @@ Status ModularFrameEncoder::EncodeQuantTable(
     }
   }
   ModularOptions cfopts;
+  cfopts.wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+  cfopts.predictor = Predictor::Variable;
+  cfopts.polish_leaves = true;
   JXL_RETURN_IF_ERROR(ModularGenericCompress(image, cfopts, *writer));
   return true;
 }
@@ -2828,6 +2837,11 @@ Status ModularFrameEncoder::AddQuantTable(size_t size_x, size_t size_y,
       }
     }
   }
+  stream_options_[stream_id].wp_tree_mode = ModularOptions::TreeMode::kNoWP;
+  stream_options_[stream_id].predictor =
+      (cparams_.decoding_speed_tier < 3) ? Predictor::Variable
+                                         : Predictor::Gradient;
+  stream_options_[stream_id].polish_leaves = true;
   return true;
 }
 }  // namespace jxl

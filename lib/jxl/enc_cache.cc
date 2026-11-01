@@ -763,6 +763,16 @@ Status InitializePassesEncoder(FrameHeader& frame_header,
         }
       }
       shared.matrices.PruneUnusedEncodings(final_used_tables_mask);
+      if (modular_frame_encoder != nullptr) {
+        const auto& encs = shared.matrices.encodings();
+        for (size_t i = 0; i < kNumQuantTables && i < encs.size(); ++i) {
+          if (encs[i].mode != QuantEncoding::kQuantModeRAW) {
+            JXL_ASSIGN_OR_RETURN(ModularStreamId qt,
+                                 ModularStreamId::QuantTable(i));
+            modular_frame_encoder->ClearStreamData(qt);
+          }
+        }
+      }
     }
     const auto process_final_ac = [&](size_t group_idx, size_t _) -> Status {
       return ComputeCoefficients(group_idx, enc_state, opsin, rect,
