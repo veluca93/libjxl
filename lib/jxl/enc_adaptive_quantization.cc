@@ -232,7 +232,6 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
   }
   const float mul = scale * dampen;
   const float add = (1.0f - dampen) * base_level;
-  const float q_base = 0.72f * mul + add;
   const size_t xsize = rect_in.xsize();
   const size_t ysize = rect_in.ysize();
 
@@ -242,9 +241,7 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
     const HWY_CAPPED(float, kBlockDim) df;
     for (size_t ix = rect_out.x0(); ix < rect_out.x1(); ix++) {
       const size_t x = ix * 8;
-      row_out[ix] = q_base;
-
-      if (band_qf != nullptr) {
+      {
         auto gamma_val =
             GammaModulation(df, x, y, xyb_x, xyb_y, rect_in, Set(df, 0.0f));
         auto blue_val =
@@ -426,58 +423,70 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
             dist_w * (edge_boost_q + chroma_boost - uniform_tex_mask);
         const float q_psych =
             FastPow2f(psych_log_q * 1.442695041f) * mul + add;
+        row_out[ix] = q_psych;
 
-        for (size_t c = 0; c < 3; ++c) {
-          const float eps = 0.001f;
-          const float e_avg =
-              0.30f * E[c][0] + 0.30f * E[c][1] + 0.25f * E[c][2] +
-              0.15f * E[c][3] + eps;
-          const float c_boost =
-              (c == 0)   ? Clamp1(0.98f + 0.16f * chroma_x_ratio, 0.94f, 1.28f)
-              : (c == 2) ? Clamp1(0.98f + 0.14f * chroma_b_ratio + 0.35f * blue_boost,
-                                  0.94f, 1.28f)
-                         : 1.0f;
-          // Localized edge indicator: when E[c][0] >> E0_harm[c], the block has
-          // an isolated edge next to a smooth area; protect HF/MF precision.
-          const float edge_loc =
-              Clamp1(E[c][0] / (E0_harm[c] + 1e-4f), 1.0f, 2.5f);
-          const float edge_boost = 1.0f + 0.08f * std::max(0.0f, edge_loc - 1.20f);
-          const bool use_chroma_csf = (c != 1) && !has_noise;
-          const float c_tex_harm =
-              use_chroma_csf ? (0.75f * E0_harm[c] + 0.25f * E0_harm[1])
-                             : E0_harm[1];
-          const float tex_thresh = use_chroma_csf ? 0.012f : 0.014f;
-          const float tex_excess = std::max(0.0f, c_tex_harm - tex_thresh);
-          for (size_t s = 0; s < 4; ++s) {
-            const float rel = (E[c][s] + eps) / e_avg;
-            float phi = Clamp1(0.95f + 0.07f * rel, 0.92f, 1.22f) * c_boost;
-            if (s == 0) {
-              const float hf_mask =
-                  1.0f / (1.0f + 0.32328653f * (tex_excess / tex_thresh) /
-                                     (edge_loc * edge_loc));
-              const float c_s0_csf =
-                  use_chroma_csf
-                      ? (0.94f + 0.06f * Clamp1(edge_loc - 1.25f, 0.0f, 1.0f))
-                      : 1.0f;
-              phi *= hf_mask * edge_boost * c_s0_csf;
-            } else if (s == 1) {
-              const float hf_mask =
-                  1.0f / (1.0f + 0.15f * (tex_excess / tex_thresh) / edge_loc);
-              const float c_s1_csf =
-                  use_chroma_csf
-                      ? (1.01f + 0.04f * Clamp1(edge_loc - 1.20f, 0.0f, 1.0f))
-                      : 1.02f;
-              phi *= hf_mask * c_s1_csf;
-            } else if (s == 2) {
-              phi *= use_chroma_csf ? 1.05f : 1.02f;
-            } else {
-              // Coarse scale (s = 3, 1:8 LF) cascades across all pyramid levels.
-              phi *= use_chroma_csf ? 1.09f : 1.06f;
+        if (band_qf != nullptr) {
+          for (size_t c = 0; c < 3; ++c) {
+            const float eps = 0.001f;
+            const float e_avg =
+                0.30f * E[c][0] + 0.30f * E[c][1] + 0.25f * E[c][2] +
+                0.15f * E[c][3] + eps;
+            const float c_boost =
+                (c == 0)   ? Clamp1(0.98f + 0.16f * chroma_x_ratio, 0.94f, 1.28f)
+                : (c == 2) ? Clamp1(0.98f + 0.14f * chroma_b_ratio +
+                                        0.35f * blue_boost,
+                                    0.94f, 1.28f)
+                           : 1.0f;
+            // Localized edge indicator: when E[c][0] >> E0_harm[c], the block
+            // has an isolated edge next to a smooth area; protect HF/MF
+            // precision.
+            const float edge_loc =
+                Clamp1(E[c][0] / (E0_harm[c] + 1e-4f), 1.0f, 2.5f);
+            const float edge_boost =
+                1.0f + 0.08f * std::max(0.0f, edge_loc - 1.20f);
+            const bool use_chroma_csf = (c != 1) && !has_noise;
+            const float c_tex_harm =
+                use_chroma_csf ? (0.75f * E0_harm[c] + 0.25f * E0_harm[1])
+                               : E0_harm[1];
+            const float tex_thresh = use_chroma_csf ? 0.012f : 0.014f;
+            const float tex_excess = std::max(0.0f, c_tex_harm - tex_thresh);
+            for (size_t s = 0; s < 4; ++s) {
+              const float rel = (E[c][s] + eps) / e_avg;
+              float phi = Clamp1(0.95f + 0.07f * rel, 0.92f, 1.22f) * c_boost;
+              if (s == 0) {
+                const float hf_mask =
+                    1.0f / (1.0f + 0.32328653f * (tex_excess / tex_thresh) /
+                                       (edge_loc * edge_loc));
+                const float c_s0_csf =
+                    use_chroma_csf
+                        ? (0.94f + 0.06f * Clamp1(edge_loc - 1.25f, 0.0f, 1.0f))
+                        : 1.0f;
+                phi *= hf_mask * edge_boost * c_s0_csf;
+              } else if (s == 1) {
+                const float hf_mask =
+                    1.0f /
+                    (1.0f + 0.15f * (tex_excess / tex_thresh) / edge_loc);
+                const float c_s1_csf =
+                    use_chroma_csf
+                        ? (1.01f + 0.04f * Clamp1(edge_loc - 1.20f, 0.0f, 1.0f))
+                        : 1.02f;
+                phi *= hf_mask * c_s1_csf;
+              } else if (s == 2) {
+                phi *= use_chroma_csf ? 1.05f : 1.02f;
+              } else {
+                // Coarse scale (s = 3, 1:8 LF) cascades across all pyramid
+                // levels.
+                phi *= use_chroma_csf ? 1.09f : 1.06f;
+              }
+              const float mod_phi =
+                  1.0f + band_dist_w * (Clamp1(phi, 0.72f, 1.32f) - 1.0f);
+              band_qf[c][s].Row(iy)[ix] = q_psych * mod_phi;
             }
-            const float mod_phi =
-                1.0f + band_dist_w * (Clamp1(phi, 0.72f, 1.32f) - 1.0f);
-            band_qf[c][s].Row(iy)[ix] = q_psych * mod_phi;
           }
+          row_out[ix] = 0.30f * band_qf[1][0].Row(iy)[ix] +
+                        0.30f * band_qf[1][1].Row(iy)[ix] +
+                        0.25f * band_qf[1][2].Row(iy)[ix] +
+                        0.15f * band_qf[1][3].Row(iy)[ix];
         }
       }
     }
@@ -626,21 +635,29 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, num_tiles, ThreadPool::NoInit,
                                 process_tile, "AQ DiffPrecompute"));
 
-  if (band_qf != nullptr && xsize_blocks * ysize_blocks > 64) {
+  if (xsize_blocks * ysize_blocks > 64) {
     const float aq_damp =
         0.24454184f +
         0.34668192f * Clamp1((butteraugli_target - 0.50f) / 2.00f, 0.0f, 1.0f);
     if (aq_damp > 1e-4f) {
       double sum_log_q = 0.0;
       for (size_t by = 0; by < ysize_blocks; ++by) {
-        const float* JXL_RESTRICT b0 = band_qf[1][0].ConstRow(by);
-        const float* JXL_RESTRICT b1 = band_qf[1][1].ConstRow(by);
-        const float* JXL_RESTRICT b2 = band_qf[1][2].ConstRow(by);
-        const float* JXL_RESTRICT b3 = band_qf[1][3].ConstRow(by);
+        const float* JXL_RESTRICT aq_row = impl.aq_map.ConstRow(by);
+        const float* JXL_RESTRICT b0 =
+            (band_qf != nullptr) ? band_qf[1][0].ConstRow(by) : nullptr;
+        const float* JXL_RESTRICT b1 =
+            (band_qf != nullptr) ? band_qf[1][1].ConstRow(by) : nullptr;
+        const float* JXL_RESTRICT b2 =
+            (band_qf != nullptr) ? band_qf[1][2].ConstRow(by) : nullptr;
+        const float* JXL_RESTRICT b3 =
+            (band_qf != nullptr) ? band_qf[1][3].ConstRow(by) : nullptr;
         for (size_t bx = 0; bx < xsize_blocks; ++bx) {
           const float q_y = std::max(
               1e-4f,
-              0.30f * b0[bx] + 0.30f * b1[bx] + 0.25f * b2[bx] + 0.15f * b3[bx]);
+              (band_qf != nullptr)
+                  ? (0.30f * b0[bx] + 0.30f * b1[bx] + 0.25f * b2[bx] +
+                     0.15f * b3[bx])
+                  : aq_row[bx]);
           sum_log_q += std::log(static_cast<double>(q_y));
         }
       }
@@ -649,24 +666,37 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
               sum_log_q / static_cast<double>(xsize_blocks * ysize_blocks))) *
           (1.0f - 0.075f * aq_damp);
       for (size_t by = 0; by < ysize_blocks; ++by) {
-        const float* JXL_RESTRICT b0 = band_qf[1][0].ConstRow(by);
-        const float* JXL_RESTRICT b1 = band_qf[1][1].ConstRow(by);
-        const float* JXL_RESTRICT b2 = band_qf[1][2].ConstRow(by);
-        const float* JXL_RESTRICT b3 = band_qf[1][3].ConstRow(by);
-        float* JXL_RESTRICT rows[3][4];
-        for (size_t c = 0; c < 3; ++c) {
-          for (size_t s = 0; s < 4; ++s) {
-            rows[c][s] = band_qf[c][s].Row(by);
+        float* JXL_RESTRICT aq_row = impl.aq_map.Row(by);
+        const float* JXL_RESTRICT b0 =
+            (band_qf != nullptr) ? band_qf[1][0].ConstRow(by) : nullptr;
+        const float* JXL_RESTRICT b1 =
+            (band_qf != nullptr) ? band_qf[1][1].ConstRow(by) : nullptr;
+        const float* JXL_RESTRICT b2 =
+            (band_qf != nullptr) ? band_qf[1][2].ConstRow(by) : nullptr;
+        const float* JXL_RESTRICT b3 =
+            (band_qf != nullptr) ? band_qf[1][3].ConstRow(by) : nullptr;
+        float* JXL_RESTRICT rows[3][4] = {};
+        if (band_qf != nullptr) {
+          for (size_t c = 0; c < 3; ++c) {
+            for (size_t s = 0; s < 4; ++s) {
+              rows[c][s] = band_qf[c][s].Row(by);
+            }
           }
         }
         for (size_t bx = 0; bx < xsize_blocks; ++bx) {
           const float q_y = std::max(
               1e-4f,
-              0.30f * b0[bx] + 0.30f * b1[bx] + 0.25f * b2[bx] + 0.15f * b3[bx]);
+              (band_qf != nullptr)
+                  ? (0.30f * b0[bx] + 0.30f * b1[bx] + 0.25f * b2[bx] +
+                     0.15f * b3[bx])
+                  : aq_row[bx]);
           const float scale_blk = std::pow(q_geom / q_y, aq_damp);
-          for (size_t c = 0; c < 3; ++c) {
-            for (size_t s = 0; s < 4; ++s) {
-              rows[c][s][bx] *= scale_blk;
+          aq_row[bx] = q_y * scale_blk;
+          if (band_qf != nullptr) {
+            for (size_t c = 0; c < 3; ++c) {
+              for (size_t s = 0; s < 4; ++s) {
+                rows[c][s][bx] *= scale_blk;
+              }
             }
           }
         }
@@ -1081,6 +1111,34 @@ Status FindBestQuantization(const FrameHeader& frame_header,
       }
     }
   }
+  if (enc_state->band_qf[0][0].xsize() == quant_field.xsize() &&
+      enc_state->band_qf[0][0].ysize() == quant_field.ysize()) {
+    for (size_t y = 0; y < quant_field.ysize(); ++y) {
+      const float* JXL_RESTRICT row_q = quant_field.ConstRow(y);
+      const float* JXL_RESTRICT row_init = initial_quant_field.ConstRow(y);
+      for (size_t x = 0; x < quant_field.xsize(); ++x) {
+        const float ratio = row_q[x] / std::max(1e-4f, row_init[x]);
+        uint32_t orig_act = 0;
+        memcpy(&orig_act, &enc_state->band_qf[1][0].ConstRow(y)[x],
+               sizeof(orig_act));
+        orig_act &= 31u;
+        for (size_t c = 0; c < 3; ++c) {
+          for (size_t s = 0; s < 4; ++s) {
+            if (enc_state->band_qf[c][s].xsize() > x &&
+                enc_state->band_qf[c][s].ysize() > y) {
+              enc_state->band_qf[c][s].Row(y)[x] *= ratio;
+            }
+          }
+        }
+        uint32_t new_bits = 0;
+        memcpy(&new_bits, &enc_state->band_qf[1][0].ConstRow(y)[x],
+               sizeof(new_bits));
+        new_bits = (new_bits & ~31u) | orig_act;
+        memcpy(&enc_state->band_qf[1][0].Row(y)[x], &new_bits,
+               sizeof(new_bits));
+      }
+    }
+  }
   JXL_RETURN_IF_ERROR(
       quantizer.SetQuantField(initial_quant_dc, quant_field, &raw_quant_field));
   return true;
@@ -1095,6 +1153,11 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
   const CompressParams& cparams = enc_state->cparams;
   Quantizer& quantizer = enc_state->shared.quantizer;
   ImageI& raw_quant_field = enc_state->shared.raw_quant_field;
+  JxlMemoryManager* memory_manager = opsin.memory_manager();
+  JXL_ASSIGN_OR_RETURN(
+      ImageF initial_quant_field,
+      ImageF::Create(memory_manager, quant_field.xsize(), quant_field.ysize()));
+  JXL_RETURN_IF_ERROR(CopyImageTo(quant_field, &initial_quant_field));
 
   // TODO(veluca): better choice of this value.
   const float initial_quant_dc =
@@ -1157,6 +1220,34 @@ Status FindBestQuantizationMaxError(const FrameHeader& frame_header,
       }
     }
   }
+  if (enc_state->band_qf[0][0].xsize() == quant_field.xsize() &&
+      enc_state->band_qf[0][0].ysize() == quant_field.ysize()) {
+    for (size_t y = 0; y < quant_field.ysize(); ++y) {
+      const float* JXL_RESTRICT row_q = quant_field.ConstRow(y);
+      const float* JXL_RESTRICT row_init = initial_quant_field.ConstRow(y);
+      for (size_t x = 0; x < quant_field.xsize(); ++x) {
+        const float ratio = row_q[x] / std::max(1e-4f, row_init[x]);
+        uint32_t orig_act = 0;
+        memcpy(&orig_act, &enc_state->band_qf[1][0].ConstRow(y)[x],
+               sizeof(orig_act));
+        orig_act &= 31u;
+        for (size_t c = 0; c < 3; ++c) {
+          for (size_t s = 0; s < 4; ++s) {
+            if (enc_state->band_qf[c][s].xsize() > x &&
+                enc_state->band_qf[c][s].ysize() > y) {
+              enc_state->band_qf[c][s].Row(y)[x] *= ratio;
+            }
+          }
+        }
+        uint32_t new_bits = 0;
+        memcpy(&new_bits, &enc_state->band_qf[1][0].ConstRow(y)[x],
+               sizeof(new_bits));
+        new_bits = (new_bits & ~31u) | orig_act;
+        memcpy(&enc_state->band_qf[1][0].Row(y)[x], &new_bits,
+               sizeof(new_bits));
+      }
+    }
+  }
   JXL_RETURN_IF_ERROR(
       quantizer.SetQuantField(initial_quant_dc, quant_field, &raw_quant_field));
   return true;
@@ -1182,11 +1273,26 @@ StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
                                    ImageF* mask1x1, ImageF (*band_qf)[4],
-                                   bool has_noise) {
+                                   bool has_noise, float* out_base_quant) {
   const float quant_ac = kAcQuant / std::max(1e-4f, butteraugli_target);
+  const float scale = quant_ac * rescale;
+  if (out_base_quant != nullptr) {
+    const float base_level = 0.4810937f * scale;
+    const float kDampenRampStart = 2.0f;
+    const float kDampenRampEnd = 14.0f;
+    float dampen = 1.0f;
+    if (butteraugli_target >= kDampenRampStart) {
+      dampen = 1.0f - ((butteraugli_target - kDampenRampStart) /
+                       (kDampenRampEnd - kDampenRampStart));
+      if (dampen < 0) dampen = 0;
+    }
+    const float mul = scale * dampen;
+    const float add = (1.0f - dampen) * base_level;
+    *out_base_quant = 0.72f * mul + add;
+  }
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
-      butteraugli_target, opsin, rect, quant_ac * rescale, pool, mask1x1,
-      band_qf, has_noise);
+      butteraugli_target, opsin, rect, scale, pool, mask1x1, band_qf,
+      has_noise);
 }
 
 Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,

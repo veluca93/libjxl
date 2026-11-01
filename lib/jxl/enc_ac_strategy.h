@@ -93,7 +93,7 @@ struct AcStrategyHeuristics {
               const ImageF& mask1x1, DequantMatrices* matrices,
               ImageF (*band_qf)[4] = nullptr, float x_qm_multiplier = 1.0f,
               float b_qm_multiplier = 1.0f, float quant_scale = 0.0f,
-              float inv_global_scale = 0.0f);
+              float inv_global_scale = 0.0f, float base_quant_override = 0.0f);
   Status PrepareForThreads(std::size_t num_threads);
   Status ProcessRect(const Rect& rect, const ColorCorrelationMap& cmap,
                      AcStrategyImage* ac_strategy, size_t thread);

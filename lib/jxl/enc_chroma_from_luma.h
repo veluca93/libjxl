@@ -37,8 +37,8 @@ Status ColorCorrelationEncodeDC(const ColorCorrelation& color_correlation,
 void OptimizeColorCorrelationParams(
     const Image3F& opsin, const Rect& opsin_rect,
     const FrameDimensions& frame_dim, const DequantMatrices& dequant,
-    const Quantizer& quantizer, const ImageF& initial_quant_field,
-    float x_qm_multiplier, float b_qm_multiplier, float butteraugli_distance,
+    const Quantizer& quantizer, float base_quant, float x_qm_multiplier,
+    float b_qm_multiplier, float butteraugli_distance,
     ColorCorrelationMap* cmap);
 
 struct CfLHeuristics {

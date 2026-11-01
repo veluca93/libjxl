@@ -1945,7 +1945,8 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
                                   DequantMatrices* matrices,
                                   ImageF (*band_qf)[4], float x_qm_multiplier,
                                   float b_qm_multiplier, float quant_scale,
-                                  float inv_global_scale) {
+                                  float inv_global_scale,
+                                  float base_quant_override) {
   config.dequant = matrices;
   config.token_cost_model = nullptr;
   config.quant_scale = quant_scale;
@@ -1968,9 +1969,11 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
   config.quant_field_row = quant_field->Row(0);
   config.quant_field_stride = quant_field->PixelsPerRow();
   config.base_quant =
-      (quant_field->xsize() > 0 && quant_field->ysize() > 0)
-          ? quant_field->ConstRow(0)[0]
-          : 1.0f;
+      (base_quant_override > 0.0f)
+          ? base_quant_override
+          : ((quant_field->xsize() > 0 && quant_field->ysize() > 0)
+                 ? quant_field->ConstRow(0)[0]
+                 : 1.0f);
   config.mask1x1_xsize = mask1x1.xsize();
   if (mask1x1.xsize() > 0 && mask1x1.ysize() > 0) {
     config.masking1x1_field_row = mask1x1.Row(0);

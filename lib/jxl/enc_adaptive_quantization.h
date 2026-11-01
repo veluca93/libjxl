@@ -240,7 +240,8 @@ StatusOr<ImageF> InitialQuantField(float butteraugli_target,
                                    ThreadPool* pool, float rescale,
                                    ImageF* initial_quant_mask1x1,
                                    ImageF (*band_qf)[4] = nullptr,
-                                   bool has_noise = false);
+                                   bool has_noise = false,
+                                   float* out_base_quant = nullptr);
 
 float InitialQuantDC(float butteraugli_target);
 

@@ -2917,12 +2917,14 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   // Call InitialQuantField only in Hare mode or slower. Otherwise, rely
   // on simple heuristics in FindBestAcStrategy, or set a constant for Falcon
   // mode.
+  float initial_base_quant = 0.0f;
   if (cparams.speed_tier > SpeedTier::kHare ||
       cparams.disable_perceptual_optimizations) {
     JXL_ASSIGN_OR_RETURN(initial_quant_field,
                          ImageF::Create(memory_manager, frame_dim.xsize_blocks,
                                         frame_dim.ysize_blocks));
     float q = 0.79 / cparams.butteraugli_distance;
+    initial_base_quant = q;
     FillImage(q, &initial_quant_field);
     if (cparams.disable_perceptual_optimizations) {
       float masking = 1.0f / (q + 0.001f);
@@ -2949,7 +2951,8 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
                           1.0f, &initial_quant_masking1x1,
                           enable_rdo ? enc_state->band_qf : nullptr,
-                          (frame_header.flags & FrameHeader::kNoise) != 0));
+                          (frame_header.flags & FrameHeader::kNoise) != 0,
+                          &initial_base_quant));
     float q = 0.39 / cparams.butteraugli_distance;
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   }
@@ -3005,7 +3008,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
           ? enc_state->band_qf
           : nullptr,
       enc_state->x_qm_multiplier, enc_state->b_qm_multiplier, quantizer.Scale(),
-      quantizer.InvGlobalScale()));
+      quantizer.InvGlobalScale(), initial_base_quant));
 
   if (initialize_global_state && !streaming_mode && enable_rdo &&
       cparams.speed_tier <= SpeedTier::kSquirrel &&
@@ -3013,7 +3016,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       cparams.noise != Override::kOn) {
     JXL_RETURN_IF_ERROR(matrices.EnsureComputed(memory_manager, 1));
     OptimizeColorCorrelationParams(
-        *opsin, rect, frame_dim, matrices, quantizer, initial_quant_field,
+        *opsin, rect, frame_dim, matrices, quantizer,
+        (initial_base_quant > 0.0f) ? initial_base_quant
+                                    : initial_quant_field.ConstRow(0)[0],
         enc_state->x_qm_multiplier, enc_state->b_qm_multiplier,
         cparams.butteraugli_distance, &cmap);
   }
@@ -3083,8 +3088,20 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
 
     if (cparams.speed_tier <= SpeedTier::kSquirrel) {
       if (enable_rdo) {
-        quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
-                                    &raw_quant_field);
+        if (initial_base_quant > 0.0f) {
+          const int32_t rqf_base = Clamp1<int32_t>(
+              std::lround(initial_base_quant * quantizer.InvGlobalScale()), 1,
+              Quantizer::kQuantMax);
+          for (size_t by = gby0; by < gby1; ++by) {
+            int32_t* JXL_RESTRICT rqf_r = raw_quant_field.Row(by);
+            for (size_t bx = gbx0; bx < gbx1; ++bx) {
+              rqf_r[bx] = rqf_base;
+            }
+          }
+        } else {
+          quantizer.SetQuantFieldRect(initial_quant_field, group_rect,
+                                      &raw_quant_field);
+        }
       }
       for (size_t by0 = gby0; by0 < gby1; by0 += kEncTileDimInBlocks) {
         const size_t by1 = std::min(by0 + kEncTileDimInBlocks, gby1);
@@ -3353,7 +3370,9 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   enc_state->token_cost_model = std::move(token_cost_model);
 
   // Choose a context model that depends on the amount of quantization for AC.
-  if (cparams.speed_tier < SpeedTier::kFalcon && initialize_global_state) {
+  if (cparams.speed_tier < SpeedTier::kFalcon && initialize_global_state &&
+      (enc_state->token_cost_model == nullptr ||
+       frame_dim.xsize_blocks * frame_dim.ysize_blocks < 64)) {
     FindBestBlockEntropyModel(cparams, raw_quant_field, ac_strategy,
                               &block_ctx_map);
   }

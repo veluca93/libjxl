@@ -664,8 +664,8 @@ HWY_EXPORT(ComputeTile);
 void OptimizeColorCorrelationParams(
     const Image3F& opsin, const Rect& opsin_rect,
     const FrameDimensions& frame_dim, const DequantMatrices& dequant,
-    const Quantizer& quantizer, const ImageF& initial_quant_field,
-    float x_qm_multiplier, float b_qm_multiplier, float butteraugli_distance,
+    const Quantizer& quantizer, float base_quant, float x_qm_multiplier,
+    float b_qm_multiplier, float butteraugli_distance,
     ColorCorrelationMap* cmap) {
   const size_t xblocks = frame_dim.xsize_blocks;
   const size_t yblocks = frame_dim.ysize_blocks;
@@ -696,7 +696,6 @@ void OptimizeColorCorrelationParams(
   std::vector<double> tile_yy(num_tiles, 0.0);
   std::vector<double> tile_yx(num_tiles, 0.0);
   std::vector<double> tile_yb(num_tiles, 0.0);
-  std::vector<double> tile_qy(num_tiles, 0.0);
   std::vector<size_t> tile_blks(num_tiles, 0);
 
   std::vector<float> dc_x(xblocks * yblocks, 0.0f);
@@ -711,7 +710,6 @@ void OptimizeColorCorrelationParams(
         opsin_rect.ConstPlaneRow(opsin, 1, by * kBlockDim);
     const float* JXL_RESTRICT row_b0 =
         opsin_rect.ConstPlaneRow(opsin, 2, by * kBlockDim);
-    const float* JXL_RESTRICT qf_row = initial_quant_field.ConstRow(by);
     const size_t ty = by / kColorTileDimInBlocks;
     for (size_t bx = 0; bx < xblocks; ++bx) {
       double sx = 0.0;
@@ -754,7 +752,6 @@ void OptimizeColorCorrelationParams(
       tile_yy[ti] += vyy * (1.0 / 64.0);
       tile_yx[ti] += vyx * (1.0 / 64.0);
       tile_yb[ti] += vyb * (1.0 / 64.0);
-      tile_qy[ti] += qf_row[bx];
       tile_blks[ti] += 1;
     }
   }
@@ -824,11 +821,11 @@ void OptimizeColorCorrelationParams(
   const double rd_mul_x = (0.30 * chroma_w) / kLambda;
   const double rd_mul_b = (0.28 * chroma_w) / kLambda;
 
+  const double q_y = std::max<double>(1e-4, base_quant);
+  const double q_x = q_y * x_qm_multiplier * qm_x_avg;
+  const double q_b = q_y * b_qm_multiplier * qm_b_avg;
   for (size_t ti = 0; ti < num_tiles; ++ti) {
     if (tile_blks[ti] == 0) continue;
-    const double q_y = tile_qy[ti] / static_cast<double>(tile_blks[ti]);
-    const double q_x = q_y * x_qm_multiplier * qm_x_avg;
-    const double q_b = q_y * b_qm_multiplier * qm_b_avg;
     const double wx = tile_yy[ti] * q_x * q_x * rd_mul_x;
     const double wb = tile_yy[ti] * q_b * q_b * rd_mul_b;
     tile_wx[ti] = wx;
