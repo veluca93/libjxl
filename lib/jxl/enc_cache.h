@@ -137,10 +137,8 @@ struct PassesEncoderState {
   float x_qm_multiplier = 1.0f;
   float b_qm_multiplier = 1.0f;
 
-  ImageF initial_quant_masking1x1;
-
   // Non-owning pointer to pre-Gaborish opsin (at unpadded frame dimensions)
-  // used during ComputeCoefficients for BlockHasFewColors detection.
+  // valid across LossyFrameHeuristics and InitializePassesEncoder.
   const Image3F* orig_opsin = nullptr;
 
   // Per-channel (X, Y, B), per-scale band (s = 0: 1:1, 1: 1:2, 2: 1:4, 3: 1:8)

@@ -1091,12 +1091,16 @@ Status ComputeVarDCTEncodingData(FrameHeader& frame_header,
   JXL_RETURN_IF_ERROR(orig_opsin.ShrinkTo(enc_state->shared.frame_dim.xsize,
                                           enc_state->shared.frame_dim.ysize));
 
-  JXL_RETURN_IF_ERROR(LossyFrameHeuristics(frame_header, enc_state, enc_modular,
-                                           linear, opsin, rect, cms, pool,
-                                           aux_out));
+  enc_state->orig_opsin = &orig_opsin;
+  Status heur_status = LossyFrameHeuristics(
+      frame_header, enc_state, enc_modular, linear, opsin, rect, cms, pool,
+      aux_out);
+  if (!heur_status) {
+    enc_state->orig_opsin = nullptr;
+    return heur_status;
+  }
 
   enc_state->epf_optimized_in_rdo = false;
-  enc_state->orig_opsin = &orig_opsin;
   Status init_status = InitializePassesEncoder(
       frame_header, *opsin, rect, cms, pool, enc_state, enc_modular, aux_out);
   enc_state->orig_opsin = nullptr;

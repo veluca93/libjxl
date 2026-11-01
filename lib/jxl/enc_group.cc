@@ -6465,18 +6465,33 @@ class WdProxyIncrementalArbiter {
   std::vector<float> sc_hp_t_;
 };
 
-float ComputeLocalBlockEpfError(const Image3F& a, const Image3F& b,
-                                const ImageF& mask1x1, size_t by, size_t bx,
-                                float asym_edge_deficit_w,
+float ComputeLocalBlockEpfError(const Image3F& a, const Image3F& b, size_t by,
+                                size_t bx, float asym_edge_deficit_w,
                                 float* JXL_RESTRICT out_bdry_err,
                                 float* JXL_RESTRICT out_grad_a,
-                                float* JXL_RESTRICT out_grad_b) {
+                                float* JXL_RESTRICT out_grad_b,
+                                const float* JXL_RESTRICT precomp_mask =
+                                    nullptr,
+                                size_t precomp_mask_stride = 0) {
   const Rect rect(bx * kBlockDim, by * kBlockDim, kBlockDim, kBlockDim,
                   a.xsize(), a.ysize());
   const size_t xsize = rect.xsize();
   const size_t ysize = rect.ysize();
   const size_t x0 = rect.x0();
   const size_t y0 = rect.y0();
+  float raw_scratch[12 * 12];
+  float block_mask[8 * 8];
+  if (precomp_mask == nullptr) {
+    const float* const a_rows[3] = {
+        a.xsize() > 0 && a.ysize() > 0 ? a.ConstPlaneRow(0, 0) : nullptr,
+        a.xsize() > 0 && a.ysize() > 0 ? a.ConstPlaneRow(1, 0) : nullptr,
+        a.xsize() > 0 && a.ysize() > 0 ? a.ConstPlaneRow(2, 0) : nullptr,
+    };
+    ComputeOpponentMaskRect(a_rows, a.PixelsPerRow(), a.xsize(), a.ysize(), x0,
+                            y0, xsize, ysize, 1.0f, raw_scratch, block_mask, 8);
+    precomp_mask = block_mask;
+    precomp_mask_stride = 8;
+  }
   const bool has_left = (out_bdry_err != nullptr) && (x0 > 0);
   const bool has_right = (out_bdry_err != nullptr) && (x0 + xsize < a.xsize());
   const bool has_top = (out_bdry_err != nullptr) && (y0 > 0);
@@ -6531,7 +6546,7 @@ float ComputeLocalBlockEpfError(const Image3F& a, const Image3F& b,
         (y == 0 && has_top) ? b.ConstPlaneRow(1, y0 - 1) + x0 : nullptr,
         (y == 0 && has_top) ? b.ConstPlaneRow(2, y0 - 1) + x0 : nullptr,
     };
-    const float* row_mask = rect.ConstRow(mask1x1, y);
+    const float* row_mask = precomp_mask + y * precomp_mask_stride;
     for (size_t x = 0; x < xsize; ++x) {
       const float mask = row_mask[x];
       const float mask2 = mask * mask;
@@ -6892,6 +6907,8 @@ struct GroupAcsDpWorkspace {
   float blk_bq[32][32][3][4] = {};
   float w_4m[32][32] = {};
   float cur_blk_dist[32][32] = {};
+  float mask_raw[260 * 260];
+  float mask_tile[256 * 256];
   float cur_blk_grad[32][32] = {};
   uint16_t cur_tr_at[32][32] = {};
   uint8_t dp_cov[32][32] = {};
@@ -7014,6 +7031,17 @@ Status SolveClosedLoopGroupAcsDP(
     }
   }
 
+  const float* const orig_rows_dp[3] = {
+      enc_state->orig_opsin->ConstPlaneRow(0, 0),
+      enc_state->orig_opsin->ConstPlaneRow(1, 0),
+      enc_state->orig_opsin->ConstPlaneRow(2, 0),
+  };
+  ComputeOpponentMaskRect(orig_rows_dp, enc_state->orig_opsin->PixelsPerRow(),
+                          enc_state->orig_opsin->xsize(),
+                          enc_state->orig_opsin->ysize(), cache.gx0 * 8,
+                          cache.gy0 * 8, rx * 8, ry * 8, 1.0f, ws->mask_raw,
+                          ws->mask_tile, 256);
+
   constexpr float epf_bdry_w_f = 0.076615788f;
   ws->grad_samples.clear();
   ws->grad_samples.reserve(rx * ry);
@@ -7028,9 +7056,9 @@ Status SolveClosedLoopGroupAcsDP(
       float bdry_b = 0.0f;
       float grad_a = 0.0f;
       const float eloc = ComputeLocalBlockEpfError(
-          *enc_state->orig_opsin, *fine_pre_gab,
-          enc_state->initial_quant_masking1x1, cache.gy0 + y, cache.gx0 + x,
-          1.20f, &bdry_b, &grad_a, nullptr);
+          *enc_state->orig_opsin, *fine_pre_gab, cache.gy0 + y, cache.gx0 + x,
+          1.20f, &bdry_b, &grad_a, nullptr,
+          &ws->mask_tile[(y * 8) * 256 + x * 8], 256);
       ws->cur_blk_dist[y][x] = w4 * (eloc + epf_bdry_w_f * bdry_b);
       ws->cur_blk_grad[y][x] = grad_a;
       ws->grad_samples.push_back(grad_a);
@@ -7196,9 +7224,9 @@ Status SolveClosedLoopGroupAcsDP(
       for (size_t ix = 0; ix < w; ++ix) {
         float bdry_b = 0.0f;
         const float eloc = ComputeLocalBlockEpfError(
-            *enc_state->orig_opsin, *fine_pre_gab,
-            enc_state->initial_quant_masking1x1, cache.gy0 + y0 + iy,
-            cache.gx0 + x0 + ix, 1.20f, &bdry_b, nullptr, nullptr);
+            *enc_state->orig_opsin, *fine_pre_gab, cache.gy0 + y0 + iy,
+            cache.gx0 + x0 + ix, 1.20f, &bdry_b, nullptr, nullptr,
+            &ws->mask_tile[((y0 + iy) * 8) * 256 + (x0 + ix) * 8], 256);
         dist += ws->w_4m[y0 + iy][x0 + ix] * (eloc + epf_bdry_w_f * bdry_b);
       }
     }
@@ -8214,8 +8242,9 @@ Status RefineQuantFieldClosedLoop(
     if (cparams.butteraugli_distance < kMinButteraugliForDynamicAR ||
         cparams.speed_tier > SpeedTier::kWombat ||
         !cparams.use_full_image_heuristics ||
-        enc_state->initial_quant_masking1x1.xsize() < xsize ||
-        enc_state->initial_quant_masking1x1.ysize() < ysize) {
+        enc_state->orig_opsin == nullptr ||
+        enc_state->orig_opsin->xsize() < xsize ||
+        enc_state->orig_opsin->ysize() < ysize) {
       FillPlane(static_cast<uint8_t>(4), out_sharp, Rect(*out_sharp));
       return true;
     }
@@ -8272,8 +8301,7 @@ Status RefineQuantFieldClosedLoop(
           float grad_a = 0.0f;
           float grad_b = 0.0f;
           float err = ComputeLocalBlockEpfError(
-              *enc_state->orig_opsin, st.post_xyb,
-              enc_state->initial_quant_masking1x1, by, bx, asym_def_w, &bdry_b,
+              *enc_state->orig_opsin, st.post_xyb, by, bx, asym_def_w, &bdry_b,
               &grad_a, &grad_b);
           if (val == 0) {
             bdry0_row[bx] = bdry_b;
@@ -10474,8 +10502,9 @@ Status RefineQuantFieldClosedLoop(
   // cold-start QuantTable multi-component joint verification, per-component
   // 4-metric checkpointed verification, and salient 2x2 / 1x1 rescue.
   size_t acs_moves = 0;
-  if (enc_state->initial_quant_masking1x1.xsize() >= xsize &&
-      enc_state->initial_quant_masking1x1.ysize() >= ysize) {
+  if (enc_state->orig_opsin != nullptr &&
+      enc_state->orig_opsin->xsize() >= xsize &&
+      enc_state->orig_opsin->ysize() >= ysize) {
     size_t quant_table_counts[kNumQuantTables] = {};
     for (size_t g = 0; g < num_groups; ++g) {
       for (const AcTransformCache& tr : group_caches[g].transforms) {
@@ -11243,7 +11272,6 @@ Status RefineQuantFieldClosedLoop(
                       float bdry_b = 0.0f;
                       cur_loc_err += ComputeLocalBlockEpfError(
                           *enc_state->orig_opsin, fine_pre_gab,
-                          enc_state->initial_quant_masking1x1,
                           cache.gy0 + by0 + iy, cache.gx0 + bx0 + ix, 1.20f,
                           &bdry_b, nullptr, nullptr);
                       cur_loc_err += kAcsEpfBdryWD * bdry_b;
@@ -11293,7 +11321,6 @@ Status RefineQuantFieldClosedLoop(
                         float bdry_b = 0.0f;
                         cand_loc_err += ComputeLocalBlockEpfError(
                             *enc_state->orig_opsin, fine_pre_gab,
-                            enc_state->initial_quant_masking1x1,
                             cache.gy0 + by0 + iy, cache.gx0 + bx0 + ix, 1.20f,
                             &bdry_b, nullptr, nullptr);
                         cand_loc_err += kAcsEpfBdryWD * bdry_b;
@@ -11973,8 +12000,9 @@ Status RefineQuantFieldClosedLoop(
       shared.block_ctx_map.num_dc_ctxs <= 1 &&
       shared.dc_storage.xsize() >= xsize_blocks &&
       shared.dc_storage.ysize() >= ysize_blocks &&
-      enc_state->initial_quant_masking1x1.xsize() >= xsize &&
-      enc_state->initial_quant_masking1x1.ysize() >= ysize) {
+      enc_state->orig_opsin != nullptr &&
+      enc_state->orig_opsin->xsize() >= xsize &&
+      enc_state->orig_opsin->ysize() >= ysize) {
     const size_t num_dc_groups = shared.frame_dim.num_dc_groups;
     bool dc_streams_ok = (num_dc_groups > 0) &&
                          (modular_frame_encoder->extra_dc_precision.size() >=
@@ -12905,8 +12933,7 @@ Status RefineQuantFieldClosedLoop(
                 for (size_t ex = b_x0; ex < b_x1; ++ex) {
                   float bdry_b = 0.0f;
                   cur_loc_err += ComputeLocalBlockEpfError(
-                      *enc_state->orig_opsin, fine_pre_gab,
-                      enc_state->initial_quant_masking1x1, ey, ex, 1.20f,
+                      *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f,
                       &bdry_b, nullptr, nullptr);
                   cur_loc_err += kAcsEpfBdryWD * bdry_b;
                 }
@@ -12919,8 +12946,7 @@ Status RefineQuantFieldClosedLoop(
                 for (size_t ex = b_x0; ex < b_x1; ++ex) {
                   float bdry_b = 0.0f;
                   cand_loc_err += ComputeLocalBlockEpfError(
-                      *enc_state->orig_opsin, fine_pre_gab,
-                      enc_state->initial_quant_masking1x1, ey, ex, 1.20f,
+                      *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f,
                       &bdry_b, nullptr, nullptr);
                   cand_loc_err += kAcsEpfBdryWD * bdry_b;
                 }

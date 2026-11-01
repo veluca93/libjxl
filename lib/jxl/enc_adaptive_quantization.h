@@ -230,6 +230,15 @@ static JXL_INLINE void ComputeBlockThresholds(
   }
 }
 
+// Computes a 3-channel opponent-aware (X, Y, B-Y) local contrast masking tile
+// over [px0, px0 + pw) x [py0, py0 + ph) with zero heap allocations.
+// `raw_scratch` must hold at least (pw + 4) * (ph + 4) floats.
+void ComputeOpponentMaskRect(const float* const JXL_RESTRICT rows[3],
+                             size_t stride, size_t xsize, size_t ysize,
+                             size_t px0, size_t py0, size_t pw, size_t ph,
+                             float lap_scale, float* JXL_RESTRICT raw_scratch,
+                             float* JXL_RESTRICT out_mask, size_t out_stride);
+
 // Returns an image subsampled by kBlockDim in each direction. If the value
 // at pixel (x,y) in the returned image is greater than 1.0, it means that
 // more fine-grained quantization should be used in the corresponding block
@@ -238,7 +247,6 @@ static JXL_INLINE void ComputeBlockThresholds(
 StatusOr<ImageF> InitialQuantField(float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* initial_quant_mask1x1,
                                    ImageF (*band_qf)[4] = nullptr,
                                    bool has_noise = false,
                                    float* out_base_quant = nullptr);

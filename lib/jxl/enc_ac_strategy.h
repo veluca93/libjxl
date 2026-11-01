@@ -42,9 +42,13 @@ struct ACSConfig {
   const AcTokenCostModel* JXL_RESTRICT token_cost_model;
   float* JXL_RESTRICT quant_field_row;
   size_t quant_field_stride;
-  const float* JXL_RESTRICT masking1x1_field_row;
-  size_t masking1x1_field_stride;
-  size_t mask1x1_xsize;
+  const float* JXL_RESTRICT mask_src_rows[3];
+  size_t mask_src_stride;
+  size_t mask_src_xsize;
+  size_t mask_src_ysize;
+  float mask_lap_scale;
+  float const_masking1x1;
+  size_t src_xsize;
   const float* JXL_RESTRICT src_rows[3];
   size_t src_stride;
   float* JXL_RESTRICT band_qf_rows[3][4];
@@ -61,10 +65,6 @@ struct ACSConfig {
   uint32_t disabled_tables_mask = 0;
   const float& Pixel(size_t c, size_t x, size_t y) const {
     return src_rows[c][y * src_stride + x];
-  }
-  const float* MaskingPtr1x1(size_t bx, size_t by) const {
-    JXL_DASSERT(masking1x1_field_row[by * masking1x1_field_stride + bx] > 0);
-    return &masking1x1_field_row[by * masking1x1_field_stride + bx];
   }
   float Quant(size_t bx, size_t by) const {
     JXL_DASSERT(quant_field_row[by * quant_field_stride + bx] > 0);
@@ -90,10 +90,11 @@ struct AcStrategyHeuristics {
         mem_per_thread(0),
         qmem_per_thread(0) {}
   Status Init(const Image3F& src, const Rect& rect_in, ImageF* quant_field,
-              const ImageF& mask1x1, DequantMatrices* matrices,
-              ImageF (*band_qf)[4] = nullptr, float x_qm_multiplier = 1.0f,
-              float b_qm_multiplier = 1.0f, float quant_scale = 0.0f,
-              float inv_global_scale = 0.0f, float base_quant_override = 0.0f);
+              const Image3F* mask_src, float mask_lap_scale,
+              DequantMatrices* matrices, ImageF (*band_qf)[4] = nullptr,
+              float x_qm_multiplier = 1.0f, float b_qm_multiplier = 1.0f,
+              float quant_scale = 0.0f, float inv_global_scale = 0.0f,
+              float base_quant_override = 0.0f);
   Status PrepareForThreads(std::size_t num_threads);
   Status ProcessRect(const Rect& rect, const ColorCorrelationMap& cmap,
                      AcStrategyImage* ac_strategy, size_t thread);

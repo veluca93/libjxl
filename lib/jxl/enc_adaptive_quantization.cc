@@ -496,61 +496,9 @@ void PerBlockModulations(const float butteraugli_target, const ImageF& xyb_x,
 struct AdaptiveQuantizationImpl {
   Status ComputeTile(float butteraugli_target, float scale, const Image3F& xyb,
                      const Rect& rect_in, const Rect& rect_out,
-                     ImageF* mask1x1, ImageF (*band_qf)[4], bool has_noise) {
+                     ImageF (*band_qf)[4], bool has_noise) {
     JXL_ENSURE(rect_in.x0() % kBlockDim == 0);
     JXL_ENSURE(rect_in.y0() % kBlockDim == 0);
-    const size_t xsize = xyb.xsize();
-    const size_t ysize = xyb.ysize();
-
-    // The XYB gamma is 3.0 to be able to decode faster with two muls.
-    // Butteraugli's gamma is matching the gamma of human eye, around 2.6.
-    // We approximate the gamma difference by adding one cubic root into
-    // the adaptive quantization. This gives us a total gamma of 2.6666
-    // for quantization uses.
-    const float match_gamma_offset = 0.019;
-
-    size_t y_start_1x1 = rect_in.y0() + rect_out.y0() * 8;
-    size_t y_end_1x1 = y_start_1x1 + rect_out.ysize() * 8;
-
-    size_t x_start_1x1 = rect_in.x0() + rect_out.x0() * 8;
-    size_t x_end_1x1 = x_start_1x1 + rect_out.xsize() * 8;
-
-    if (rect_in.x0() != 0 && rect_out.x0() == 0) x_start_1x1 -= 2;
-    if (rect_in.x1() < xsize && rect_out.x1() * 8 == rect_in.xsize()) {
-      x_end_1x1 += 2;
-    }
-    if (rect_in.y0() != 0 && rect_out.y0() == 0) y_start_1x1 -= 2;
-    if (rect_in.y1() < ysize && rect_out.y1() * 8 == rect_in.ysize()) {
-      y_end_1x1 += 2;
-    }
-
-    // 1x1 Laplacian of intensity.
-    for (size_t y = y_start_1x1; y < y_end_1x1; ++y) {
-      const size_t y2 = y + 1 < ysize ? y + 1 : y;
-      const size_t y1 = y > 0 ? y - 1 : y;
-      const float* row_in = xyb.ConstPlaneRow(1, y);
-      const float* row_in1 = xyb.ConstPlaneRow(1, y1);
-      const float* row_in2 = xyb.ConstPlaneRow(1, y2);
-      float* mask1x1_out = mask1x1->Row(y);
-      auto scalar_pixel1x1 = [&](size_t x) {
-        const size_t x2 = x + 1 < xsize ? x + 1 : x;
-        const size_t x1 = x > 0 ? x - 1 : x;
-        const float base =
-            0.25f * (row_in2[x] + row_in1[x] + row_in[x1] + row_in[x2]);
-        const float gammac = RatioOfDerivativesOfCubicRootToSimpleGamma(
-            row_in[x] + match_gamma_offset);
-        float diff = std::abs(gammac * (row_in[x] - base));
-        static const double kScaler = 1.0;
-        diff *= kScaler;
-        diff = std::log1p(diff);
-        static const float kMul = 1.0;
-        static const float kOffset = 0.01;
-        mask1x1_out[x] = kMul / (diff + kOffset);
-      };
-      for (size_t x = x_start_1x1; x < x_end_1x1; ++x) {
-        scalar_pixel1x1(x);
-      }
-    }
 
     PerBlockModulations(butteraugli_target, xyb.Plane(0), xyb.Plane(1),
                         xyb.Plane(2), rect_in, scale, rect_out, &aq_map,
@@ -560,40 +508,9 @@ struct AdaptiveQuantizationImpl {
   ImageF aq_map;
 };
 
-Status Blur1x1Masking(JxlMemoryManager* memory_manager, ThreadPool* pool,
-                      ImageF* mask1x1, const Rect& rect) {
-  // Blur the mask1x1 to obtain the masking image.
-  // Before blurring it contains an image of absolute value of the
-  // Laplacian of the intensity channel.
-  static const float kFilterMask1x1[5] = {
-    0.364911248, 0.05, 0.1688888021, 0.221069183, 0.306563504,
-  };
-  double sum =
-      1.0 + 4 * (kFilterMask1x1[0] + kFilterMask1x1[1] + kFilterMask1x1[2] +
-                 kFilterMask1x1[4] + 2 * kFilterMask1x1[3]);
-  if (sum < 1e-5) {
-    sum = 1e-5;
-  }
-  const float normalize = static_cast<float>(1.0 / sum);
-  WeightsSymmetric5 weights =
-      WeightsSymmetric5{{HWY_REP4(normalize)},
-                        {HWY_REP4(normalize * kFilterMask1x1[0])},
-                        {HWY_REP4(normalize * kFilterMask1x1[2])},
-                        {HWY_REP4(normalize * kFilterMask1x1[1])},
-                        {HWY_REP4(normalize * kFilterMask1x1[4])},
-                        {HWY_REP4(normalize * kFilterMask1x1[3])}};
-  JXL_ASSIGN_OR_RETURN(
-      ImageF temp, ImageF::Create(memory_manager, rect.xsize(), rect.ysize()));
-  JXL_RETURN_IF_ERROR(
-      Symmetric5(*mask1x1, rect, weights, pool, &temp, Rect(temp)));
-  *mask1x1 = std::move(temp);
-  return true;
-}
-
 StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
                                          const Image3F& xyb, const Rect& rect,
                                          float scale, ThreadPool* pool,
-                                         ImageF* mask1x1,
                                          ImageF (*band_qf)[4],
                                          bool has_noise) {
   JXL_ENSURE(rect.xsize() % kBlockDim == 0);
@@ -604,8 +521,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
   JxlMemoryManager* memory_manager = xyb.memory_manager();
   JXL_ASSIGN_OR_RETURN(
       impl.aq_map, ImageF::Create(memory_manager, xsize_blocks, ysize_blocks));
-  JXL_ASSIGN_OR_RETURN(
-      *mask1x1, ImageF::Create(memory_manager, xyb.xsize(), xyb.ysize()));
   if (band_qf != nullptr) {
     for (size_t c = 0; c < 3; ++c) {
       for (size_t s = 0; s < 4; ++s) {
@@ -626,8 +541,7 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     size_t bx1 = std::min((tx + 1) * kEncTileDimInBlocks, xsize_blocks);
     Rect rect_out(bx0, by0, bx1 - bx0, by1 - by0);
     JXL_RETURN_IF_ERROR(impl.ComputeTile(butteraugli_target, scale, xyb, rect,
-                                         rect_out, mask1x1, band_qf,
-                                         has_noise));
+                                         rect_out, band_qf, has_noise));
     return true;
   };
   size_t num_tiles = DivCeil(xsize_blocks, kEncTileDimInBlocks) *
@@ -704,7 +618,6 @@ StatusOr<ImageF> AdaptiveQuantizationMap(const float butteraugli_target,
     }
   }
 
-  JXL_RETURN_IF_ERROR(Blur1x1Masking(memory_manager, pool, mask1x1, rect));
   return std::move(impl).aq_map;
 }
 
@@ -1269,11 +1182,136 @@ float InitialQuantDC(float butteraugli_target) {
   return std::min(kDcQuant / butteraugli_target_dc, 50.f);
 }
 
+void ComputeOpponentMaskRect(const float* const JXL_RESTRICT rows[3],
+                             size_t stride, size_t xsize, size_t ysize,
+                             size_t px0, size_t py0, size_t pw, size_t ph,
+                             float lap_scale, float* JXL_RESTRICT raw_scratch,
+                             float* JXL_RESTRICT out_mask, size_t out_stride) {
+  if (pw == 0 || ph == 0) return;
+  if (xsize == 0 || ysize == 0 || rows[0] == nullptr || rows[1] == nullptr ||
+      rows[2] == nullptr) {
+    for (size_t oy = 0; oy < ph; ++oy) {
+      float* JXL_RESTRICT dst = out_mask + oy * out_stride;
+      for (size_t ox = 0; ox < pw; ++ox) dst[ox] = 100.0f;
+    }
+    return;
+  }
+
+  const size_t rw = pw + 4;
+  const size_t rh = ph + 4;
+  const int64_t xlim = static_cast<int64_t>(xsize) - 1;
+  const int64_t sx0 = static_cast<int64_t>(px0) - 2;
+  const size_t rx_lo =
+      (sx0 < 1) ? std::min<size_t>(rw, static_cast<size_t>(1 - sx0)) : 0;
+  const int64_t max_int_rx = xlim - sx0;
+  const size_t rx_hi =
+      (max_int_rx <= static_cast<int64_t>(rx_lo))
+          ? rx_lo
+          : std::min<size_t>(rw, static_cast<size_t>(max_int_rx));
+
+  for (size_t ry = 0; ry < rh; ++ry) {
+    const int64_t sy =
+        static_cast<int64_t>(py0) + static_cast<int64_t>(ry) - 2;
+    const size_t yc =
+        static_cast<size_t>(Mirror(sy, static_cast<int64_t>(ysize)));
+    const size_t ym = (yc > 0) ? (yc - 1) : 0;
+    const size_t yp = (yc + 1 < ysize) ? (yc + 1) : yc;
+
+    const float* JXL_RESTRICT x_c = rows[0] + yc * stride;
+    const float* JXL_RESTRICT x_m = rows[0] + ym * stride;
+    const float* JXL_RESTRICT x_p = rows[0] + yp * stride;
+    const float* JXL_RESTRICT y_c = rows[1] + yc * stride;
+    const float* JXL_RESTRICT y_m = rows[1] + ym * stride;
+    const float* JXL_RESTRICT y_p = rows[1] + yp * stride;
+    const float* JXL_RESTRICT b_c = rows[2] + yc * stride;
+    const float* JXL_RESTRICT b_m = rows[2] + ym * stride;
+    const float* JXL_RESTRICT b_p = rows[2] + yp * stride;
+    float* JXL_RESTRICT raw_row = raw_scratch + ry * rw;
+
+    auto eval_px = [&](size_t xm, size_t xc, size_t xp) -> float {
+      const float yc_v = y_c[xc];
+      const float lap_y =
+          yc_v - 0.25f * (y_m[xc] + y_p[xc] + y_c[xm] + y_c[xp]);
+      const float lap_x =
+          x_c[xc] - 0.25f * (x_m[xc] + x_p[xc] + x_c[xm] + x_c[xp]);
+      const float lap_b =
+          b_c[xc] - 0.25f * (b_m[xc] + b_p[xc] + b_c[xm] + b_c[xp]);
+      const float v = std::max(0.0f, yc_v + 0.019f);
+      const float v2 = v * v;
+      const float gammac =
+          (157.186484f * v2 * v + 5.4044867f) / (119.906570f * v2 + 0.01f);
+      const float dy = std::abs(gammac * lap_y);
+      const float dx = 6.0f * lap_x;
+      const float dby = 0.48f * (lap_b - lap_y);
+      const float dchr2 = dx * dx + dby * dby;
+      const float thr = 0.68f * dy + 0.0035f;
+      float diff = dy;
+      if (dchr2 > thr * thr) {
+        const float ex = std::sqrt(dchr2) - thr;
+        diff = std::sqrt(dy * dy + ex * ex);
+      }
+      return 1.0f / (std::log1p(lap_scale * diff) + 0.01f);
+    };
+
+    for (size_t rx = 0; rx < rx_lo; ++rx) {
+      const int64_t sx = sx0 + static_cast<int64_t>(rx);
+      const size_t xc =
+          static_cast<size_t>(Mirror(sx, static_cast<int64_t>(xsize)));
+      const size_t xm = (xc > 0) ? (xc - 1) : 0;
+      const size_t xp = (xc + 1 < xsize) ? (xc + 1) : xc;
+      raw_row[rx] = eval_px(xm, xc, xp);
+    }
+    for (size_t rx = rx_lo; rx < rx_hi; ++rx) {
+      const size_t xc = static_cast<size_t>(sx0 + static_cast<int64_t>(rx));
+      raw_row[rx] = eval_px(xc - 1, xc, xc + 1);
+    }
+    for (size_t rx = rx_hi; rx < rw; ++rx) {
+      const int64_t sx = sx0 + static_cast<int64_t>(rx);
+      const size_t xc =
+          static_cast<size_t>(Mirror(sx, static_cast<int64_t>(xsize)));
+      const size_t xm = (xc > 0) ? (xc - 1) : 0;
+      const size_t xp = (xc + 1 < xsize) ? (xc + 1) : xc;
+      raw_row[rx] = eval_px(xm, xc, xp);
+    }
+  }
+
+  constexpr float kW0 = 0.15797769f;
+  constexpr float kWhv1 = 0.05764784f;
+  constexpr float kWhv2 = 0.02668066f;
+  constexpr float kWd11 = 0.00789888f;
+  constexpr float kWd22 = 0.04843019f;
+  constexpr float kWd12 = 0.03492400f;
+
+  for (size_t oy = 0; oy < ph; ++oy) {
+    const float* JXL_RESTRICT r_m2 = raw_scratch + oy * rw + 2;
+    const float* JXL_RESTRICT r_m1 = r_m2 + rw;
+    const float* JXL_RESTRICT r_0 = r_m1 + rw;
+    const float* JXL_RESTRICT r_p1 = r_0 + rw;
+    const float* JXL_RESTRICT r_p2 = r_p1 + rw;
+    float* JXL_RESTRICT dst = out_mask + oy * out_stride;
+    for (size_t ox = 0; ox < pw; ++ox) {
+      const float c0 = r_0[ox];
+      const float hv1 = r_m1[ox] + r_p1[ox] + r_0[ox - 1] + r_0[ox + 1];
+      const float hv2 = r_m2[ox] + r_p2[ox] + r_0[ox - 2] + r_0[ox + 2];
+      const float d11 =
+          r_m1[ox - 1] + r_m1[ox + 1] + r_p1[ox - 1] + r_p1[ox + 1];
+      const float d22 =
+          r_m2[ox - 2] + r_m2[ox + 2] + r_p2[ox - 2] + r_p2[ox + 2];
+      const float d12 = r_m2[ox - 1] + r_m2[ox + 1] + r_p2[ox - 1] +
+                        r_p2[ox + 1] + r_m1[ox - 2] + r_m1[ox + 2] +
+                        r_p1[ox - 2] + r_p1[ox + 2];
+      const float blur5x5 = kW0 * c0 + kWhv1 * hv1 + kWhv2 * hv2 +
+                            kWd11 * d11 + kWd22 * d22 + kWd12 * d12;
+      dst[ox] = blur5x5;
+    }
+  }
+}
+
 StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
                                    const Image3F& opsin, const Rect& rect,
                                    ThreadPool* pool, float rescale,
-                                   ImageF* mask1x1, ImageF (*band_qf)[4],
-                                   bool has_noise, float* out_base_quant) {
+                                   ImageF (*band_qf)[4], bool has_noise,
+                                   float* out_base_quant) {
   const float quant_ac = kAcQuant / std::max(1e-4f, butteraugli_target);
   const float scale = quant_ac * rescale;
   if (out_base_quant != nullptr) {
@@ -1291,8 +1329,7 @@ StatusOr<ImageF> InitialQuantField(const float butteraugli_target,
     *out_base_quant = 0.72f * mul + add;
   }
   return HWY_DYNAMIC_DISPATCH(AdaptiveQuantizationMap)(
-      butteraugli_target, opsin, rect, scale, pool, mask1x1, band_qf,
-      has_noise);
+      butteraugli_target, opsin, rect, scale, pool, band_qf, has_noise);
 }
 
 Status FindBestQuantizer(const FrameHeader& frame_header, const Image3F* linear,

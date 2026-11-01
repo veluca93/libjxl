@@ -322,9 +322,10 @@ using hwy::HWY_NAMESPACE::Shuffle2301;
 Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
                        const ACSConfig& config,
                        const float* JXL_RESTRICT cmap_factors, float* block,
-                       float* full_scratch_space, uint32_t* quantized,
-                       float best_cost_bound, float& entropy, float& q_out,
-                       uint8_t& act_out) {
+                       float* full_scratch_space,
+                       const float* JXL_RESTRICT mask_tile, size_t mask_x0,
+                       size_t mask_y0, float best_cost_bound, float& entropy,
+                       float& q_out, uint8_t& act_out) {
   entropy = 0.0f;
   float* mem = full_scratch_space;
   float* pixels_buf = full_scratch_space + AcStrategy::kMaxCoeffArea;
@@ -758,19 +759,17 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
         for (size_t ix = 0; ix < cov_x; ix++) {
           for (size_t dy = 0; dy < kBlockDim; dy += 2) {
             for (size_t dx = 0; dx < kBlockDim; dx += Lanes(df8)) {
-              if (x + ix * 8 + dx + Lanes(df8) <= config.mask1x1_xsize) {
+              if (x + ix * 8 + dx + Lanes(df8) <= config.src_xsize) {
                 const size_t p_off0 =
                     (iy * kBlockDim + dy) * (cov_x * kBlockDim) +
                     ix * kBlockDim + dx;
                 const size_t p_off1 = p_off0 + cov_x * kBlockDim;
+                const size_t mx = (x - mask_x0) + ix * 8 + dx;
+                const size_t my = (y - mask_y0) + iy * 8 + dy;
                 auto masku0 =
-                    Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
-                                                       y + iy * 8 + dy)),
-                        masku_off);
+                    Add(Load(df8, mask_tile + my * 256 + mx), masku_off);
                 auto masku1 =
-                    Add(Load(df8, config.MaskingPtr1x1(x + ix * 8 + dx,
-                                                       y + iy * 8 + dy + 1)),
-                        masku_off);
+                    Add(Load(df8, mask_tile + (my + 1) * 256 + mx), masku_off);
                 auto in0 = Mul(masku0, Load(df8, pixels_buf + p_off0));
                 auto in1 = Mul(masku1, Load(df8, pixels_buf + p_off1));
 #if HWY_TARGET != HWY_SCALAR
@@ -814,7 +813,7 @@ Status EstimateEntropy(const AcStrategy& acs, size_t x, size_t y,
         const size_t buf_stride = cov_x * kBlockDim;
         for (size_t iy = 0; iy < cov_y; ++iy) {
           for (size_t ix = 0; ix < cov_x; ++ix) {
-            if (x + ix * 8 + kBlockDim > config.mask1x1_xsize) continue;
+            if (x + ix * 8 + kBlockDim > config.src_xsize) continue;
             float cell_mu_o[4];
             float cell_mu_r[4];
             float cell_sum_o2[4];
@@ -1302,6 +1301,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     uint8_t act;
   };
   struct DPTable {
+    HWY_ALIGN float mask_tile[256 * 256];
+    float mask_raw[260 * 260];
     float cost_flat[528 * 528];
     uint16_t split_flat[528 * 528];
     uint16_t iv_idx[32][33];
@@ -1316,10 +1317,26 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
     CandBlock cands[6144];
     LocalCand local_cands[352];
   };
-  static constexpr size_t kQMemWords = 655360;
+  static constexpr size_t kQMemWords = 794624;
   static_assert(sizeof(DPTable) <= kQMemWords * sizeof(uint32_t),
                 "DPTable fits in per-thread quantized buffer");
   DPTable* JXL_RESTRICT dp = reinterpret_cast<DPTable*>(quantized);
+  const size_t mask_x0 = 8 * bx;
+  const size_t mask_y0 = 8 * by;
+  if (config.const_masking1x1 > 0.0f) {
+    for (size_t my = 0; my < 8 * ry; ++my) {
+      float* JXL_RESTRICT mrow = dp->mask_tile + my * 256;
+      for (size_t mx = 0; mx < 8 * rx; ++mx) {
+        mrow[mx] = config.const_masking1x1;
+      }
+    }
+  } else {
+    ComputeOpponentMaskRect(config.mask_src_rows, config.mask_src_stride,
+                            config.mask_src_xsize, config.mask_src_ysize,
+                            mask_x0, mask_y0, 8 * rx, 8 * ry,
+                            config.mask_lap_scale, dp->mask_raw, dp->mask_tile,
+                            256);
+  }
 
   // Precompute CfL factors for each 8x8 color tile overlapping this AC group.
   float cmap_factors_tile[4][4][3];
@@ -1379,8 +1396,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
         uint8_t cand_act = 0;
         JXL_RETURN_IF_ERROR(EstimateEntropy(
             AcStrategy::FromRawStrategy(tx.type), 8 * (bx + ix), 8 * (by + iy),
-            config, cmap_factors, block, scratch_space, quantized,
-            best_entropy, cand_entropy, cand_q, cand_act));
+            config, cmap_factors, block, scratch_space, dp->mask_tile, mask_x0,
+            mask_y0, best_entropy, cand_entropy, cand_q, cand_act));
         if (cand_entropy < best_entropy) {
           best_entropy = cand_entropy;
           best_of_8x8s = tx.type;
@@ -1704,8 +1721,8 @@ Status ProcessRectACS(const CompressParams& cparams, const ACSConfig& config,
                                    [x0 / kColorTileDimInBlocks];
               JXL_RETURN_IF_ERROR(EstimateEntropy(
                   acs_direct, (bx + x0) * 8, (by + y0) * 8, config,
-                  cmap_factors, block, scratch_space, quantized, best_c,
-                  cand_entropy, cand_q, cand_act));
+                  cmap_factors, block, scratch_space, dp->mask_tile, mask_x0,
+                  mask_y0, best_c, cand_entropy, cand_q, cand_act));
               if (cand_entropy < best_c) {
                 best_c = cand_entropy;
                 best_s = 0;
@@ -1941,7 +1958,8 @@ namespace jxl {
 HWY_EXPORT(ProcessRectACS);
 
 Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
-                                  ImageF* quant_field, const ImageF& mask1x1,
+                                  ImageF* quant_field, const Image3F* mask_src,
+                                  float mask_lap_scale,
                                   DequantMatrices* matrices,
                                   ImageF (*band_qf)[4], float x_qm_multiplier,
                                   float b_qm_multiplier, float quant_scale,
@@ -1974,10 +1992,33 @@ Status AcStrategyHeuristics::Init(const Image3F& src, const Rect& rect_in,
           : ((quant_field->xsize() > 0 && quant_field->ysize() > 0)
                  ? quant_field->ConstRow(0)[0]
                  : 1.0f);
-  config.mask1x1_xsize = mask1x1.xsize();
-  if (mask1x1.xsize() > 0 && mask1x1.ysize() > 0) {
-    config.masking1x1_field_row = mask1x1.Row(0);
-    config.masking1x1_field_stride = mask1x1.PixelsPerRow();
+  config.src_xsize = rect_in.xsize();
+  config.mask_lap_scale = mask_lap_scale;
+  if (cparams.disable_perceptual_optimizations) {
+    config.const_masking1x1 = 1.0f / (config.base_quant + 0.001f);
+    config.mask_src_rows[0] = nullptr;
+    config.mask_src_rows[1] = nullptr;
+    config.mask_src_rows[2] = nullptr;
+    config.mask_src_stride = 0;
+    config.mask_src_xsize = 0;
+    config.mask_src_ysize = 0;
+  } else {
+    config.const_masking1x1 = 0.0f;
+    if (mask_src != nullptr && mask_src->xsize() > 0 && mask_src->ysize() > 0) {
+      config.mask_src_rows[0] = mask_src->ConstPlaneRow(0, 0);
+      config.mask_src_rows[1] = mask_src->ConstPlaneRow(1, 0);
+      config.mask_src_rows[2] = mask_src->ConstPlaneRow(2, 0);
+      config.mask_src_stride = mask_src->PixelsPerRow();
+      config.mask_src_xsize = mask_src->xsize();
+      config.mask_src_ysize = mask_src->ysize();
+    } else {
+      config.mask_src_rows[0] = rect_in.ConstPlaneRow(src, 0, 0);
+      config.mask_src_rows[1] = rect_in.ConstPlaneRow(src, 1, 0);
+      config.mask_src_rows[2] = rect_in.ConstPlaneRow(src, 2, 0);
+      config.mask_src_stride = src.PixelsPerRow();
+      config.mask_src_xsize = rect_in.xsize();
+      config.mask_src_ysize = rect_in.ysize();
+    }
   }
 
   for (size_t c = 0; c < 3; ++c) {
@@ -2055,7 +2096,7 @@ Status AcStrategyHeuristics::PrepareForThreads(std::size_t num_threads) {
   mem_per_thread = 8 * AcStrategy::kMaxCoeffArea + dct_scratch_size;
   size_t mem_bytes = num_threads * mem_per_thread * sizeof(float);
   JXL_ASSIGN_OR_RETURN(mem, AlignedMemory::Create(memory_manager, mem_bytes));
-  qmem_per_thread = 655360;
+  qmem_per_thread = 794624;
   size_t qmem_bytes = num_threads * qmem_per_thread * sizeof(uint32_t);
   JXL_ASSIGN_OR_RETURN(qmem, AlignedMemory::Create(memory_manager, qmem_bytes));
   return true;

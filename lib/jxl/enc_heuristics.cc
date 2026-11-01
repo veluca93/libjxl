@@ -1901,8 +1901,8 @@ StatusOr<Image3F> ReconstructImage(
   return std::move(*decoded.color());
 }
 
-float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
-                             const ImageF& mask1x1, size_t by, size_t bx,
+float ComputeBlockL2Distance(const Image3F& a, const Image3F& b, size_t by,
+                             size_t bx,
                              float* JXL_RESTRICT out_bdry_err = nullptr,
                              float* JXL_RESTRICT out_grad_a = nullptr,
                              float* JXL_RESTRICT out_grad_b = nullptr) {
@@ -1912,6 +1912,15 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
   const size_t ysize = rect.ysize();
   const size_t x0 = rect.x0();
   const size_t y0 = rect.y0();
+  float raw_scratch[12 * 12];
+  float block_mask[8 * 8];
+  const float* const a_rows[3] = {
+      a.xsize() > 0 && a.ysize() > 0 ? a.ConstPlaneRow(0, 0) : nullptr,
+      a.xsize() > 0 && a.ysize() > 0 ? a.ConstPlaneRow(1, 0) : nullptr,
+      a.xsize() > 0 && a.ysize() > 0 ? a.ConstPlaneRow(2, 0) : nullptr,
+  };
+  ComputeOpponentMaskRect(a_rows, a.PixelsPerRow(), a.xsize(), a.ysize(), x0,
+                          y0, xsize, ysize, 1.0f, raw_scratch, block_mask, 8);
   const bool has_left = (out_bdry_err != nullptr) && (x0 > 0);
   const bool has_right = (out_bdry_err != nullptr) && (x0 + xsize < a.xsize());
   const bool has_top = (out_bdry_err != nullptr) && (y0 > 0);
@@ -1966,7 +1975,7 @@ float ComputeBlockL2Distance(const Image3F& a, const Image3F& b,
         (y == 0 && has_top) ? b.ConstPlaneRow(1, y0 - 1) + x0 : nullptr,
         (y == 0 && has_top) ? b.ConstPlaneRow(2, y0 - 1) + x0 : nullptr,
     };
-    const float* row_mask = rect.ConstRow(mask1x1, y);
+    const float* row_mask = block_mask + y * 8;
     for (size_t x = 0; x < xsize; ++x) {
       float mask = row_mask[x];
       float mask2 = mask * mask;
@@ -2113,7 +2122,6 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   const CompressParams& cparams = enc_state->cparams;
   PassesSharedState& shared = enc_state->shared;
   const FrameDimensions& frame_dim = shared.frame_dim;
-  const ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageB& epf_sharpness = shared.epf_sharpness;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
@@ -2183,9 +2191,8 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
         float bdry_b = 0.0f;
         float grad_a = 0.0f;
         float grad_b = 0.0f;
-        float err = ComputeBlockL2Distance(
-            orig_opsin, decoded, initial_quant_masking1x1, by, bx, &bdry_b,
-            &grad_a, &grad_b);
+        float err = ComputeBlockL2Distance(orig_opsin, decoded, by, bx, &bdry_b,
+                                           &grad_a, &grad_b);
         if (val == 0) {
           bdry0_row[bx] = bdry_b;
           target_grad_row[bx] = std::min(grad_a, grad_b);
@@ -2835,7 +2842,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   ImageFeatures& image_features = shared.image_features;
   DequantMatrices& matrices = shared.matrices;
   Quantizer& quantizer = shared.quantizer;
-  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
   ImageI& raw_quant_field = shared.raw_quant_field;
   ColorCorrelationMap& cmap = shared.cmap;
   AcStrategyImage& ac_strategy = shared.ac_strategy;
@@ -2926,13 +2932,6 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     float q = 0.79 / cparams.butteraugli_distance;
     initial_base_quant = q;
     FillImage(q, &initial_quant_field);
-    if (cparams.disable_perceptual_optimizations) {
-      float masking = 1.0f / (q + 0.001f);
-      JXL_ASSIGN_OR_RETURN(
-          initial_quant_masking1x1,
-          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
-      FillImage(masking, &initial_quant_masking1x1);
-    }
     quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
   } else {
     // Call this here, as it relies on pre-gaborish values.
@@ -2949,8 +2948,7 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
         InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
-                          1.0f, &initial_quant_masking1x1,
-                          enable_rdo ? enc_state->band_qf : nullptr,
+                          1.0f, enable_rdo ? enc_state->band_qf : nullptr,
                           (frame_header.flags & FrameHeader::kNoise) != 0,
                           &initial_base_quant));
     float q = 0.39 / cparams.butteraugli_distance;
@@ -3002,8 +3000,16 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
       std::pow(1.25f, frame_header.b_qm_scale - 2.0f);
 
   JXL_RETURN_IF_ERROR(cfl_heuristics.Init(rect));
+  const bool can_use_orig_opsin =
+      !streaming_mode && !image_features.patches.HasAny() &&
+      !image_features.splines.HasAny() && enc_state->orig_opsin != nullptr &&
+      enc_state->orig_opsin->xsize() > 0 &&
+      enc_state->orig_opsin->ysize() > 0;
+  const Image3F* mask_src = can_use_orig_opsin ? enc_state->orig_opsin : nullptr;
+  const float mask_lap_scale =
+      (!can_use_orig_opsin && frame_header.loop_filter.gab) ? 0.62f : 1.0f;
   JXL_RETURN_IF_ERROR(acs_heuristics.Init(
-      *opsin, rect, &initial_quant_field, initial_quant_masking1x1, &matrices,
+      *opsin, rect, &initial_quant_field, mask_src, mask_lap_scale, &matrices,
       (enable_rdo || cparams.speed_tier <= SpeedTier::kHare)
           ? enc_state->band_qf
           : nullptr,
