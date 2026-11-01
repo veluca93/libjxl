@@ -294,6 +294,17 @@ static JXL_INLINE size_t BuildRdoqCandidates(
   return count;
 }
 
+struct CflCouplingContext {
+  const float* x_src = nullptr;
+  const float* b_src = nullptr;
+  const float* zero_thres_x = nullptr;
+  const float* zero_thres_b = nullptr;
+  float x_factor = 0.0f;
+  float b_opp_factor = 0.0f;
+  float x_qm_mul = 1.0f;
+  float b_qm_mul = 1.0f;
+};
+
 int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
                                const AcTokenCostModel& tcm, size_t c,
                                float qm_multiplier, AcStrategyType quant_kind,
@@ -306,7 +317,8 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
                                bool few_colors, int8_t rdoq_level,
                                const float* JXL_RESTRICT block_in,
                                int32_t quant, int32_t* JXL_RESTRICT block_out,
-                               uint8_t* JXL_RESTRICT choices_buf) {
+                               uint8_t* JXL_RESTRICT choices_buf,
+                               const CflCouplingContext* cfl_ctx = nullptr) {
   const size_t size = covered_blocks * kDCTBlockSize;
   const size_t dim = xsize * kBlockDim;
   const coeff_order_t* JXL_RESTRICT order =
@@ -419,6 +431,120 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   for (size_t k = search_end; k < size; ++k) {
     suffix_nzeros += static_cast<size_t>(block_out[order[k]] != 0);
   }
+
+  static constexpr float kBandDistWeight[4] = {0.92f, 1.00f, 1.27829313f,
+                                               1.55410683f};
+  const float sparse_w = Clamp1((eob_scale - 0.32f) / 0.42f, 0.0f, 1.0f);
+  const float sharp_lo_rdoq = Clamp1(1.0f - eob_scale, 0.0f, 1.0f);
+  const float base_ref = (c == 1) ? 2.8215988f : 3.571999f;
+  float rdoq_ref_mul = 1.0f;
+  if (rdoq_level > 0) {
+    rdoq_ref_mul = 1.4480802f;
+  } else if (rdoq_level == -1) {
+    rdoq_ref_mul = 0.715483427f;
+  } else if (rdoq_level <= -2) {
+    rdoq_ref_mul = (rdoq_level == -2)
+                       ? 0.565904856f
+                       : ((rdoq_level == -3) ? 0.441753954f : 0.339791059f);
+  }
+  const float lo_sharp_boost =
+      (!few_colors && rdoq_level >= -1 && c <= 1)
+          ? (((c == 1) ? 0.28f : 0.14f) * sharp_lo_rdoq)
+          : 0.0f;
+  const float eff_ref_bits =
+      base_ref * (1.0f + 0.355283588f * eob_scale + lo_sharp_boost) *
+      rdoq_ref_mul;
+  constexpr float kQuadTilt = 0.47541872f;
+  const float base_h = 0.58f;
+  const float t_ref = 0.60f;
+  const float denom_ref = b_c * (2.0f * t_ref - b_c);
+
+  const bool cfl_has_x =
+      (c == 1 && cfl_ctx != nullptr && cfl_ctx->x_src != nullptr &&
+       cfl_ctx->zero_thres_x != nullptr && std::abs(cfl_ctx->x_factor) > 1e-6f);
+  const bool cfl_has_b =
+      (c == 1 && cfl_ctx != nullptr && cfl_ctx->b_src != nullptr &&
+       cfl_ctx->zero_thres_b != nullptr &&
+       std::abs(cfl_ctx->b_opp_factor) > 1e-6f);
+  const bool has_cfl = cfl_has_x || cfl_has_b;
+  const float* JXL_RESTRICT deqm_y =
+      has_cfl ? quantizer.DequantMatrix(quant_kind, 1) : nullptr;
+  const float inv_qac_y = has_cfl ? quantizer.inv_quant_ac(quant) : 0.0f;
+  const float* JXL_RESTRICT qm_x =
+      cfl_has_x ? quantizer.InvDequantMatrix(quant_kind, 0) : nullptr;
+  const float* JXL_RESTRICT qm_b =
+      cfl_has_b ? quantizer.InvDequantMatrix(quant_kind, 2) : nullptr;
+  const float qac_x =
+      cfl_has_x ? (quantizer.Scale() * quant * cfl_ctx->x_qm_mul) : 0.0f;
+  const float qac_b =
+      cfl_has_b ? (quantizer.Scale() * quant * cfl_ctx->b_qm_mul) : 0.0f;
+  const float cfl_denom_x =
+      kDefaultQuantBias[0] * (2.0f * t_ref - kDefaultQuantBias[0]);
+  const float cfl_denom_b =
+      kDefaultQuantBias[2] * (2.0f * t_ref - kDefaultQuantBias[2]);
+  const float cfl_eff_ref_x =
+      3.571999f *
+      (1.0f + 0.355283588f * eob_scale +
+       ((!few_colors && rdoq_level >= -1) ? (0.14f * sharp_lo_rdoq) : 0.0f)) *
+      rdoq_ref_mul;
+  const float cfl_eff_ref_b =
+      3.571999f * (1.0f + 0.355283588f * eob_scale) * rdoq_ref_mul;
+  float cfl_quad_thres[2][4] = {};
+  if (has_cfl) {
+    const float* zt_arr[2] = {cfl_ctx->zero_thres_x, cfl_ctx->zero_thres_b};
+    for (int ci_m = 0; ci_m < 2; ++ci_m) {
+      if (zt_arr[ci_m] == nullptr) continue;
+      for (int q = 0; q < 4; ++q) cfl_quad_thres[ci_m][q] = zt_arr[ci_m][q];
+      if (xsize * ysize >= 4) {
+        const float sub =
+            Clamp1(0.0045f * static_cast<float>(xsize * ysize), 0.0f, 0.055f);
+        cfl_quad_thres[ci_m][0] =
+            std::max(0.525f, cfl_quad_thres[ci_m][0] - sub);
+        for (int q = 1; q < 3; ++q) {
+          cfl_quad_thres[ci_m][q] =
+              std::max(0.57f, cfl_quad_thres[ci_m][q] - 0.35f * sub);
+        }
+      }
+    }
+  }
+  auto eval_cfl_env = [](float u, float t0_m, float w_m) -> float {
+    const float au = std::abs(u);
+    if (au <= t0_m) return w_m * au * au;
+    return w_m * t0_m * t0_m + 1.15f * std::log1p(au - t0_m);
+  };
+  auto eval_cfl_delta_bits = [&](size_t pos, size_t hfix, uint8_t s,
+                                 float y_deq_phys) -> float {
+    float delta = 0.0f;
+    const float raw_h_c = (hfix == 0) ? 0.58f : 0.62f;
+    if (cfl_has_x) {
+      const float t0_x =
+          cfl_quad_thres[0][hfix] + cfl_ctx->zero_thres_x[4 + s];
+      const float perc_t0_x =
+          std::max(0.50f, t0_x - (1.0f - kQuadTilt) * (raw_h_c - base_h));
+      const float tr_x = t_ref / perc_t0_x;
+      const float w_x = (cfl_eff_ref_x / cfl_denom_x) * (tr_x * tr_x);
+      const float sx = qm_x[pos] * qac_x;
+      const float u0 = cfl_ctx->x_src[pos] * sx;
+      const float u1 =
+          (cfl_ctx->x_src[pos] - cfl_ctx->x_factor * y_deq_phys) * sx;
+      delta += eval_cfl_env(u1, t0_x, w_x) - eval_cfl_env(u0, t0_x, w_x);
+    }
+    if (cfl_has_b) {
+      const float t0_b =
+          cfl_quad_thres[1][hfix] + cfl_ctx->zero_thres_b[4 + s];
+      const float perc_t0_b =
+          std::max(0.50f, t0_b - (1.0f - kQuadTilt) * (raw_h_c - base_h));
+      const float tr_b = t_ref / perc_t0_b;
+      const float w_b = (cfl_eff_ref_b / cfl_denom_b) * (tr_b * tr_b);
+      const float sb = qm_b[pos] * qac_b;
+      const float o_src = cfl_ctx->b_src[pos] - block_in[pos];
+      const float u0 = o_src * sb;
+      const float u1 = (o_src - cfl_ctx->b_opp_factor * y_deq_phys) * sb;
+      delta += eval_cfl_env(u1, t0_b, w_b) - eval_cfl_env(u0, t0_b, w_b);
+    }
+    return 0.65f * Clamp1(delta, -1.6f, 1.6f);
+  };
+
   size_t window_orig_nzeros = 0;
   size_t scalar_lf_nz = 0;
   bool any_near_dz_cand = false;
@@ -442,14 +568,22 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
           (static_cast<size_t>(v8 >= 4) * 2 + static_cast<size_t>(u8 >= 4));
       const float t0_full = quad_thres[hfix] + zero_thres[4 + s];
       const float near_dz_floor = std::max(dz_min, t0_full - dz_pull);
-      const float abs_ideal = std::abs(block_in[pos] * (qm[pos] * qac));
+      const float ideal = block_in[pos] * (qm[pos] * qac);
+      const float abs_ideal = std::abs(ideal);
       const bool can_restore =
           (c == 1)
               ? (wi < restore_len)
               : ((wi < restore_len / 2) &&
                  (is_partial_block ? (k <= 8) : (s >= 2)));
+      bool cfl_restore = false;
+      if (has_cfl && !few_colors && rdoq_level >= -1 && abs_ideal >= 0.42f &&
+          abs_ideal < near_dz_floor) {
+        const float y_deq_1 =
+            ((ideal >= 0.0f) ? b_c : -b_c) * deqm_y[pos] * inv_qac_y;
+        cfl_restore = (eval_cfl_delta_bits(pos, hfix, s, y_deq_1) < -0.22f);
+      }
       if ((can_restore && abs_ideal >= restore_floor) ||
-          (!few_colors && abs_ideal >= near_dz_floor)) {
+          (!few_colors && abs_ideal >= near_dz_floor) || cfl_restore) {
         any_near_dz_cand = true;
         last_active_wi = wi;
       }
@@ -481,33 +615,6 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
       suffix_cost[init_prev] = bits;
     }
   }
-
-  static constexpr float kBandDistWeight[4] = {0.92f, 1.00f, 1.27829313f,
-                                               1.55410683f};
-  const float sparse_w = Clamp1((eob_scale - 0.32f) / 0.42f, 0.0f, 1.0f);
-  const float sharp_lo_rdoq = Clamp1(1.0f - eob_scale, 0.0f, 1.0f);
-  const float base_ref = (c == 1) ? 2.8215988f : 3.571999f;
-  float rdoq_ref_mul = 1.0f;
-  if (rdoq_level > 0) {
-    rdoq_ref_mul = 1.4480802f;
-  } else if (rdoq_level == -1) {
-    rdoq_ref_mul = 0.715483427f;
-  } else if (rdoq_level <= -2) {
-    rdoq_ref_mul = (rdoq_level == -2)
-                       ? 0.565904856f
-                       : ((rdoq_level == -3) ? 0.441753954f : 0.339791059f);
-  }
-  const float lo_sharp_boost =
-      (!few_colors && rdoq_level >= -1 && c <= 1)
-          ? (((c == 1) ? 0.28f : 0.14f) * sharp_lo_rdoq)
-          : 0.0f;
-  const float eff_ref_bits =
-      base_ref * (1.0f + 0.355283588f * eob_scale + lo_sharp_boost) *
-      rdoq_ref_mul;
-  constexpr float kQuadTilt = 0.47541872f;
-  const float base_h = 0.58f;
-  const float t_ref = 0.60f;
-  const float denom_ref = b_c * (2.0f * t_ref - b_c);
 
   constexpr float kInf = 1e30f;
   float cost_buf[2][kBandStride];
@@ -544,9 +651,16 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
             ? (wi < restore_len)
             : ((wi < restore_len / 2) &&
                (is_partial_block ? (k <= 8) : (s >= 2)));
+    bool cfl_restore = false;
+    if (current == 0 && has_cfl && !few_colors && rdoq_level >= -1 &&
+        abs_ideal >= 0.42f && abs_ideal < near_dz_floor) {
+      const float y_deq_1 =
+          ((ideal >= 0.0f) ? b_c : -b_c) * deqm_y[pos] * inv_qac_y;
+      cfl_restore = (eval_cfl_delta_bits(pos, hfix, s, y_deq_1) < -0.22f);
+    }
     const bool allow_zero_to_one =
         (can_restore && abs_ideal >= restore_floor) ||
-        (!few_colors && abs_ideal >= near_dz_floor);
+        (!few_colors && abs_ideal >= near_dz_floor) || cfl_restore;
     const bool allow_round_up =
         (rdoq_level > -2) && !(few_colors && s <= 1);
     float restore_rate_mul = 1.0f;
@@ -573,6 +687,16 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
           std::max(0.50f, t0_full - (1.0f - kQuadTilt) * (raw_h - base_h));
       const float t_ratio = t_ref / perc_t0;
       float w_base = (eff_ref_bits / denom_ref) * (t_ratio * t_ratio);
+      if (!is_partial_block && (u8 >= 2 || v8 >= 2)) {
+        const float u2 = static_cast<float>(u8 * u8);
+        const float v2 = static_cast<float>(v8 * v8);
+        const float r2 = u2 + v2;
+        const float sin2_2theta = (4.0f * u2 * v2) / (r2 * r2);
+        const float hf_ramp =
+            Clamp1((r2 - 4.0f) * (1.0f / 45.0f), 0.0f, 1.0f);
+        const float oblique_gain = (c == 1) ? 0.14f : 0.10f;
+        w_base *= 1.0f + oblique_gain * hf_ramp * (0.42f - sin2_2theta);
+      }
       if (!is_partial_block && rdoq_level < 0) {
         if (hfix == 0 && s >= 2) {
           w_base *= 1.12768173f;
@@ -592,7 +716,11 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
       for (size_t ci = 1; ci < cand_count; ++ci) {
         const int32_t level = candidates[ci];
         const float deq = ReconstructedLevel(level, b_c);
-        dist_cost[ci] = d_zero_step + w_base * deq * (deq - 2.0f * ideal);
+        float dc = d_zero_step + w_base * deq * (deq - 2.0f * ideal);
+        if (has_cfl) {
+          dc += eval_cfl_delta_bits(pos, hfix, s, deq * deqm_y[pos] * inv_qac_y);
+        }
+        dist_cost[ci] = dc;
         packed_sym[ci] = PackSigned(level);
       }
     }
@@ -979,7 +1107,8 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
                      int32_t predicted_nzeros = 32,
                      int32_t* out_nzeros = nullptr,
                      uint8_t* JXL_RESTRICT rdoq_choices = nullptr,
-                     bool few_colors = false, int8_t rdoq_level = 0) {
+                     bool few_colors = false, int8_t rdoq_level = 0,
+                     const CflCouplingContext* cfl_ctx = nullptr) {
   CoefficientLayout(&ysize, &xsize);
   const float* JXL_RESTRICT qm = quantizer.InvDequantMatrix(quant_kind, c);
   const float qac = quantizer.Scale() * quant * qm_multiplier;
@@ -1075,7 +1204,7 @@ void QuantizeBlockAC(const Quantizer& quantizer, const bool error_diffusion,
         quantizer, *tcm, c, qm_multiplier, quant_kind, xsize, ysize, ord,
         covered_blocks, log2_covered_blocks, predicted_nzeros, quad_thres,
         zero_thres, eob_scale, few_colors, rdoq_level, block_in, quant,
-        block_out, rdoq_choices);
+        block_out, rdoq_choices, cfl_ctx);
     if (out_nzeros != nullptr) *out_nzeros = nz;
     return;
   }
@@ -1297,7 +1426,8 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
                                int32_t predicted_nzeros = 32,
                                int32_t* out_nzeros = nullptr,
                                uint8_t* JXL_RESTRICT rdoq_choices = nullptr,
-                               bool few_colors = false, int8_t rdoq_level = 0) {
+                               bool few_colors = false, int8_t rdoq_level = 0,
+                               float x_factor = 0.0f, float b_factor = 1.0f) {
   CoefficientLayout(&ysize, &xsize);
   if (enc_state->cparams.speed_tier > SpeedTier::kHare) {
     zero_thres[1][0] = 0.56f;
@@ -1308,11 +1438,26 @@ void QuantizeRoundtripYBlockAC(PassesEncoderState* enc_state, const size_t size,
       zero_thres[1][4 + s] = 0.0f;
     }
   }
+  CflCouplingContext cfl_ctx;
+  const float b_opp = b_factor - 1.0f;
+  const CflCouplingContext* cfl_ptr = nullptr;
+  if (tcm != nullptr && eob_scale > 0.0f && rdoq_choices != nullptr &&
+      (std::abs(x_factor) > 1e-6f || std::abs(b_opp) > 1e-6f)) {
+    cfl_ctx.x_src = inout;
+    cfl_ctx.b_src = inout + 2 * size;
+    cfl_ctx.zero_thres_x = zero_thres[0];
+    cfl_ctx.zero_thres_b = zero_thres[2];
+    cfl_ctx.x_factor = x_factor;
+    cfl_ctx.b_opp_factor = b_opp;
+    cfl_ctx.x_qm_mul = enc_state->x_qm_multiplier;
+    cfl_ctx.b_qm_mul = enc_state->b_qm_multiplier;
+    cfl_ptr = &cfl_ctx;
+  }
   QuantizeBlockAC(quantizer, error_diffusion, 1, 1.0f, quant_kind, xsize, ysize,
                   zero_thres[1], eob_scale, inout + size, quant,
                   quantized + size, tcm, ord, covered_blocks,
                   log2_covered_blocks, predicted_nzeros, out_nzeros,
-                  rdoq_choices, few_colors, rdoq_level);
+                  rdoq_choices, few_colors, rdoq_level, cfl_ptr);
 
   const float* JXL_RESTRICT dequant_matrix =
       quantizer.DequantMatrix(quant_kind, 1);
@@ -1465,10 +1610,12 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
           enc_state->shared.ac_strategy.ConstRow(block_group_rect, by);
       for (size_t tx = 0; tx < DivCeil(xsize_blocks, kColorTileDimInBlocks);
            tx++) {
-        const auto x_factor =
-            Set(d, enc_state->shared.cmap.base().YtoXRatio(row_cmap[0][tx]));
-        const auto b_factor =
-            Set(d, enc_state->shared.cmap.base().YtoBRatio(row_cmap[2][tx]));
+        const float x_factor_f =
+            enc_state->shared.cmap.base().YtoXRatio(row_cmap[0][tx]);
+        const float b_factor_f =
+            enc_state->shared.cmap.base().YtoBRatio(row_cmap[2][tx]);
+        const auto x_factor = Set(d, x_factor_f);
+        const auto b_factor = Set(d, b_factor_f);
         for (size_t bx = tx * kColorTileDimInBlocks;
              bx < xsize_blocks && bx < (tx + 1) * kColorTileDimInBlocks; ++bx) {
           const AcStrategy acs = ac_strategy_row[bx];
@@ -1591,7 +1738,7 @@ Status ComputeCoefficients(size_t group_idx, PassesEncoderState* enc_state,
               acs.Strategy(), xblocks, yblocks, zero_thres, eob_scale,
               kDefaultQuantBias, quant_ac, coeffs_in, quantized, tcm, ord,
               covered_blocks, log2_covered_blocks, pred_nz_y, &final_nz_y,
-              rdoq_choices, few_colors, rdoq_lvl);
+              rdoq_choices, few_colors, rdoq_lvl, x_factor_f, b_factor_f);
           if (tcm != nullptr) {
             const int32_t shifted_nz_y = static_cast<int32_t>(
                 (final_nz_y + covered_blocks - 1) >> log2_covered_blocks);
@@ -2071,18 +2218,18 @@ Status EvalAcGroupCacheImpl(const PassesEncoderState* enc_state,
       uint8_t* rdoq_ptr = use_rdoq ? rdoq_choices : nullptr;
       int32_t final_nz[3] = {0, 0, 0};
 
+      const float x_factor_f = shared.cmap.base().YtoXRatio(tr.cur_ytox_q);
+      const float b_factor_f = shared.cmap.base().YtoBRatio(tr.cur_ytob_q);
       QuantizeRoundtripYBlockAC(
           const_cast<PassesEncoderState*>(enc_state), size, shared.quantizer,
           error_diffusion, acs.Strategy(), xblocks, yblocks, zero_thres,
           eob_scale, kDefaultQuantBias, quant_ac, coeffs_in, quantized, tcm_q,
           ord, covered_blocks, log2_covered_blocks, pred_nz[1], &final_nz[1],
-          rdoq_ptr, tr.few_colors, eff_rdoq_level);
+          rdoq_ptr, tr.few_colors, eff_rdoq_level, x_factor_f, b_factor_f);
 
       constexpr HWY_CAPPED(float, kDCTBlockSize) df;
-      const auto x_factor =
-          Set(df, shared.cmap.base().YtoXRatio(tr.cur_ytox_q));
-      const auto b_factor =
-          Set(df, shared.cmap.base().YtoBRatio(tr.cur_ytob_q));
+      const auto x_factor = Set(df, x_factor_f);
+      const auto b_factor = Set(df, b_factor_f);
       for (size_t k = 0; k < size; k += Lanes(df)) {
         const auto in_x = Load(df, coeffs_in + k);
         const auto in_y = Load(df, coeffs_in + size + k);
@@ -2573,16 +2720,18 @@ Status EvalAcsBoxCandidateImpl(const PassesEncoderState* enc_state,
       }
 
       int32_t final_nz[3] = {0, 0, 0};
+      const float x_factor_f = shared.cmap.base().YtoXRatio(sp.ytox_q);
+      const float b_factor_f = shared.cmap.base().YtoBRatio(sp.ytob_q);
       QuantizeRoundtripYBlockAC(
           const_cast<PassesEncoderState*>(enc_state), size, shared.quantizer,
           error_diffusion, acs.Strategy(), xblocks, yblocks, zero_thres,
           eob_scale, kDefaultQuantBias, quant_ac, coeffs_in, quantized, tcm,
           ord, covered_blocks, log2_covered_blocks, pred_nz[1], &final_nz[1],
-          rdoq_choices, few_colors, sp.rdoq_lvl);
+          rdoq_choices, few_colors, sp.rdoq_lvl, x_factor_f, b_factor_f);
 
       constexpr HWY_CAPPED(float, kDCTBlockSize) df;
-      const auto x_factor = Set(df, shared.cmap.base().YtoXRatio(sp.ytox_q));
-      const auto b_factor = Set(df, shared.cmap.base().YtoBRatio(sp.ytob_q));
+      const auto x_factor = Set(df, x_factor_f);
+      const auto b_factor = Set(df, b_factor_f);
       for (size_t i = 0; i < size; i += Lanes(df)) {
         const auto in_x = Load(df, coeffs_in + i);
         const auto in_y = Load(df, coeffs_in + size + i);
