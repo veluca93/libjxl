@@ -7106,58 +7106,73 @@ void ApplyLocalGabBox(bool gab, const float gab_w_f[3][3],
                       const Image3F* feat_ptr, size_t xsize, size_t ysize,
                       const Image3F& cur_pre_gab, const Image3F& patch_src,
                       size_t fx0, size_t fy0, size_t lw, size_t lh,
-                      Image3F* dst_xyb) {
-  for (size_t iy = 0; iy < lh; ++iy) {
-    const size_t y = fy0 + iy;
+                      Image3F* dst_xyb, bool include_outer_halo = false) {
+  if (lw == 0 || lh == 0 || fx0 >= xsize || fy0 >= ysize) return;
+  lw = std::min(lw, xsize - fx0);
+  lh = std::min(lh, ysize - fy0);
+  const size_t gfx0 = (gab && include_outer_halo && fx0 > 0) ? (fx0 - 1) : fx0;
+  const size_t gfy0 = (gab && include_outer_halo && fy0 > 0) ? (fy0 - 1) : fy0;
+  const size_t gfx1 = (gab && include_outer_halo && fx0 + lw < xsize)
+                          ? (fx0 + lw + 1)
+                          : (fx0 + lw);
+  const size_t gfy1 = (gab && include_outer_halo && fy0 + lh < ysize)
+                          ? (fy0 + lh + 1)
+                          : (fy0 + lh);
+  const size_t glw = gfx1 - gfx0;
+  const size_t glh = gfy1 - gfy0;
+  for (size_t iy = 0; iy < glh; ++iy) {
+    const size_t y = gfy0 + iy;
     const size_t yt = static_cast<size_t>(
         Mirror(static_cast<int64_t>(y) - 1, static_cast<int64_t>(ysize)));
     const size_t yb = static_cast<size_t>(
         Mirror(static_cast<int64_t>(y) + 1, static_cast<int64_t>(ysize)));
+    const bool ym_in = (y >= fy0 && y < fy0 + lh);
     const bool yt_in = (yt >= fy0 && yt < fy0 + lh);
     const bool yb_in = (yb >= fy0 && yb < fy0 + lh);
     for (size_t c = 0; c < 3; ++c) {
-      float* JXL_RESTRICT out_r = dst_xyb->PlaneRow(c, y) + fx0;
+      float* JXL_RESTRICT out_r = dst_xyb->PlaneRow(c, y) + gfx0;
       if (!gab) {
-        memcpy(out_r, patch_src.ConstPlaneRow(c, y) + fx0, lw * sizeof(float));
+        memcpy(out_r, patch_src.ConstPlaneRow(c, y) + gfx0,
+               glw * sizeof(float));
         continue;
       }
-      const float* rt = yt_in ? patch_src.ConstPlaneRow(c, yt)
-                              : cur_pre_gab.ConstPlaneRow(c, yt);
-      const float* rm_p = patch_src.ConstPlaneRow(c, y);
+      const float* rt_p = yt_in ? patch_src.ConstPlaneRow(c, yt) : nullptr;
+      const float* rt_c = cur_pre_gab.ConstPlaneRow(c, yt);
+      const float* rm_p = ym_in ? patch_src.ConstPlaneRow(c, y) : nullptr;
       const float* rm_c = cur_pre_gab.ConstPlaneRow(c, y);
-      const float* rb = yb_in ? patch_src.ConstPlaneRow(c, yb)
-                              : cur_pre_gab.ConstPlaneRow(c, yb);
+      const float* rb_p = yb_in ? patch_src.ConstPlaneRow(c, yb) : nullptr;
+      const float* rb_c = cur_pre_gab.ConstPlaneRow(c, yb);
       const float w0 = gab_w_f[c][0];
       const float w1 = gab_w_f[c][1];
       const float w2 = gab_w_f[c][2];
-      for (size_t ix = 0; ix < lw; ++ix) {
-        const size_t x = fx0 + ix;
+      for (size_t ix = 0; ix < glw; ++ix) {
+        const size_t x = gfx0 + ix;
         const size_t xl = (x > 0) ? (x - 1) : 0;
         const size_t xr = (x + 1 < xsize) ? (x + 1) : (xsize - 1);
+        const bool xm_in = (x >= fx0 && x < fx0 + lw);
         const bool xl_in = (xl >= fx0 && xl < fx0 + lw);
         const bool xr_in = (xr >= fx0 && xr < fx0 + lw);
-        const float s0 = rm_p[x];
-        const float s1 = (xl_in ? rm_p[xl] : rm_c[xl]) +
-                         (xr_in ? rm_p[xr] : rm_c[xr]) + rt[x] + rb[x];
-        const float tl = (yt_in && xl_in) ? patch_src.ConstPlaneRow(c, yt)[xl]
-                                          : cur_pre_gab.ConstPlaneRow(c, yt)[xl];
-        const float tr = (yt_in && xr_in) ? patch_src.ConstPlaneRow(c, yt)[xr]
-                                          : cur_pre_gab.ConstPlaneRow(c, yt)[xr];
-        const float bl = (yb_in && xl_in) ? patch_src.ConstPlaneRow(c, yb)[xl]
-                                          : cur_pre_gab.ConstPlaneRow(c, yb)[xl];
-        const float br = (yb_in && xr_in) ? patch_src.ConstPlaneRow(c, yb)[xr]
-                                          : cur_pre_gab.ConstPlaneRow(c, yb)[xr];
-        out_r[ix] = s0 * w0 + s1 * w1 + (tl + tr + bl + br) * w2;
+        const float s0 = (ym_in && xm_in) ? rm_p[x] : rm_c[x];
+        const float l_v = (ym_in && xl_in) ? rm_p[xl] : rm_c[xl];
+        const float r_v = (ym_in && xr_in) ? rm_p[xr] : rm_c[xr];
+        const float t_v = (yt_in && xm_in) ? rt_p[x] : rt_c[x];
+        const float b_v = (yb_in && xm_in) ? rb_p[x] : rb_c[x];
+        const float tl = (yt_in && xl_in) ? rt_p[xl] : rt_c[xl];
+        const float tr = (yt_in && xr_in) ? rt_p[xr] : rt_c[xr];
+        const float bl = (yb_in && xl_in) ? rb_p[xl] : rb_c[xl];
+        const float br = (yb_in && xr_in) ? rb_p[xr] : rb_c[xr];
+        out_r[ix] = s0 * w0 + (l_v + r_v + t_v + b_v) * w1 +
+                    (tl + tr + bl + br) * w2;
       }
     }
   }
   if (feat_ptr != nullptr) {
     for (size_t c = 0; c < 3; ++c) {
-      for (size_t iy = 0; iy < lh; ++iy) {
-        float* JXL_RESTRICT out_r = dst_xyb->PlaneRow(c, fy0 + iy) + fx0;
+      for (size_t iy = 0; iy < glh; ++iy) {
+        float* JXL_RESTRICT out_r = dst_xyb->PlaneRow(c, gfy0 + iy) + gfx0;
         const float* JXL_RESTRICT rf =
-            feat_ptr->ConstPlaneRow(c, fy0 + iy) + fx0;
-        for (size_t ix = 0; ix < lw; ++ix) out_r[ix] += rf[ix];
+            feat_ptr->ConstPlaneRow(c, gfy0 + iy) + gfx0;
+        for (size_t ix = 0; ix < glw; ++ix) out_r[ix] += rf[ix];
       }
     }
   }
@@ -8382,6 +8397,17 @@ Status RefineQuantFieldClosedLoop(
     LoopFilter best_lf;
     LoopFilter base_gab_lf;
     std::vector<LoopFilter> cand_lfs;
+    struct CandTrPol {
+      double score;
+      uint32_t tr_idx;
+      size_t group;
+      int16_t ref_q;
+    };
+    std::vector<CandTrPol> tr_cands;
+    size_t quant_table_counts[kNumQuantTables] = {};
+    float gab_w_f[3][3] = {};
+    std::array<uint8_t, 16> tile_pats[12] = {};
+    bool pat_is_rel[12] = {};
   };
   auto st_ptr = jxl::make_unique<ClosedLoopRdoState>();
   ClosedLoopRdoState& st = *st_ptr;
@@ -9300,7 +9326,7 @@ Status RefineQuantFieldClosedLoop(
             if (qe.kind == Stage2MoveKind::kTrRdoqMinus) {
               nrl = static_cast<int8_t>(std::max<int>(-4, orl - 1));
             } else if (qe.kind == Stage2MoveKind::kTrRdoqPlus) {
-              if (orl == 0) nrl = 1;
+              if (orl >= -1 && orl < 1) nrl = static_cast<int8_t>(orl + 1);
             } else if (qe.kind == Stage2MoveKind::kTrUnsignalDip) {
               if (orl == 0 && oq < qe.ref_q) {
                 const int32_t cand_q = qe.ref_q;
@@ -10827,7 +10853,8 @@ Status RefineQuantFieldClosedLoop(
   if (enc_state->orig_opsin != nullptr &&
       enc_state->orig_opsin->xsize() >= xsize &&
       enc_state->orig_opsin->ysize() >= ysize) {
-    size_t quant_table_counts[kNumQuantTables] = {};
+    auto& quant_table_counts = st.quant_table_counts;
+    memset(quant_table_counts, 0, sizeof(quant_table_counts));
     for (size_t g = 0; g < num_groups; ++g) {
       for (const AcTransformCache& tr : group_caches[g].transforms) {
         const size_t t_idx =
@@ -10852,7 +10879,8 @@ Status RefineQuantFieldClosedLoop(
     double cur_table_tax_bits = init_table_tax_bits;
     double cum_acs_sym_delta_bits = 0.0;
 
-    float gab_w_f[3][3] = {};
+    auto& gab_w_f = st.gab_w_f;
+    memset(gab_w_f, 0, sizeof(gab_w_f));
     if (lf.gab) {
       const float rw1[3] = {lf.gab_x_weight1, lf.gab_y_weight1,
                             lf.gab_b_weight1};
@@ -10868,9 +10896,11 @@ Status RefineQuantFieldClosedLoop(
 
     auto apply_local_gab_box = [&](const Image3F& patch_src, size_t fx0,
                                    size_t fy0, size_t lw, size_t lh,
-                                   Image3F* dst_xyb) {
+                                   Image3F* dst_xyb,
+                                   bool include_outer_halo = false) {
       ApplyLocalGabBox(lf.gab, gab_w_f, feat_ptr, xsize, ysize, cur_pre_gab,
-                       patch_src, fx0, fy0, lw, lh, dst_xyb);
+                       patch_src, fx0, fy0, lw, lh, dst_xyb,
+                       include_outer_halo);
     };
 
     auto swap_box_transforms = [](std::vector<AcTransformCache>* trs,
@@ -11238,6 +11268,10 @@ Status RefineQuantFieldClosedLoop(
                        aff_dirty[gi].xsize() * sizeof(float));
               }
             }
+            apply_local_gab_box(cur_pre_gab, aff_dirty[gi].x0(),
+                                aff_dirty[gi].y0(), aff_dirty[gi].xsize(),
+                                aff_dirty[gi].ysize(), &fine_pre_gab,
+                                /*include_outer_halo=*/true);
           }
           cur_group_bits[g] = aff_cand_bits[gi];
         }
@@ -11252,7 +11286,7 @@ Status RefineQuantFieldClosedLoop(
           apply_local_gab_box(cur_pre_gab,
                               cache.px0 + u.comp->bx0 * kBlockDim,
                               cache.py0 + u.comp->by0 * kBlockDim, bw_px, bh_px,
-                              &fine_pre_gab);
+                              &fine_pre_gab, /*include_outer_halo=*/true);
           u.comp->committed = true;
           ++acs_moves;
         }
@@ -11539,8 +11573,9 @@ Status RefineQuantFieldClosedLoop(
                     uint32_t best_act = blk_act[dy][dx];
                     for (size_t iy = 0; iy < sch; ++iy) {
                       for (size_t ix = 0; ix < scw; ++ix) {
-                        q_max = std::max(q_max, blk_q[dy + iy][dx + ix]);
-                        q_sum += blk_q[dy + iy][dx + ix];
+                        const int32_t qv = blk_q[dy + iy][dx + ix];
+                        q_max = std::max(q_max, qv);
+                        q_sum += qv;
                         rdoq_best =
                             std::max(rdoq_best, blk_rdoq[dy + iy][dx + ix]);
                         const uint32_t a = blk_act[dy + iy][dx + ix];
@@ -11937,9 +11972,9 @@ Status RefineQuantFieldClosedLoop(
                 }
               }
             }
-            apply_local_gab_box(cur_pre_gab, cache.px0 + bx0 * kBlockDim,
-                                cache.py0 + by0 * kBlockDim, box_w_px, box_h_px,
-                                &fine_pre_gab);
+            apply_local_gab_box(cur_pre_gab, px_x0, px_y0, px_x1 - px_x0,
+                                px_y1 - px_y0, &fine_pre_gab,
+                                /*include_outer_halo=*/true);
             cur_bits = new_ac_qf_bits;
             cur_group_bits[g] = item.cand_ac_qf_bits;
             cum_acs_sym_delta_bits += delta_acs_sym;
@@ -12427,6 +12462,12 @@ Status RefineQuantFieldClosedLoop(
         uint16_t px;
         uint16_t py;
       };
+      struct DcAtom {
+        uint8_t mc;
+        uint16_t lx;
+        uint16_t ly;
+        int16_t dq;
+      };
       struct DcReclaimCand {
         double score;
         uint32_t dg;
@@ -12441,24 +12482,38 @@ Status RefineQuantFieldClosedLoop(
         uint16_t bx;
         uint16_t by;
       };
+      struct SalDcQuad {
+        double err;
+        uint32_t dg;
+        uint16_t bx;
+        uint16_t by;
+      };
       struct Pass2GDcState {
         Tree dc_pilot_tree;
         std::vector<std::array<FlatTree, 3>> dc_flat_trees;
         std::vector<std::array<size_t, 3>> dc_num_props;
         Properties dc_props_scratch;
+        std::vector<Channel> dc_ref_vec;
+        Properties dbg_props;
         std::vector<DcSingleHist> dc_leaf_hists;
         std::vector<DcSingleHist> dc_chan_hists;
         AlignedMemory dc_fmem;
         float gab_w_2g[3][3] = {};
         DcStencilPt pts[17] = {};
-        float delta_dc[3][3][3] = {};
+        DcStencilPt union_pts[80] = {};
+        int32_t saved_q[12] = {};
+        size_t uniq_bx[4] = {};
+        size_t uniq_by[4] = {};
+        float saved_u[4][3] = {};
+        float delta_dc_4x4[3][4][4] = {};
+        float new_dec_4x4[3][4][4] = {};
+        uint32_t aff_trs_buf[16] = {};
         float tr_dc_diff[64] = {};
-        float new_u[3] = {};
-        float new_dec[3][3][3] = {};
-        float u_tmp[3] = {};
-        float dec_tmp[3][3][3] = {};
+        DcAtom cand_atoms[12] = {};
+        DcAtom best_atoms[12] = {};
         std::vector<DcReclaimCand> dc_reclaims;
         std::vector<SalDcBlk> sal_dc_blks;
+        std::vector<SalDcQuad> sal_dc_quads;
       };
       auto p2g_ptr = jxl::make_unique<Pass2GDcState>();
       Pass2GDcState& p2g = *p2g_ptr;
@@ -12492,15 +12547,20 @@ Status RefineQuantFieldClosedLoop(
       }
 
       p2g.dc_props_scratch.assign(max_dc_props, 0);
-      JXL_ASSIGN_OR_RETURN(
-          Channel dc_ref_scratch,
-          Channel::Create(
-              memory_manager,
-              std::max<size_t>(1, max_dc_props - kNumNonrefProperties),
-              max_dcr_w));
+      p2g.dc_ref_vec.clear();
+      {
+        JXL_ASSIGN_OR_RETURN(
+            Channel c_ref,
+            Channel::Create(
+                memory_manager,
+                std::max<size_t>(1, max_dc_props - kNumNonrefProperties),
+                max_dcr_w));
+        p2g.dc_ref_vec.push_back(std::move(c_ref));
+      }
 
       auto eval_dc_tree_pixel = [&](size_t dg, size_t mc_eval, size_t px,
                                     size_t py, size_t* out_ctx) -> int32_t {
+        Channel& dc_ref_s = p2g.dc_ref_vec[0];
         const Image* dc_img = modular_frame_encoder->VarDCTDCImage(dg);
         const Channel& ch = dc_img->channel[mc_eval];
         const size_t w = ch.w;
@@ -12529,9 +12589,9 @@ Status RefineQuantFieldClosedLoop(
               static_cast<PropertyVal>(left_p + top_p - tl_p);
         }
         const size_t num_extra = nprops - kNumNonrefProperties;
-        dc_ref_scratch.w = num_extra;
+        dc_ref_s.w = num_extra;
         if (num_extra > 0) {
-          pixel_type* JXL_RESTRICT rp = dc_ref_scratch.Row(px);
+          pixel_type* JXL_RESTRICT rp = dc_ref_s.Row(px);
           for (size_t k = 0; k < num_extra; ++k) rp[k] = 0;
           size_t offset = 0;
           for (int32_t j = static_cast<int32_t>(mc_eval) - 1;
@@ -12560,7 +12620,7 @@ Status RefineQuantFieldClosedLoop(
         MATreeLookup lookup(p2g.dc_flat_trees[dg][mc_eval]);
         const PredictionResult res = PredictTreeNoWP(
             &p2g.dc_props_scratch, w, row + px, onerow, static_cast<int>(px),
-            static_cast<int>(py), lookup, dc_ref_scratch);
+            static_cast<int>(py), lookup, dc_ref_s);
         if (out_ctx != nullptr) {
           *out_ctx = std::min<size_t>(static_cast<size_t>(res.context),
                                       num_dc_leaves - 1);
@@ -12580,31 +12640,35 @@ Status RefineQuantFieldClosedLoop(
           const Channel& ch = dc_img->channel[mc];
 #if JXL_IS_DEBUG_BUILD
           const size_t nprops_dbg = p2g.dc_num_props[dg][mc];
-          Properties dbg_props(nprops_dbg, 0);
+          p2g.dbg_props.assign(nprops_dbg, 0);
           std::array<pixel_type, kNumStaticProperties> dbg_sp = {
               {static_cast<pixel_type>(mc),
                static_cast<pixel_type>(
                    ModularStreamId::VarDCTDC(dg).ID(shared.frame_dim))}};
-          JXL_ASSIGN_OR_RETURN(
-              Channel dbg_refs,
-              Channel::Create(memory_manager, nprops_dbg - kNumNonrefProperties,
-                              ch.w));
+          while (p2g.dc_ref_vec.size() > 1) p2g.dc_ref_vec.pop_back();
+          {
+            JXL_ASSIGN_OR_RETURN(
+                Channel c_dbg,
+                Channel::Create(memory_manager,
+                                nprops_dbg - kNumNonrefProperties, ch.w));
+            p2g.dc_ref_vec.push_back(std::move(c_dbg));
+          }
           MATreeLookup dbg_lookup(p2g.dc_flat_trees[dg][mc]);
 #endif
           for (size_t ly = 0; ly < dcr.ysize(); ++ly) {
 #if JXL_IS_DEBUG_BUILD
             PrecomputeReferences(ch, ly, *dc_img, static_cast<uint32_t>(mc),
-                                 &dbg_refs);
-            InitPropsRow(&dbg_props, dbg_sp, static_cast<int>(ly));
+                                 &p2g.dc_ref_vec[1]);
+            InitPropsRow(&p2g.dbg_props, dbg_sp, static_cast<int>(ly));
 #endif
             for (size_t lx = 0; lx < dcr.xsize(); ++lx) {
               size_t ctx = 0;
               const int32_t res = eval_dc_tree_pixel(dg, mc, lx, ly, &ctx);
 #if JXL_IS_DEBUG_BUILD
               const PredictionResult dbg_pr = PredictTreeNoWP(
-                  &dbg_props, ch.w, ch.Row(ly) + lx, ch.plane.PixelsPerRow(),
+                  &p2g.dbg_props, ch.w, ch.Row(ly) + lx, ch.plane.PixelsPerRow(),
                   static_cast<int>(lx), static_cast<int>(ly), dbg_lookup,
-                  dbg_refs);
+                  p2g.dc_ref_vec[1]);
               const size_t dbg_ctx = std::min<size_t>(
                   static_cast<size_t>(dbg_pr.context), num_dc_leaves - 1);
               const int32_t dbg_res = static_cast<int32_t>(
@@ -12777,61 +12841,106 @@ Status RefineQuantFieldClosedLoop(
         return true;
       };
 
-      auto price_dc_step = [&](size_t dg, size_t mc, size_t lx, size_t ly,
-                               int32_t dq, bool allow_new_sym,
-                               double* out_delta_bits) -> bool {
+      auto price_dc_atoms = [&](size_t dg, const DcAtom* atoms, size_t n_atoms,
+                                bool allow_new_sym,
+                                double* out_delta_bits) -> bool {
+        if (n_atoms == 0 || n_atoms > 12) return false;
         Image* dc_img = modular_frame_encoder->VarDCTDCImage(dg);
-        Plane<pixel_type>& pl = dc_img->channel[mc].plane;
-        const int32_t q_old = pl.ConstRow(ly)[lx];
-        const int64_t q_cand64 = static_cast<int64_t>(q_old) + dq;
-        if (clamp_i16 && (q_cand64 < -32768 || q_cand64 > 32767)) return false;
-        const int32_t q_new = static_cast<int32_t>(q_cand64);
-
-        size_t np = 0;
-        collect_dc_stencil(dg, mc, lx, ly, p2g.pts, &np);
+        size_t n_union = 0;
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const DcAtom& a = atoms[ai];
+          const int32_t q_old = dc_img->channel[a.mc].plane.ConstRow(a.ly)[a.lx];
+          p2g.saved_q[ai] = q_old;
+          const int64_t q_cand64 = static_cast<int64_t>(q_old) + a.dq;
+          if (clamp_i16 && (q_cand64 < -32768 || q_cand64 > 32767)) {
+            return false;
+          }
+          size_t np = 0;
+          collect_dc_stencil(dg, a.mc, a.lx, a.ly, p2g.pts, &np);
+          for (size_t i = 0; i < np; ++i) {
+            const DcStencilPt pt = p2g.pts[i];
+            bool dup = false;
+            for (size_t u = 0; u < n_union; ++u) {
+              if (p2g.union_pts[u].mc_p == pt.mc_p &&
+                  p2g.union_pts[u].px == pt.px &&
+                  p2g.union_pts[u].py == pt.py) {
+                dup = true;
+                break;
+              }
+            }
+            if (!dup && n_union < 80) p2g.union_pts[n_union++] = pt;
+          }
+        }
 
         double old_bits = 0.0;
-        for (size_t i = 0; i < np; ++i) {
+        for (size_t i = 0; i < n_union; ++i) {
           size_t ctx = 0;
-          const int32_t r_val = eval_dc_tree_pixel(
-              dg, p2g.pts[i].mc_p, p2g.pts[i].px, p2g.pts[i].py, &ctx);
+          const int32_t r_val =
+              eval_dc_tree_pixel(dg, p2g.union_pts[i].mc_p, p2g.union_pts[i].px,
+                                 p2g.union_pts[i].py, &ctx);
           double b = 0.0;
-          eval_dc_token_bits(p2g.pts[i].mc_p, ctx, r_val,
+          eval_dc_token_bits(p2g.union_pts[i].mc_p, ctx, r_val,
                              /*allow_new_sym=*/true, &b);
           old_bits += b;
         }
 
-        pl.Row(ly)[lx] = q_new;
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const DcAtom& a = atoms[ai];
+          dc_img->channel[a.mc].plane.Row(a.ly)[a.lx] =
+              p2g.saved_q[ai] + static_cast<int32_t>(a.dq);
+        }
         bool ok = true;
         double new_bits = 0.0;
-        for (size_t i = 0; i < np; ++i) {
+        for (size_t i = 0; i < n_union; ++i) {
           size_t ctx = 0;
-          const int32_t r_val = eval_dc_tree_pixel(
-              dg, p2g.pts[i].mc_p, p2g.pts[i].px, p2g.pts[i].py, &ctx);
+          const int32_t r_val =
+              eval_dc_tree_pixel(dg, p2g.union_pts[i].mc_p, p2g.union_pts[i].px,
+                                 p2g.union_pts[i].py, &ctx);
           double b = 0.0;
-          if (!eval_dc_token_bits(p2g.pts[i].mc_p, ctx, r_val, allow_new_sym,
-                                  &b)) {
+          if (!eval_dc_token_bits(p2g.union_pts[i].mc_p, ctx, r_val,
+                                  allow_new_sym, &b)) {
             ok = false;
             break;
           }
           new_bits += b;
         }
-        pl.Row(ly)[lx] = q_old;
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const DcAtom& a = atoms[ai];
+          dc_img->channel[a.mc].plane.Row(a.ly)[a.lx] = p2g.saved_q[ai];
+        }
         if (!ok) return false;
         *out_delta_bits = new_bits - old_bits;
         return true;
       };
 
-      auto commit_dc_hist_step = [&](size_t dg, size_t mc, size_t lx, size_t ly,
-                                     int32_t q_new) {
-        Plane<pixel_type>& pl =
-            modular_frame_encoder->VarDCTDCImage(dg)->channel[mc].plane;
-        size_t np = 0;
-        collect_dc_stencil(dg, mc, lx, ly, p2g.pts, &np);
-        for (size_t i = 0; i < np; ++i) {
+      auto commit_dc_hist_atoms = [&](size_t dg, const DcAtom* atoms,
+                                      size_t n_atoms) {
+        Image* dc_img = modular_frame_encoder->VarDCTDCImage(dg);
+        size_t n_union = 0;
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const DcAtom& a = atoms[ai];
+          p2g.saved_q[ai] = dc_img->channel[a.mc].plane.ConstRow(a.ly)[a.lx];
+          size_t np = 0;
+          collect_dc_stencil(dg, a.mc, a.lx, a.ly, p2g.pts, &np);
+          for (size_t i = 0; i < np; ++i) {
+            const DcStencilPt pt = p2g.pts[i];
+            bool dup = false;
+            for (size_t u = 0; u < n_union; ++u) {
+              if (p2g.union_pts[u].mc_p == pt.mc_p &&
+                  p2g.union_pts[u].px == pt.px &&
+                  p2g.union_pts[u].py == pt.py) {
+                dup = true;
+                break;
+              }
+            }
+            if (!dup && n_union < 80) p2g.union_pts[n_union++] = pt;
+          }
+        }
+        for (size_t i = 0; i < n_union; ++i) {
           size_t ctx = 0;
-          const int32_t r_val = eval_dc_tree_pixel(
-              dg, p2g.pts[i].mc_p, p2g.pts[i].px, p2g.pts[i].py, &ctx);
+          const int32_t r_val =
+              eval_dc_tree_pixel(dg, p2g.union_pts[i].mc_p, p2g.union_pts[i].px,
+                                 p2g.union_pts[i].py, &ctx);
           uint32_t tok = 0;
           uint32_t nb = 0;
           uint32_t eb = 0;
@@ -12841,18 +12950,23 @@ Status RefineQuantFieldClosedLoop(
             p2g.dc_leaf_hists[ctx].hist[tok]--;
           }
           if (p2g.dc_leaf_hists[ctx].tot > 0) p2g.dc_leaf_hists[ctx].tot--;
-          if (p2g.dc_chan_hists[p2g.pts[i].mc_p].hist[tok] > 0) {
-            p2g.dc_chan_hists[p2g.pts[i].mc_p].hist[tok]--;
+          if (p2g.dc_chan_hists[p2g.union_pts[i].mc_p].hist[tok] > 0) {
+            p2g.dc_chan_hists[p2g.union_pts[i].mc_p].hist[tok]--;
           }
-          if (p2g.dc_chan_hists[p2g.pts[i].mc_p].tot > 0) {
-            p2g.dc_chan_hists[p2g.pts[i].mc_p].tot--;
+          if (p2g.dc_chan_hists[p2g.union_pts[i].mc_p].tot > 0) {
+            p2g.dc_chan_hists[p2g.union_pts[i].mc_p].tot--;
           }
         }
-        pl.Row(ly)[lx] = q_new;
-        for (size_t i = 0; i < np; ++i) {
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const DcAtom& a = atoms[ai];
+          dc_img->channel[a.mc].plane.Row(a.ly)[a.lx] =
+              p2g.saved_q[ai] + static_cast<int32_t>(a.dq);
+        }
+        for (size_t i = 0; i < n_union; ++i) {
           size_t ctx = 0;
-          const int32_t r_val = eval_dc_tree_pixel(
-              dg, p2g.pts[i].mc_p, p2g.pts[i].px, p2g.pts[i].py, &ctx);
+          const int32_t r_val =
+              eval_dc_tree_pixel(dg, p2g.union_pts[i].mc_p, p2g.union_pts[i].px,
+                                 p2g.union_pts[i].py, &ctx);
           uint32_t tok = 0;
           uint32_t nb = 0;
           uint32_t eb = 0;
@@ -12860,71 +12974,108 @@ Status RefineQuantFieldClosedLoop(
           tok = std::min<uint32_t>(tok, 127u);
           p2g.dc_leaf_hists[ctx].hist[tok]++;
           p2g.dc_leaf_hists[ctx].tot++;
-          p2g.dc_chan_hists[p2g.pts[i].mc_p].hist[tok]++;
-          p2g.dc_chan_hists[p2g.pts[i].mc_p].tot++;
+          p2g.dc_chan_hists[p2g.union_pts[i].mc_p].hist[tok]++;
+          p2g.dc_chan_hists[p2g.union_pts[i].mc_p].tot++;
         }
       };
 
-      // Evaluates or commits the pixel-domain LLF shift induced by changing
-      // q(bx, by) on modular channel `mc` by `dq`.
-      auto apply_dc_perturbation =
-          [&](size_t dg, size_t bx, size_t by, size_t mc, int32_t dq,
-              Image3F* target_pre_gab, bool commit_state, Rect* out_px_box,
-              float out_new_u[3], float out_new_dec[3][3][3]) -> bool {
+      // Evaluates or commits the pixel-domain LLF shift induced by a set of
+      // single-block or 2x2-quad DC residual atoms within DC group `dg`.
+      auto apply_dc_atoms = [&](size_t dg, const DcAtom* atoms, size_t n_atoms,
+                                Image3F* target_pre_gab, bool commit_state,
+                                Rect* out_px_box) -> bool {
+        if (n_atoms == 0 || n_atoms > 12) return false;
+        const Rect dcr = shared.frame_dim.DCGroupRect(dg);
         const float mul_deq =
             1.0f /
             static_cast<float>(1u << modular_frame_encoder->extra_dc_precision[dg]);
-        float old_u[3];
-        for (size_t c = 0; c < 3; ++c) {
-          old_u[c] = st.dc_unsmoothed.ConstPlaneRow(c, by)[bx];
-          out_new_u[c] = old_u[c];
+
+        size_t n_uniq_blk = 0;
+        size_t bx_min = xsize_blocks;
+        size_t by_min = ysize_blocks;
+        size_t bx_max = 0;
+        size_t by_max = 0;
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const size_t bx = dcr.x0() + atoms[ai].lx;
+          const size_t by = dcr.y0() + atoms[ai].ly;
+          bx_min = std::min(bx_min, bx);
+          by_min = std::min(by_min, by);
+          bx_max = std::max(bx_max, bx);
+          by_max = std::max(by_max, by);
+          bool seen_b = false;
+          for (size_t u = 0; u < n_uniq_blk; ++u) {
+            if (p2g.uniq_bx[u] == bx && p2g.uniq_by[u] == by) {
+              seen_b = true;
+              break;
+            }
+          }
+          if (!seen_b) {
+            if (n_uniq_blk >= 4) return false;
+            p2g.uniq_bx[n_uniq_blk] = bx;
+            p2g.uniq_by[n_uniq_blk] = by;
+            for (size_t c = 0; c < 3; ++c) {
+              p2g.saved_u[n_uniq_blk][c] =
+                  st.dc_unsmoothed.ConstPlaneRow(c, by)[bx];
+            }
+            ++n_uniq_blk;
+          }
         }
-        if (mc == 0) {
-          const float du_y = static_cast<float>(dq) * (dc_factors[1] * mul_deq);
-          out_new_u[1] += du_y;
-          out_new_u[0] += du_y * cfl_dc[0];
-          out_new_u[2] += du_y * cfl_dc[2];
-        } else if (mc == 1) {
-          out_new_u[0] += static_cast<float>(dq) * (dc_factors[0] * mul_deq);
-        } else {
-          out_new_u[2] += static_cast<float>(dq) * (dc_factors[2] * mul_deq);
-        }
-        for (size_t c = 0; c < 3; ++c) {
-          st.dc_unsmoothed.PlaneRow(c, by)[bx] = out_new_u[c];
+        if (bx_max - bx_min > 1 || by_max - by_min > 1) return false;
+
+        for (size_t ai = 0; ai < n_atoms; ++ai) {
+          const DcAtom& a = atoms[ai];
+          const size_t bx = dcr.x0() + a.lx;
+          const size_t by = dcr.y0() + a.ly;
+          if (a.mc == 0) {
+            const float du_y = static_cast<float>(a.dq) * (dc_factors[1] * mul_deq);
+            st.dc_unsmoothed.PlaneRow(1, by)[bx] += du_y;
+            st.dc_unsmoothed.PlaneRow(0, by)[bx] += du_y * cfl_dc[0];
+            st.dc_unsmoothed.PlaneRow(2, by)[bx] += du_y * cfl_dc[2];
+          } else if (a.mc == 1) {
+            st.dc_unsmoothed.PlaneRow(0, by)[bx] +=
+                static_cast<float>(a.dq) * (dc_factors[0] * mul_deq);
+          } else {
+            st.dc_unsmoothed.PlaneRow(2, by)[bx] +=
+                static_cast<float>(a.dq) * (dc_factors[2] * mul_deq);
+          }
         }
 
-        const size_t sx0 = smooth_dc ? (bx > 0 ? bx - 1 : 0) : bx;
-        const size_t sy0 = smooth_dc ? (by > 0 ? by - 1 : 0) : by;
-        const size_t sx1 = smooth_dc ? std::min(xsize_blocks, bx + 2) : (bx + 1);
-        const size_t sy1 = smooth_dc ? std::min(ysize_blocks, by + 2) : (by + 1);
+        const size_t sx0 = smooth_dc ? (bx_min > 0 ? bx_min - 1 : 0) : bx_min;
+        const size_t sy0 = smooth_dc ? (by_min > 0 ? by_min - 1 : 0) : by_min;
+        const size_t sx1 =
+            smooth_dc ? std::min(xsize_blocks, bx_max + 2) : (bx_max + 1);
+        const size_t sy1 =
+            smooth_dc ? std::min(ysize_blocks, by_max + 2) : (by_max + 1);
 
-        memset(p2g.delta_dc, 0, sizeof(p2g.delta_dc));
-        uint32_t aff_trs[9];
+        memset(p2g.delta_dc_4x4, 0, sizeof(p2g.delta_dc_4x4));
         size_t num_aff = 0;
         for (size_t sy = sy0; sy < sy1; ++sy) {
           for (size_t sx = sx0; sx < sx1; ++sx) {
             float ndc[3];
             eval_smoothed_dc_at(sx, sy, ndc);
             for (size_t c = 0; c < 3; ++c) {
-              out_new_dec[c][sy - sy0][sx - sx0] = ndc[c];
-              p2g.delta_dc[c][sy - sy0][sx - sx0] =
+              p2g.new_dec_4x4[c][sy - sy0][sx - sx0] = ndc[c];
+              p2g.delta_dc_4x4[c][sy - sy0][sx - sx0] =
                   ndc[c] - shared.dc_storage.ConstPlaneRow(c, sy)[sx];
             }
             const uint32_t code = st.blk_to_tr[sy * xsize_blocks + sx];
             if (code == 0xFFFFFFFFu) continue;
             bool seen = false;
             for (size_t k = 0; k < num_aff; ++k) {
-              if (aff_trs[k] == code) {
+              if (p2g.aff_trs_buf[k] == code) {
                 seen = true;
                 break;
               }
             }
-            if (!seen && num_aff < 9) aff_trs[num_aff++] = code;
+            if (!seen && num_aff < 16) p2g.aff_trs_buf[num_aff++] = code;
           }
         }
         if (!commit_state) {
-          for (size_t c = 0; c < 3; ++c) {
-            st.dc_unsmoothed.PlaneRow(c, by)[bx] = old_u[c];
+          for (size_t u = 0; u < n_uniq_blk; ++u) {
+            for (size_t c = 0; c < 3; ++c) {
+              st.dc_unsmoothed.PlaneRow(c, p2g.uniq_by[u])[p2g.uniq_bx[u]] =
+                  p2g.saved_u[u][c];
+            }
           }
         }
         if (num_aff == 0) return false;
@@ -12934,8 +13085,8 @@ Status RefineQuantFieldClosedLoop(
         size_t px_x1 = 0;
         size_t px_y1 = 0;
         for (size_t k = 0; k < num_aff; ++k) {
-          const size_t g = aff_trs[k] >> 16;
-          const size_t ti = aff_trs[k] & 0xFFFFu;
+          const size_t g = p2g.aff_trs_buf[k] >> 16;
+          const size_t ti = p2g.aff_trs_buf[k] & 0xFFFFu;
           AcGroupBlockCache& cache = group_caches[g];
           const AcTransformCache& tr = cache.transforms[ti];
           const size_t t_bx0 = cache.gx0 + tr.bx;
@@ -12960,7 +13111,7 @@ Status RefineQuantFieldClosedLoop(
                  sy < std::min(sy1, t_by0 + tr.cov_y); ++sy) {
               for (size_t sx = std::max(sx0, t_bx0);
                    sx < std::min(sx1, t_bx0 + tr.cov_x); ++sx) {
-                const float dv = p2g.delta_dc[c][sy - sy0][sx - sx0];
+                const float dv = p2g.delta_dc_4x4[c][sy - sy0][sx - sx0];
                 if (std::abs(dv) > 1e-9f) {
                   p2g.tr_dc_diff[(sy - t_by0) * tr.cov_x + (sx - t_bx0)] = dv;
                   non_zero = true;
@@ -12996,8 +13147,9 @@ Status RefineQuantFieldClosedLoop(
             for (size_t sx = sx0; sx < sx1; ++sx) {
               for (size_t c = 0; c < 3; ++c) {
                 shared.dc_storage.PlaneRow(c, sy)[sx] =
-                    out_new_dec[c][sy - sy0][sx - sx0];
+                    p2g.new_dec_4x4[c][sy - sy0][sx - sx0];
               }
+              st.dc_touched_blk[sy * xsize_blocks + sx] = 1;
             }
           }
         }
@@ -13006,10 +13158,9 @@ Status RefineQuantFieldClosedLoop(
         return true;
       };
 
-      auto eval_exact_4m_dc_move = [&](size_t dg, size_t bx, size_t by,
-                                       size_t lx, size_t ly, size_t mc,
-                                       int32_t dq, double delta_dc_bits,
-                                       bool require_unanimous) -> StatusOr<bool> {
+      auto eval_exact_4m_dc_atoms =
+          [&](size_t dg, const DcAtom* atoms, size_t n_atoms,
+              double delta_dc_bits, bool require_unanimous) -> StatusOr<bool> {
         const double cur_tot =
             std::max(1.0, cur_bits + cur_sh_bits + cum_dc_delta_bits);
         const double new_tot = std::max(
@@ -13017,9 +13168,8 @@ Status RefineQuantFieldClosedLoop(
         const double delta_rate = rate_term(new_tot) - rate_term(cur_tot);
 
         Rect px_box;
-        if (!apply_dc_perturbation(dg, bx, by, mc, dq, &cand_pre_gab,
-                                   /*commit_state=*/false, &px_box, p2g.new_u,
-                                   p2g.new_dec)) {
+        if (!apply_dc_atoms(dg, atoms, n_atoms, &cand_pre_gab,
+                            /*commit_state=*/false, &px_box)) {
           return false;
         }
         const size_t lx0 = (px_box.x0() > lf_pad) ? (px_box.x0() - lf_pad) : 0;
@@ -13064,15 +13214,10 @@ Status RefineQuantFieldClosedLoop(
         const double min_gain = (delta_rate < 0.0) ? 0.0005 : 0.0007;
 
         if (j_gain > min_gain && pareto_ok) {
-          const int32_t q_old =
-              modular_frame_encoder->VarDCTDCImage(dg)
-                  ->channel[mc]
-                  .plane.ConstRow(ly)[lx];
-          commit_dc_hist_step(dg, mc, lx, ly, q_old + dq);
+          commit_dc_hist_atoms(dg, atoms, n_atoms);
           Rect unused_box;
-          apply_dc_perturbation(dg, bx, by, mc, dq, /*target_pre_gab=*/nullptr,
-                                /*commit_state=*/true, &unused_box, p2g.u_tmp,
-                                p2g.dec_tmp);
+          apply_dc_atoms(dg, atoms, n_atoms, /*target_pre_gab=*/nullptr,
+                         /*commit_state=*/true, &unused_box);
           for (size_t c = 0; c < 3; ++c) {
             for (size_t y = 0; y < px_box.ysize(); ++y) {
               const float* src_r =
@@ -13091,17 +13236,6 @@ Status RefineQuantFieldClosedLoop(
           const size_t gy1 = std::min(ysize, px_box.y0() + px_box.ysize() + 1);
           apply_gab_rect_2g(cur_pre_gab, gx0, gy0, gx1 - gx0, gy1 - gy0,
                             &fine_pre_gab);
-          const size_t tsx0 = smooth_dc ? (bx > 0 ? bx - 1 : 0) : bx;
-          const size_t tsy0 = smooth_dc ? (by > 0 ? by - 1 : 0) : by;
-          const size_t tsx1 =
-              smooth_dc ? std::min(xsize_blocks, bx + 2) : (bx + 1);
-          const size_t tsy1 =
-              smooth_dc ? std::min(ysize_blocks, by + 2) : (by + 1);
-          for (size_t tsy = tsy0; tsy < tsy1; ++tsy) {
-            for (size_t tsx = tsx0; tsx < tsx1; ++tsx) {
-              st.dc_touched_blk[tsy * xsize_blocks + tsx] = 1;
-            }
-          }
           cum_dc_delta_bits += delta_dc_bits;
           cur_d = cand_d;
           ++dc_moves;
@@ -13126,6 +13260,98 @@ Status RefineQuantFieldClosedLoop(
         return false;
       };
 
+      auto score_dc_atoms_local = [&](size_t dg, const DcAtom* atoms,
+                                      size_t n_atoms, double dbits,
+                                      double* out_loc_j) -> bool {
+        Rect px_box;
+        if (!apply_dc_atoms(dg, atoms, n_atoms, &plain_pre_gab,
+                            /*commit_state=*/false, &px_box)) {
+          return false;
+        }
+        const size_t gx0 = (px_box.x0() > 0) ? (px_box.x0() - 1) : 0;
+        const size_t gy0 = (px_box.y0() > 0) ? (px_box.y0() - 1) : 0;
+        const size_t gx1 = std::min(xsize, px_box.x0() + px_box.xsize() + 1);
+        const size_t gy1 = std::min(ysize, px_box.y0() + px_box.ysize() + 1);
+        const size_t b_x0 = gx0 / kBlockDim;
+        const size_t b_y0 = gy0 / kBlockDim;
+        const size_t b_x1 = std::min(xsize_blocks, DivCeil(gx1, kBlockDim));
+        const size_t b_y1 = std::min(ysize_blocks, DivCeil(gy1, kBlockDim));
+
+        double cur_loc_err = 0.0;
+        for (size_t ey = b_y0; ey < b_y1; ++ey) {
+          for (size_t ex = b_x0; ex < b_x1; ++ex) {
+            float bdry_b = 0.0f;
+            cur_loc_err += ComputeLocalBlockEpfError(
+                *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f, &bdry_b,
+                nullptr, nullptr,
+                st.ar_mask.ConstRow(ey * kBlockDim) + ex * kBlockDim,
+                st.ar_mask.PixelsPerRow());
+            cur_loc_err += kAcsEpfBdryWD * bdry_b;
+          }
+        }
+
+        apply_gab_rect_2g(plain_pre_gab, gx0, gy0, gx1 - gx0, gy1 - gy0,
+                          &fine_pre_gab);
+        double cand_loc_err = 0.0;
+        for (size_t ey = b_y0; ey < b_y1; ++ey) {
+          for (size_t ex = b_x0; ex < b_x1; ++ex) {
+            float bdry_b = 0.0f;
+            cand_loc_err += ComputeLocalBlockEpfError(
+                *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f, &bdry_b,
+                nullptr, nullptr,
+                st.ar_mask.ConstRow(ey * kBlockDim) + ex * kBlockDim,
+                st.ar_mask.PixelsPerRow());
+            cand_loc_err += kAcsEpfBdryWD * bdry_b;
+          }
+        }
+
+        for (size_t c = 0; c < 3; ++c) {
+          for (size_t y = 0; y < px_box.ysize(); ++y) {
+            memcpy(plain_pre_gab.PlaneRow(c, px_box.y0() + y) + px_box.x0(),
+                   cur_pre_gab.ConstPlaneRow(c, px_box.y0() + y) + px_box.x0(),
+                   px_box.xsize() * sizeof(float));
+          }
+        }
+        apply_gab_rect_2g(cur_pre_gab, gx0, gy0, gx1 - gx0, gy1 - gy0,
+                          &fine_pre_gab);
+
+        *out_loc_j = (cur_loc_err - cand_loc_err) -
+                     kP2gLocLamMul *
+                         static_cast<double>(tcm.bits_to_cost_mul) * dbits;
+        return true;
+      };
+
+      const bool has_nonneutral_dc_cfl =
+          (std::abs(cfl_dc[0]) > 0.015f || std::abs(cfl_dc[2] - 1.0f) > 0.04f);
+      auto make_achromatic_y_atoms = [&](size_t dg, uint16_t lx, uint16_t ly,
+                                         int32_t dq_y,
+                                         DcAtom* out_atoms) -> size_t {
+        const float mul_deq =
+            1.0f /
+            static_cast<float>(1u << modular_frame_encoder->extra_dc_precision[dg]);
+        const float du_y = static_cast<float>(dq_y) * (dc_factors[1] * mul_deq);
+        const float fac_x = dc_factors[0] * mul_deq;
+        const float fac_b = dc_factors[2] * mul_deq;
+        const int32_t dq_x =
+            (fac_x > 1e-8f)
+                ? static_cast<int32_t>(std::lround(-du_y * cfl_dc[0] / fac_x))
+                : 0;
+        const int32_t dq_b =
+            (fac_b > 1e-8f)
+                ? static_cast<int32_t>(
+                      std::lround(du_y * (1.0f - cfl_dc[2]) / fac_b))
+                : 0;
+        size_t na = 0;
+        out_atoms[na++] = {0, lx, ly, static_cast<int16_t>(dq_y)};
+        if (dq_x != 0 && std::abs(dq_x) <= 4) {
+          out_atoms[na++] = {1, lx, ly, static_cast<int16_t>(dq_x)};
+        }
+        if (dq_b != 0 && std::abs(dq_b) <= 4) {
+          out_atoms[na++] = {2, lx, ly, static_cast<int16_t>(dq_b)};
+        }
+        return na;
+      };
+
       accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/false);
       double sum_be_2g = 0.0;
       for (double v : blk_err_cur) sum_be_2g += v;
@@ -13147,9 +13373,13 @@ Status RefineQuantFieldClosedLoop(
               double best_dbits = -1.15;
               for (int32_t dq : {-3, -2, -1, 1, 2, 3}) {
                 if (mc != 0 && (dq < -1 || dq > 1)) continue;
+                p2g.cand_atoms[0] = {static_cast<uint8_t>(mc),
+                                     static_cast<uint16_t>(lx),
+                                     static_cast<uint16_t>(ly),
+                                     static_cast<int16_t>(dq)};
                 double dbits = 0.0;
-                if (price_dc_step(dg, mc, lx, ly, dq, /*allow_new_sym=*/false,
-                                  &dbits) &&
+                if (price_dc_atoms(dg, p2g.cand_atoms, 1,
+                                   /*allow_new_sym=*/false, &dbits) &&
                     dbits < best_dbits) {
                   best_dbits = dbits;
                   best_dq = static_cast<int8_t>(dq);
@@ -13179,26 +13409,29 @@ Status RefineQuantFieldClosedLoop(
         for (size_t ri = 0; ri < max_rec_trials; ++ri) {
           const DcReclaimCand& rc = p2g.dc_reclaims[ri];
           const Rect dcr = shared.frame_dim.DCGroupRect(rc.dg);
-          const size_t lx = rc.bx - dcr.x0();
-          const size_t ly = rc.by - dcr.y0();
+          p2g.cand_atoms[0] = {
+              rc.mc, static_cast<uint16_t>(rc.bx - dcr.x0()),
+              static_cast<uint16_t>(rc.by - dcr.y0()),
+              static_cast<int16_t>(rc.dq)};
           double dbits = 0.0;
-          if (!price_dc_step(rc.dg, rc.mc, lx, ly, rc.dq,
-                             /*allow_new_sym=*/false, &dbits) ||
+          if (!price_dc_atoms(rc.dg, p2g.cand_atoms, 1,
+                              /*allow_new_sym=*/false, &dbits) ||
               dbits > -1.00) {
             continue;
           }
           JXL_ASSIGN_OR_RETURN(
-              bool ok, eval_exact_4m_dc_move(rc.dg, rc.bx, rc.by, lx, ly, rc.mc,
-                                             rc.dq, dbits,
-                                             /*require_unanimous=*/true));
+              bool ok, eval_exact_4m_dc_atoms(rc.dg, p2g.cand_atoms, 1, dbits,
+                                              /*require_unanimous=*/true));
           (void)ok;
         }
       }
 
-      // Step 2G.2: Salient 8x8 block Y/X/B quantized DC refinement.
+      // Step 2G.2: Salient 8x8 block Y/X/B quantized DC refinement (including
+      // opponent-compensated achromatic Y moves and rejected-(X,B) joint moves).
       if (dc_moves > 0) {
         accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/false);
       }
+      const size_t dc_moves_before_2g2 = dc_moves;
       for (size_t dg = 0; dg < num_dc_groups; ++dg) {
         const Rect dcr = shared.frame_dim.DCGroupRect(dg);
         for (size_t ly = 0; ly < dcr.ysize(); ++ly) {
@@ -13206,8 +13439,22 @@ Status RefineQuantFieldClosedLoop(
           for (size_t lx = 0; lx < dcr.xsize(); ++lx) {
             const size_t bx = dcr.x0() + lx;
             const double be = blk_err_cur[by * xsize_blocks + bx];
-            if (be > 1.15 * mean_be_2g) {
-              p2g.sal_dc_blks.push_back({be, static_cast<uint32_t>(dg),
+            bool is_acs_changed = false;
+            if (acs_moves > 0) {
+              const uint32_t tr_code = st.blk_to_tr[by * xsize_blocks + bx];
+              if (tr_code != 0xFFFFFFFFu) {
+                const size_t tg = tr_code >> 16;
+                const size_t tti = tr_code & 0xFFFFu;
+                if (tg < num_groups && tti < group_caches[tg].transforms.size()) {
+                  is_acs_changed = group_caches[tg].transforms[tti].acs_changed;
+                }
+              }
+            }
+            if (be > 1.15 * mean_be_2g ||
+                (is_acs_changed && be > 0.75 * mean_be_2g)) {
+              const double eff_be =
+                  is_acs_changed ? std::max(be * 1.35, 1.16 * mean_be_2g) : be;
+              p2g.sal_dc_blks.push_back({eff_be, static_cast<uint32_t>(dg),
                                          static_cast<uint16_t>(bx),
                                          static_cast<uint16_t>(by)});
             }
@@ -13225,96 +13472,201 @@ Status RefineQuantFieldClosedLoop(
         for (size_t si = 0; si < max_sal_dc; ++si) {
           const SalDcBlk& sb = p2g.sal_dc_blks[si];
           const Rect dcr = shared.frame_dim.DCGroupRect(sb.dg);
-          const size_t lx = sb.bx - dcr.x0();
-          const size_t ly = sb.by - dcr.y0();
+          const uint16_t lx = static_cast<uint16_t>(sb.bx - dcr.x0());
+          const uint16_t ly = static_cast<uint16_t>(sb.by - dcr.y0());
 
+          int16_t rej_dq_chr[2] = {0, 0};
           for (size_t mc = 0; mc < 3; ++mc) {
-            int32_t best_dq = 0;
+            size_t best_na = 0;
             double best_dbits = 0.0;
             double best_loc_j = 0.0;
+            int16_t best_single_dq = 0;
 
             for (int32_t dq : {-3, -2, -1, 1, 2, 3}) {
+              p2g.cand_atoms[0] = {static_cast<uint8_t>(mc), lx, ly,
+                                   static_cast<int16_t>(dq)};
               double dbits = 0.0;
-              if (!price_dc_step(sb.dg, mc, lx, ly, dq, /*allow_new_sym=*/true,
-                                 &dbits) ||
-                  dbits > 5.5) {
-                continue;
-              }
-              Rect px_box;
-              if (!apply_dc_perturbation(sb.dg, sb.bx, sb.by, mc, dq,
-                                         &plain_pre_gab,
-                                         /*commit_state=*/false, &px_box,
-                                         p2g.new_u, p2g.new_dec)) {
-                continue;
-              }
-              const size_t gx0 = (px_box.x0() > 0) ? (px_box.x0() - 1) : 0;
-              const size_t gy0 = (px_box.y0() > 0) ? (px_box.y0() - 1) : 0;
-              const size_t gx1 =
-                  std::min(xsize, px_box.x0() + px_box.xsize() + 1);
-              const size_t gy1 =
-                  std::min(ysize, px_box.y0() + px_box.ysize() + 1);
-              const size_t b_x0 = gx0 / kBlockDim;
-              const size_t b_y0 = gy0 / kBlockDim;
-              const size_t b_x1 = std::min(xsize_blocks, DivCeil(gx1, kBlockDim));
-              const size_t b_y1 = std::min(ysize_blocks, DivCeil(gy1, kBlockDim));
-
-              double cur_loc_err = 0.0;
-              for (size_t ey = b_y0; ey < b_y1; ++ey) {
-                for (size_t ex = b_x0; ex < b_x1; ++ex) {
-                  float bdry_b = 0.0f;
-                  cur_loc_err += ComputeLocalBlockEpfError(
-                      *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f,
-                      &bdry_b, nullptr, nullptr,
-                      st.ar_mask.ConstRow(ey * kBlockDim) + ex * kBlockDim,
-                      st.ar_mask.PixelsPerRow());
-                  cur_loc_err += kAcsEpfBdryWD * bdry_b;
-                }
-              }
-
-              apply_gab_rect_2g(plain_pre_gab, gx0, gy0, gx1 - gx0, gy1 - gy0,
-                                &fine_pre_gab);
-              double cand_loc_err = 0.0;
-              for (size_t ey = b_y0; ey < b_y1; ++ey) {
-                for (size_t ex = b_x0; ex < b_x1; ++ex) {
-                  float bdry_b = 0.0f;
-                  cand_loc_err += ComputeLocalBlockEpfError(
-                      *enc_state->orig_opsin, fine_pre_gab, ey, ex, 1.20f,
-                      &bdry_b, nullptr, nullptr,
-                      st.ar_mask.ConstRow(ey * kBlockDim) + ex * kBlockDim,
-                      st.ar_mask.PixelsPerRow());
-                  cand_loc_err += kAcsEpfBdryWD * bdry_b;
-                }
-              }
-
-              // Restore plain_pre_gab and fine_pre_gab.
-              for (size_t c = 0; c < 3; ++c) {
-                for (size_t y = 0; y < px_box.ysize(); ++y) {
-                  memcpy(plain_pre_gab.PlaneRow(c, px_box.y0() + y) + px_box.x0(),
-                         cur_pre_gab.ConstPlaneRow(c, px_box.y0() + y) +
-                             px_box.x0(),
-                         px_box.xsize() * sizeof(float));
-                }
-              }
-              apply_gab_rect_2g(cur_pre_gab, gx0, gy0, gx1 - gx0, gy1 - gy0,
-                                &fine_pre_gab);
-
-              const double loc_j =
-                  (cur_loc_err - cand_loc_err) -
-                  kP2gLocLamMul *
-                      static_cast<double>(tcm.bits_to_cost_mul) * dbits;
-              if (loc_j > best_loc_j) {
+              double loc_j = 0.0;
+              if (price_dc_atoms(sb.dg, p2g.cand_atoms, 1,
+                                 /*allow_new_sym=*/true, &dbits) &&
+                  dbits <= 5.5 &&
+                  score_dc_atoms_local(sb.dg, p2g.cand_atoms, 1, dbits,
+                                       &loc_j) &&
+                  loc_j > best_loc_j) {
                 best_loc_j = loc_j;
-                best_dq = dq;
                 best_dbits = dbits;
+                best_na = 1;
+                p2g.best_atoms[0] = p2g.cand_atoms[0];
+                best_single_dq = static_cast<int16_t>(dq);
+              }
+              if (mc == 0 && has_nonneutral_dc_cfl) {
+                const size_t na_ach =
+                    make_achromatic_y_atoms(sb.dg, lx, ly, dq, p2g.cand_atoms);
+                if (na_ach > 1 &&
+                    price_dc_atoms(sb.dg, p2g.cand_atoms, na_ach,
+                                   /*allow_new_sym=*/true, &dbits) &&
+                    dbits <= 6.0 &&
+                    score_dc_atoms_local(sb.dg, p2g.cand_atoms, na_ach, dbits,
+                                         &loc_j) &&
+                    loc_j > best_loc_j) {
+                  best_loc_j = loc_j;
+                  best_dbits = dbits;
+                  best_na = na_ach;
+                  for (size_t k = 0; k < na_ach; ++k) {
+                    p2g.best_atoms[k] = p2g.cand_atoms[k];
+                  }
+                  best_single_dq = 0;
+                }
               }
             }
 
-            if (best_dq != 0) {
+            if (best_na > 0) {
               JXL_ASSIGN_OR_RETURN(
-                  bool ok, eval_exact_4m_dc_move(sb.dg, sb.bx, sb.by, lx, ly,
-                                                 mc, best_dq, best_dbits,
-                                                 /*require_unanimous=*/false));
-              (void)ok;
+                  bool ok,
+                  eval_exact_4m_dc_atoms(sb.dg, p2g.best_atoms, best_na,
+                                         best_dbits,
+                                         /*require_unanimous=*/false));
+              if (!ok && mc >= 1 && best_na == 1) {
+                rej_dq_chr[mc - 1] = best_single_dq;
+              }
+            }
+          }
+          if (rej_dq_chr[0] != 0 && rej_dq_chr[1] != 0) {
+            p2g.cand_atoms[0] = {1, lx, ly, rej_dq_chr[0]};
+            p2g.cand_atoms[1] = {2, lx, ly, rej_dq_chr[1]};
+            double dbits_xb = 0.0;
+            if (price_dc_atoms(sb.dg, p2g.cand_atoms, 2,
+                               /*allow_new_sym=*/true, &dbits_xb) &&
+                dbits_xb <= 6.5) {
+              JXL_ASSIGN_OR_RETURN(
+                  bool ok_xb,
+                  eval_exact_4m_dc_atoms(sb.dg, p2g.cand_atoms, 2, dbits_xb,
+                                         /*require_unanimous=*/false));
+              (void)ok_xb;
+            }
+          }
+        }
+      }
+
+      // Step 2G.3: Salient 2x2 smooth-preserving & multi-block-transform
+      // (DCT16x16+) uniform DC quad refinement.
+      if (dc_moves > dc_moves_before_2g2) {
+        accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/false);
+      }
+      for (size_t dg = 0; dg < num_dc_groups; ++dg) {
+        const Rect dcr = shared.frame_dim.DCGroupRect(dg);
+        for (size_t ly = 0; ly + 1 < dcr.ysize(); ly += 2) {
+          const size_t by = dcr.y0() + ly;
+          for (size_t lx = 0; lx + 1 < dcr.xsize(); lx += 2) {
+            const size_t bx = dcr.x0() + lx;
+            const uint32_t c00 = st.blk_to_tr[by * xsize_blocks + bx];
+            const uint32_t c10 = st.blk_to_tr[by * xsize_blocks + bx + 1];
+            const uint32_t c01 = st.blk_to_tr[(by + 1) * xsize_blocks + bx];
+            const uint32_t c11 = st.blk_to_tr[(by + 1) * xsize_blocks + bx + 1];
+            const bool same_multiblk_tr =
+                (c00 != 0xFFFFFFFFu && c00 == c10 && c00 == c01 && c00 == c11);
+            if (!same_multiblk_tr) {
+              float uy_min = std::numeric_limits<float>::max();
+              float uy_max = -std::numeric_limits<float>::max();
+              for (size_t dy = 0; dy < 2; ++dy) {
+                for (size_t dx = 0; dx < 2; ++dx) {
+                  const float u =
+                      st.dc_unsmoothed.ConstPlaneRow(1, by + dy)[bx + dx];
+                  uy_min = std::min(uy_min, u);
+                  uy_max = std::max(uy_max, u);
+                }
+              }
+              if (uy_max - uy_min > 1.25f * dc_factors[1]) continue;
+            }
+            const double q_err = blk_err_cur[by * xsize_blocks + bx] +
+                                 blk_err_cur[by * xsize_blocks + bx + 1] +
+                                 blk_err_cur[(by + 1) * xsize_blocks + bx] +
+                                 blk_err_cur[(by + 1) * xsize_blocks + bx + 1];
+            const double thr_q =
+                same_multiblk_tr ? (3.40 * mean_be_2g) : (4.20 * mean_be_2g);
+            if (q_err > thr_q) {
+              const double eff_q = same_multiblk_tr ? (1.20 * q_err) : q_err;
+              p2g.sal_dc_quads.push_back({eff_q, static_cast<uint32_t>(dg),
+                                          static_cast<uint16_t>(bx),
+                                          static_cast<uint16_t>(by)});
+            }
+          }
+        }
+      }
+      if (!p2g.sal_dc_quads.empty()) {
+        std::sort(p2g.sal_dc_quads.begin(), p2g.sal_dc_quads.end(),
+                  [](const SalDcQuad& a, const SalDcQuad& b) {
+                    if (a.err != b.err) return a.err > b.err;
+                    return (a.by != b.by) ? (a.by < b.by) : (a.bx < b.bx);
+                  });
+        const size_t max_quad_dc =
+            std::min<size_t>(p2g.sal_dc_quads.size(), 28 * group_cap_scale);
+        for (size_t qi = 0; qi < max_quad_dc; ++qi) {
+          const SalDcQuad& sq = p2g.sal_dc_quads[qi];
+          const Rect dcr = shared.frame_dim.DCGroupRect(sq.dg);
+          const uint16_t lx = static_cast<uint16_t>(sq.bx - dcr.x0());
+          const uint16_t ly = static_cast<uint16_t>(sq.by - dcr.y0());
+
+          for (size_t mc = 0; mc < 3; ++mc) {
+            if (mc > 0 && sq.err < 5.00 * mean_be_2g) continue;
+            size_t best_na = 0;
+            double best_dbits = 0.0;
+            double best_loc_j = 0.0;
+            for (int32_t dq : {-2, -1, 1, 2}) {
+              if (mc > 0 && std::abs(dq) > 1) continue;
+              for (size_t k = 0; k < 4; ++k) {
+                p2g.cand_atoms[k] = {static_cast<uint8_t>(mc),
+                                     static_cast<uint16_t>(lx + (k & 1u)),
+                                     static_cast<uint16_t>(ly + (k >> 1u)),
+                                     static_cast<int16_t>(dq)};
+              }
+              double dbits = 0.0;
+              double loc_j = 0.0;
+              const double max_db = (mc == 0) ? 6.5 : 4.5;
+              if (price_dc_atoms(sq.dg, p2g.cand_atoms, 4,
+                                 /*allow_new_sym=*/true, &dbits) &&
+                  dbits <= max_db &&
+                  score_dc_atoms_local(sq.dg, p2g.cand_atoms, 4, dbits,
+                                       &loc_j) &&
+                  loc_j > best_loc_j) {
+                best_loc_j = loc_j;
+                best_dbits = dbits;
+                best_na = 4;
+                for (size_t k = 0; k < 4; ++k) {
+                  p2g.best_atoms[k] = p2g.cand_atoms[k];
+                }
+              }
+              if (mc == 0 && has_nonneutral_dc_cfl && std::abs(dq) == 1) {
+                size_t na_ach = 0;
+                for (size_t k = 0; k < 4; ++k) {
+                  na_ach += make_achromatic_y_atoms(
+                      sq.dg, static_cast<uint16_t>(lx + (k & 1u)),
+                      static_cast<uint16_t>(ly + (k >> 1u)), dq,
+                      p2g.cand_atoms + na_ach);
+                }
+                if (na_ach > 4 && na_ach <= 12 &&
+                    price_dc_atoms(sq.dg, p2g.cand_atoms, na_ach,
+                                   /*allow_new_sym=*/true, &dbits) &&
+                    dbits <= 7.0 &&
+                    score_dc_atoms_local(sq.dg, p2g.cand_atoms, na_ach, dbits,
+                                         &loc_j) &&
+                    loc_j > best_loc_j) {
+                  best_loc_j = loc_j;
+                  best_dbits = dbits;
+                  best_na = na_ach;
+                  for (size_t k = 0; k < na_ach; ++k) {
+                    p2g.best_atoms[k] = p2g.cand_atoms[k];
+                  }
+                }
+              }
+            }
+            if (best_na > 0) {
+              JXL_ASSIGN_OR_RETURN(
+                  bool ok_q,
+                  eval_exact_4m_dc_atoms(sq.dg, p2g.best_atoms, best_na,
+                                         best_dbits,
+                                         /*require_unanimous=*/false));
+              (void)ok_q;
             }
           }
         }
@@ -13368,18 +13720,21 @@ Status RefineQuantFieldClosedLoop(
       return false;
     };
 
-    struct CandTr2H {
-      double score;
-      uint32_t tr_idx;
-      size_t group;
-      int16_t ref_q;
+    using CandTr2H = ClosedLoopRdoState::CandTrPol;
+    auto sort_tr_cands = [](std::vector<CandTr2H>* v) {
+      std::sort(v->begin(), v->end(),
+                [](const CandTr2H& a, const CandTr2H& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return (a.group != b.group) ? (a.group < b.group)
+                                              : (a.tr_idx < b.tr_idx);
+                });
     };
 
     // Step 2H.0: Unsignal 2D-surrounded sub-tile AQ dips created or exposed by
     // Pass 2F/2G.
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     {
-      std::vector<CandTr2H> dip_cands;
+      st.tr_cands.clear();
       for (size_t g = 0; g < num_groups; ++g) {
         const Rect bgr = shared.frame_dim.BlockGroupRect(g);
         const auto& trs = group_caches[g].transforms;
@@ -13398,19 +13753,14 @@ Status RefineQuantFieldClosedLoop(
           const double alpha =
               static_cast<double>(q_tgt) / static_cast<double>(tr.cur_quant_ac);
           const double sc = (1.0 - 1.0 / alpha) + 0.05 / (0.01 + tr_err);
-          dip_cands.push_back(
+          st.tr_cands.push_back(
               {sc, static_cast<uint32_t>(i), g, q_tgt});
         }
       }
-      if (!dip_cands.empty()) {
-        std::sort(dip_cands.begin(), dip_cands.end(),
-                  [](const CandTr2H& a, const CandTr2H& b) {
-                    if (a.score != b.score) return a.score > b.score;
-                    return (a.group != b.group) ? (a.group < b.group)
-                                                : (a.tr_idx < b.tr_idx);
-                  });
+      if (!st.tr_cands.empty()) {
+        sort_tr_cands(&st.tr_cands);
         std::vector<std::vector<Stage2QueueEntry>> queues(num_groups);
-        for (const CandTr2H& c : dip_cands) {
+        for (const CandTr2H& c : st.tr_cands) {
           if (queues[c.group].size() < 12) {
             queues[c.group].push_back(
                 {c.tr_idx, 0, c.ref_q, Stage2MoveKind::kTrUnsignalDip,
@@ -13429,7 +13779,7 @@ Status RefineQuantFieldClosedLoop(
     // unanimous 4-metric agreement on touched transforms.
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     {
-      std::vector<CandTr2H> rm_cands;
+      st.tr_cands.clear();
       for (size_t g = 0; g < num_groups; ++g) {
         const Rect bgr = shared.frame_dim.BlockGroupRect(g);
         const auto& trs = group_caches[g].transforms;
@@ -13453,19 +13803,14 @@ Status RefineQuantFieldClosedLoop(
               rate_term(std::max(1.0, cur_bits + cur_sh_bits - dbits_est));
           const double proxy_j = drate_save - 0.50 * tr_err;
           if (proxy_j > 0.0002) {
-            rm_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
+            st.tr_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
           }
         }
       }
-      if (!rm_cands.empty()) {
-        std::sort(rm_cands.begin(), rm_cands.end(),
-                  [](const CandTr2H& a, const CandTr2H& b) {
-                    if (a.score != b.score) return a.score > b.score;
-                    return (a.group != b.group) ? (a.group < b.group)
-                                                : (a.tr_idx < b.tr_idx);
-                  });
+      if (!st.tr_cands.empty()) {
+        sort_tr_cands(&st.tr_cands);
         std::vector<std::vector<Stage2QueueEntry>> queues(num_groups);
-        for (const CandTr2H& c : rm_cands) {
+        for (const CandTr2H& c : st.tr_cands) {
           if (queues[c.group].size() < 16) {
             queues[c.group].push_back(
                 {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqMinus, c.score});
@@ -13486,16 +13831,16 @@ Status RefineQuantFieldClosedLoop(
     const double mean_be_2h =
         sum_be_2h / static_cast<double>(std::max<size_t>(1, num_blocks));
     if (mean_be_2h > 1e-12) {
-      std::vector<CandTr2H> rp_cands;
+      st.tr_cands.clear();
       for (size_t g = 0; g < num_groups; ++g) {
         const Rect bgr = shared.frame_dim.BlockGroupRect(g);
         const auto& trs = group_caches[g].transforms;
         for (size_t i = 0; i < trs.size(); ++i) {
           const AcTransformCache& tr = trs[i];
           if (!is_tr_touched(g, tr)) continue;
-          if (tr.cur_rdoq_level != 0) continue;
+          if (tr.cur_rdoq_level < -1 || tr.cur_rdoq_level >= 1) continue;
           const size_t cov = static_cast<size_t>(tr.cov_x) * tr.cov_y;
-          if (cov > 4) continue;
+          if (cov > 8) continue;
           double tr_err = 0.0;
           for (size_t iy = 0; iy < tr.cov_y; ++iy) {
             for (size_t ix = 0; ix < tr.cov_x; ++ix) {
@@ -13511,19 +13856,14 @@ Status RefineQuantFieldClosedLoop(
                                rate_term(cur_bits + cur_sh_bits);
           const double proxy_j = 0.60 * tr_err - drate;
           if (proxy_j > 0.0002) {
-            rp_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
+            st.tr_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
           }
         }
       }
-      if (!rp_cands.empty()) {
-        std::sort(rp_cands.begin(), rp_cands.end(),
-                  [](const CandTr2H& a, const CandTr2H& b) {
-                    if (a.score != b.score) return a.score > b.score;
-                    return (a.group != b.group) ? (a.group < b.group)
-                                                : (a.tr_idx < b.tr_idx);
-                  });
+      if (!st.tr_cands.empty()) {
+        sort_tr_cands(&st.tr_cands);
         std::vector<std::vector<Stage2QueueEntry>> queues(num_groups);
-        for (const CandTr2H& c : rp_cands) {
+        for (const CandTr2H& c : st.tr_cands) {
           if (queues[c.group].size() < 16) {
             queues[c.group].push_back(
                 {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus, c.score});
@@ -13544,7 +13884,7 @@ Status RefineQuantFieldClosedLoop(
     const double mean_be2_2h =
         sum_be_2h / static_cast<double>(std::max<size_t>(1, num_blocks));
     if (mean_be2_2h > 1e-12) {
-      std::vector<CandTr2H> qp_cands;
+      st.tr_cands.clear();
       for (size_t g = 0; g < num_groups; ++g) {
         const Rect bgr = shared.frame_dim.BlockGroupRect(g);
         const auto& trs = group_caches[g].transforms;
@@ -13569,19 +13909,14 @@ Status RefineQuantFieldClosedLoop(
                                rate_term(cur_bits + cur_sh_bits);
           const double proxy_j = tr_err - drate;
           if (proxy_j > 0.0004) {
-            qp_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
+            st.tr_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
           }
         }
       }
-      if (!qp_cands.empty()) {
-        std::sort(qp_cands.begin(), qp_cands.end(),
-                  [](const CandTr2H& a, const CandTr2H& b) {
-                    if (a.score != b.score) return a.score > b.score;
-                    return (a.group != b.group) ? (a.group < b.group)
-                                                : (a.tr_idx < b.tr_idx);
-                  });
+      if (!st.tr_cands.empty()) {
+        sort_tr_cands(&st.tr_cands);
         std::vector<std::vector<Stage2QueueEntry>> queues(num_groups);
-        for (const CandTr2H& c : qp_cands) {
+        for (const CandTr2H& c : st.tr_cands) {
           if (queues[c.group].size() < 10) {
             queues[c.group].push_back(
                 {c.tr_idx, 0, 0, Stage2MoveKind::kTrQfPlus, c.score});
@@ -14100,8 +14435,8 @@ Status RefineQuantFieldClosedLoop(
         }
         const int mean_s = static_cast<int>(
             (sum_s + n_tile_blk / 2) / std::max<size_t>(1, n_tile_blk));
-        std::array<uint8_t, 16> tile_pats[12] = {};
-        bool pat_is_rel[12] = {};
+        auto& tile_pats = st.tile_pats;
+        auto& pat_is_rel = st.pat_is_rel;
         size_t num_pats = 0;
         auto push_pat = [&](const std::array<uint8_t, 16>& pat, bool is_rel) {
           bool same_as_cur = true;
@@ -14507,30 +14842,84 @@ Status RefineQuantFieldClosedLoop(
     }
   }
 
-  // Stage 3C: Coupled post-LoopFilter transform-level RDOQ fidelity recovery.
-  // Re-adapts per-transform RDOQ +1 levels on salient blocks where Stage 3
-  // updated LoopFilter (epf_iters, gab_custom) and epf_sharpness.
+  // Stage 3C: Coupled bidirectional post-LoopFilter transform-level RDOQ
+  // polish. Reclaims HF bits (kTrRdoqMinus under unanimous 4-metric agreement)
+  // where Stage 3 EPF newly smoothed ringing/noise, and recovers edge/contour
+  // fidelity (kTrRdoqPlus) where Stage 3 reduced EPF or Gaborish blur.
   if (s3_changed && eob_scale_s2 > 0.0f && num_blocks >= 64) {
-    struct CandTr3C {
-      double score;
-      uint32_t tr_idx;
-      size_t group;
+    JXL_RETURN_IF_ERROR(CopyImageTo(cur_pre_gab, &cand_pre_gab));
+    JXL_RETURN_IF_ERROR(CopyImageTo(cur_pre_gab, &batch_pre_gab));
+    using CandTr3C = ClosedLoopRdoState::CandTrPol;
+    auto sort_tr_cands_3c = [](std::vector<CandTr3C>* v) {
+      std::sort(v->begin(), v->end(),
+                [](const CandTr3C& a, const CandTr3C& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return (a.group != b.group) ? (a.group < b.group)
+                                              : (a.tr_idx < b.tr_idx);
+                });
     };
+
+    // Step 3C.1: Unanimous 4-metric kTrRdoqMinus bit reclaim on smoothed blocks.
+    if (lf.epf_iters >= 2) {
+      accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
+      st.tr_cands.clear();
+      for (size_t g = 0; g < num_groups; ++g) {
+        const Rect bgr = shared.frame_dim.BlockGroupRect(g);
+        const auto& trs = group_caches[g].transforms;
+        for (size_t i = 0; i < trs.size(); ++i) {
+          const AcTransformCache& tr = trs[i];
+          if (tr.cur_rdoq_level > 0 || tr.cur_rdoq_level <= -2) continue;
+          const float tr_bits = tr.slots[tr.cur_slot].bits;
+          if (tr_bits < 4.5f) continue;
+          double tr_err = 0.0;
+          for (size_t iy = 0; iy < tr.cov_y; ++iy) {
+            for (size_t ix = 0; ix < tr.cov_x; ++ix) {
+              tr_err += blk_err_cur[(bgr.y0() + tr.by + iy) * xsize_blocks +
+                                    (bgr.x0() + tr.bx + ix)];
+            }
+          }
+          const double dbits_est = 0.10 * static_cast<double>(tr_bits);
+          const double drate_save =
+              rate_term(cur_bits + cur_sh_bits) -
+              rate_term(std::max(1.0, cur_bits + cur_sh_bits - dbits_est));
+          const double proxy_j = drate_save - 0.50 * tr_err;
+          if (proxy_j > 0.0002) {
+            st.tr_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
+          }
+        }
+      }
+      if (!st.tr_cands.empty()) {
+        sort_tr_cands_3c(&st.tr_cands);
+        std::vector<std::vector<Stage2QueueEntry>> queues(num_groups);
+        for (const CandTr3C& c : st.tr_cands) {
+          if (queues[c.group].size() < 12) {
+            queues[c.group].push_back(
+                {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqMinus, c.score});
+          }
+        }
+        size_t rm_moves_3c = 0;
+        const size_t cap = std::min<size_t>(
+            200 * group_cap_scale, std::max<size_t>(4, num_tiles / 2));
+        JXL_RETURN_IF_ERROR(run_stage2_queue(cap, queues, &rm_moves_3c));
+      }
+    }
+
+    // Step 3C.2: Salient edge/contour kTrRdoqPlus fidelity recovery.
     accumulate_4m_spatial_gain(blk_err_cur.data(), /*weight_by_step1=*/true);
     double sum_be_3c = 0.0;
     for (size_t b = 0; b < num_blocks; ++b) sum_be_3c += blk_err_cur[b];
     const double mean_be_3c =
         sum_be_3c / static_cast<double>(std::max<size_t>(1, num_blocks));
     if (mean_be_3c > 1e-12) {
-      std::vector<CandTr3C> rp_cands;
+      st.tr_cands.clear();
       for (size_t g = 0; g < num_groups; ++g) {
         const Rect bgr = shared.frame_dim.BlockGroupRect(g);
         const auto& trs = group_caches[g].transforms;
         for (size_t i = 0; i < trs.size(); ++i) {
           const AcTransformCache& tr = trs[i];
-          if (tr.cur_rdoq_level != 0) continue;
+          if (tr.cur_rdoq_level < -1 || tr.cur_rdoq_level >= 1) continue;
           const size_t cov = static_cast<size_t>(tr.cov_x) * tr.cov_y;
-          if (cov > 4) continue;
+          if (cov > 8) continue;
           double tr_err = 0.0;
           for (size_t iy = 0; iy < tr.cov_y; ++iy) {
             for (size_t ix = 0; ix < tr.cov_x; ++ix) {
@@ -14546,19 +14935,14 @@ Status RefineQuantFieldClosedLoop(
                                rate_term(cur_bits + cur_sh_bits);
           const double proxy_j = 0.60 * tr_err - drate;
           if (proxy_j > 0.0003) {
-            rp_cands.push_back({proxy_j, static_cast<uint32_t>(i), g});
+            st.tr_cands.push_back({proxy_j, static_cast<uint32_t>(i), g, 0});
           }
         }
       }
-      if (!rp_cands.empty()) {
-        std::sort(rp_cands.begin(), rp_cands.end(),
-                  [](const CandTr3C& a, const CandTr3C& b) {
-                    if (a.score != b.score) return a.score > b.score;
-                    return (a.group != b.group) ? (a.group < b.group)
-                                                : (a.tr_idx < b.tr_idx);
-                  });
+      if (!st.tr_cands.empty()) {
+        sort_tr_cands_3c(&st.tr_cands);
         std::vector<std::vector<Stage2QueueEntry>> queues(num_groups);
-        for (const CandTr3C& c : rp_cands) {
+        for (const CandTr3C& c : st.tr_cands) {
           if (queues[c.group].size() < 12) {
             queues[c.group].push_back(
                 {c.tr_idx, 0, 0, Stage2MoveKind::kTrRdoqPlus, c.score});
