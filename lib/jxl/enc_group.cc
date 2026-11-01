@@ -441,11 +441,11 @@ int32_t TrellisQuantizeBlockAC(const Quantizer& quantizer,
   if (rdoq_level > 0) {
     rdoq_ref_mul = 1.4480802f;
   } else if (rdoq_level == -1) {
-    rdoq_ref_mul = 0.715483427f;
+    rdoq_ref_mul = 0.715619326f;
   } else if (rdoq_level <= -2) {
     rdoq_ref_mul = (rdoq_level == -2)
-                       ? 0.565904856f
-                       : ((rdoq_level == -3) ? 0.441753954f : 0.339791059f);
+                       ? 0.566030204f
+                       : ((rdoq_level == -3) ? 0.441865802f : 0.339887828f);
   }
   const float lo_sharp_boost =
       (!few_colors && rdoq_level >= -1 && c <= 1)
@@ -5755,7 +5755,8 @@ class Ba3IncrementalArbiter {
   }
 
   double Score() const {
-    return has_sub_ ? (0.85 * ScaleScore(s0_) + 0.50 * ScaleScore(s1_))
+    return has_sub_ ? (0.85 * ScaleScore(s0_) +
+                       0.50133936676765523 * ScaleScore(s1_))
                     : ScaleScore(s0_);
   }
 
@@ -5764,7 +5765,8 @@ class Ba3IncrementalArbiter {
     if (weight <= 0.0) return;
     if (has_sub_) {
       AccumulateScaleBlockError(s0_, bx_w, by_h, 0.85 * weight, out_blk);
-      AccumulateScaleBlockError(s1_, bx_w, by_h, 0.50 * weight, out_blk);
+      AccumulateScaleBlockError(s1_, bx_w, by_h,
+                                0.50133936676765523 * weight, out_blk);
     } else {
       AccumulateScaleBlockError(s0_, bx_w, by_h, weight, out_blk);
     }
@@ -8994,7 +8996,8 @@ Status RefineQuantFieldClosedLoop(
       memory_manager, lf, shared, plain_pre_gab, feat_ptr, epf_sigma, epf_ws,
       full_px_rect, &cur_lin));
   JXL_RETURN_IF_ERROR(score_full_4m(cur_lin, &plain_d));
-  const double cv_q_sat = Clamp1(plain_d[3] / 0.12, 0.25, 1.0);
+  const double cv_q_sat =
+      Clamp1(plain_d[3] / 0.12000503722572844, 0.24987254999577999, 1.0);
   const std::array<double, 4> pareto_w_m = {
       1.0 - 0.50 * sigma_lo, 1.0, 1.0, (1.0 - 0.50 * sigma_lo) * cv_q_sat};
 
@@ -9013,11 +9016,11 @@ Status RefineQuantFieldClosedLoop(
       full_px_rect, &cur_lin));
   JXL_RETURN_IF_ERROR(score_full_4m(cur_lin, &cur_d));
 
-  constexpr double kAcsEpfBdryWD = 0.07799340207135852;
+  constexpr double kAcsEpfBdryWD = 0.080529552975377644;
   constexpr double kP2gLocLamMul = 0.8256526086402158;
   {
     static constexpr double kMetricPrior[4] = {
-        0.17723437466700412, 0.31189977506645639, 0.23035563601193476,
+        0.17723437466700412, 0.31216494264764749, 0.23035563601193476,
         0.29831789635209766};
     const double r_plain = rate_term(plain_bits + cur_sh_bits);
     const double r_fine = rate_term(fine_bits + cur_sh_bits);
@@ -9034,7 +9037,7 @@ Status RefineQuantFieldClosedLoop(
     slope_scale_eff *=
         std::exp(-0.0090437780320644368 * static_cast<double>(s_lo));
     slope_scale_eff *=
-        std::exp(0.029940325394272806 * static_cast<double>(s_hi));
+        std::exp(0.04038667790591717 * static_cast<double>(s_hi));
     size_t active_cnt = 0;
     for (size_t m = 0; m < 4; ++m) {
       const double sf =
@@ -14130,7 +14133,7 @@ Status RefineQuantFieldClosedLoop(
       JXL_RETURN_IF_ERROR(CopyImageTo(best_cand_sharp, &cand_sharp));
 
       if (st.base_gab_lf.gab_custom &&
-          cparams.butteraugli_distance >= 1.63641834f) {
+          cparams.butteraugli_distance >= 1.64838898f) {
         LoopFilter glf_std = st.base_gab_lf;
         glf_std.gab_custom = false;
         glf_std.gab_x_weight1 = 1.1f * 0.104699568f;

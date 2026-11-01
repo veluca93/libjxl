@@ -2946,13 +2946,13 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
     // Call this here, as it relies on pre-gaborish values.
     float butteraugli_distance_for_iqf = cparams.butteraugli_distance;
     if (!frame_header.loop_filter.gab) {
-      butteraugli_distance_for_iqf *= 0.620898664f;
+      butteraugli_distance_for_iqf *= 0.621857107f;
     } else if (frame_header.loop_filter.gab_custom) {
       const float s_y_eff = Clamp1(
           frame_header.loop_filter.gab_y_weight1 / (1.1f * 0.104699568f),
           0.0f, 1.0f);
       butteraugli_distance_for_iqf *=
-          (0.620898664f + 0.379101336f * std::pow(s_y_eff, 0.755501032f));
+          (0.621857107f + 0.378142893f * std::pow(s_y_eff, 0.755501032f));
     }
     JXL_ASSIGN_OR_RETURN(
         initial_quant_field,
