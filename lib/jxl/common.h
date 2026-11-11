@@ -45,17 +45,20 @@ enum class SpeedTier {
   kTectonicPlate = -1,
   // Learn a global tree in Modular mode.
   kGlacier = 0,
-  // Turns on FindBestQuantizationHQ loop. Equivalent to "guetzli" mode.
+  // Uses 3-pass empirical coupled RDO + wide-band (W=24) Trellis RDOQ
+  // with cross-channel CfL coupling.
   kTortoise = 1,
-  // Turns on FindBestQuantization butteraugli loop.
+  // Uses 2-pass coupled RDO + medium-band (W=8) Trellis RDOQ and full
+  // shifted Guillotine DP tile search.
   kKitten = 2,
-  // Turns on dots, patches, and spline detection by default, as well as full
-  // context clustering. Default.
+  // Uses 1-pass coupled RDO + Trellis RDOQ (W=4) with Dyadic Guillotine DP
+  // tile search (patches/dots/splines/noise default off in VarDCT). Default.
   kSquirrel = 3,
   // Turns on error diffusion and full AC strategy heuristics. Equivalent to
   // "fast" mode.
   kWombat = 4,
-  // Turns on simple heuristics for AC strategy, quant field, gaborish by default, non-default cmap, initial quant field, non-default CFL.
+  // Turns on simple heuristics for AC strategy, quant field, gaborish by
+  // default, non-default cmap, initial quant field, non-default CFL.
   kHare = 5,
   // Turns on clustering and enables coefficient reordering.
   kCheetah = 6,

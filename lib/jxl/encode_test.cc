@@ -177,7 +177,8 @@ TEST(EncodeTest, DefaultParallelRunnerTest) {
 void VerifyFrameEncoding(size_t xsize, size_t ysize, JxlEncoder* enc,
                          const JxlEncoderFrameSettings* frame_settings,
                          size_t max_compressed_size,
-                         bool lossy_use_original_profile) {
+                         bool lossy_use_original_profile,
+                         bool use_display_p3 = false) {
   JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
   JxlPixelFormat pixel_format = {4, JXL_TYPE_UINT16, JXL_BIG_ENDIAN, 0};
   std::vector<uint8_t> pixels = jxl::test::GetSomeTestImage(xsize, ysize, 4, 0);
@@ -200,6 +201,13 @@ void VerifyFrameEncoding(size_t xsize, size_t ysize, JxlEncoder* enc,
   JxlColorEncodingSetToSRGB(&color_encoding, JXL_TRUE);
   EXPECT_EQ(JXL_ENC_ERROR, JxlEncoderSetColorEncoding(enc, &color_encoding));
   JxlColorEncodingSetToSRGB(&color_encoding, JXL_FALSE);
+  if (use_display_p3) {
+    color_encoding.primaries = JXL_PRIMARIES_P3;
+    EXPECT_TRUE(input_io->metadata.m.color_encoding.SetPrimariesType(
+        jxl::Primaries::kP3));
+    EXPECT_TRUE(input_io->metadata.m.color_encoding.CreateICC());
+    input_io->Main().OverrideProfile(input_io->metadata.m.color_encoding);
+  }
   EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderSetColorEncoding(enc, &color_encoding));
   pixel_format.num_channels = 1;
   EXPECT_EQ(JXL_ENC_ERROR,
@@ -307,7 +315,9 @@ TEST(EncodeTest, CmsTest) {
   ASSERT_EQ(JXL_ENC_SUCCESS,
             JxlEncoderFrameSettingsSetOption(frame_settings,
                                              JXL_ENC_FRAME_SETTING_EFFORT, 8));
-  VerifyFrameEncoding(enc.get(), frame_settings);
+  VerifyFrameEncoding(63, 129, enc.get(), frame_settings, 27000,
+                      /*lossy_use_original_profile=*/false,
+                      /*use_display_p3=*/true);
   EXPECT_TRUE(cms_called);
 }
 

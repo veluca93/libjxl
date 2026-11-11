@@ -114,6 +114,18 @@ Status InitializePassesEncoder(const FrameHeader& frame_header,
                                 ThreadPool::NoInit, process_group,
                                 "Compute coeffs"));
 
+  return ComputeVarDCTDC(frame_header, std::move(dc), cms, pool, enc_state,
+                         modular_frame_encoder, aux_out);
+}
+
+Status ComputeVarDCTDC(const FrameHeader& frame_header, Image3F dc,
+                       const JxlCmsInterface& cms, ThreadPool* pool,
+                       PassesEncoderState* enc_state,
+                       ModularFrameEncoder* modular_frame_encoder,
+                       AuxOut* aux_out) {
+  PassesSharedState& JXL_RESTRICT shared = enc_state->shared;
+  JxlMemoryManager* memory_manager = enc_state->memory_manager();
+
   if (frame_header.flags & FrameHeader::kUseDcFrame) {
     CompressParams cparams = enc_state->cparams;
     cparams.dots = Override::kOff;

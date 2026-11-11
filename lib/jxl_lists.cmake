@@ -370,6 +370,8 @@ set(JPEGXL_INTERNAL_ENC_SOURCES
   jxl/enc_progressive_split.h
   jxl/enc_quant_weights.cc
   jxl/enc_quant_weights.h
+  jxl/enc_rdoq.cc
+  jxl/enc_rdoq.h
   jxl/enc_splines.cc
   jxl/enc_splines.h
   jxl/enc_toc.cc
@@ -516,6 +518,7 @@ set(JPEGXL_INTERNAL_TESTS
   jxl/enc_linalg_test.cc
   jxl/enc_optimize_test.cc
   jxl/enc_photon_noise_test.cc
+  jxl/enc_rdoq_test.cc
   jxl/encode_test.cc
   jxl/entropy_coder_test.cc
   jxl/fast_math_test.cc

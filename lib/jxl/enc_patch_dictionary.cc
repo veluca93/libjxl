@@ -233,7 +233,11 @@ StatusOr<std::vector<PatchInfo>> FindTextLikePatches(
     const PassesEncoderState* JXL_RESTRICT state, ThreadPool* pool,
     AuxOut* aux_out, bool is_xyb) {
   std::vector<PatchInfo> info;
-  if (state->cparams.patches == Override::kOff) return info;
+  if (state->cparams.patches == Override::kOff ||
+      (!state->cparams.modular_mode &&
+       state->cparams.patches != Override::kOn)) {
+    return info;
+  }
   const auto& frame_dim = state->shared.frame_dim;
   JxlMemoryManager* memory_manager = opsin.memory_manager();
 
@@ -629,12 +633,15 @@ Status FindBestPatchDictionary(const Image3F& opsin,
   // TODO(veluca): this doesn't work if both dots and patches are enabled.
   // For now, since dots and patches are not likely to occur in the same kind of
   // images, disable dots if some patches were found.
-  if (info.empty() &&
-      ApplyOverride(
-          state->cparams.dots,
-          state->cparams.speed_tier <= SpeedTier::kSquirrel &&
-              state->cparams.butteraugli_distance >= kMinButteraugliForDots &&
-              !state->cparams.disable_perceptual_optimizations)) {
+  const bool enable_dots =
+      state->cparams.modular_mode
+          ? ApplyOverride(state->cparams.dots,
+                          state->cparams.speed_tier <= SpeedTier::kSquirrel &&
+                              state->cparams.butteraugli_distance >=
+                                  kMinButteraugliForDots &&
+                              !state->cparams.disable_perceptual_optimizations)
+          : (state->cparams.dots == Override::kOn);
+  if (info.empty() && enable_dots) {
     Rect rect(0, 0, state->shared.frame_dim.xsize,
               state->shared.frame_dim.ysize);
     JXL_ASSIGN_OR_RETURN(info,

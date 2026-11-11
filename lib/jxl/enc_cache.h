@@ -78,6 +78,11 @@ struct PassesEncoderState {
 
 // Initialize per-frame information.
 class ModularFrameEncoder;
+Status ComputeVarDCTDC(const FrameHeader& frame_header, Image3F dc,
+                       const JxlCmsInterface& cms, ThreadPool* pool,
+                       PassesEncoderState* enc_state,
+                       ModularFrameEncoder* modular_frame_encoder,
+                       AuxOut* aux_out);
 Status InitializePassesEncoder(const FrameHeader& frame_header,
                                const Image3F& opsin, const Rect& rect,
                                const JxlCmsInterface& cms, ThreadPool* pool,

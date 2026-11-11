@@ -116,7 +116,7 @@ TEST(PassesTest, RoundtripMultiGroupPasses) {
   };
 
   auto run1 = std::async(std::launch::async, test, 1.0f, 0.25f, 76350);
-  auto run2 = std::async(std::launch::async, test, 2.05f, 0.0f, 50900);
+  auto run2 = std::async(std::launch::async, test, 2.05f, 0.0f, 52200);
   (void)run1;
   (void)run2;
 }
@@ -302,7 +302,7 @@ TEST(PassesTest, ProgressiveDownsample2DegradesCorrectlyGrayscale) {
 
   ASSERT_TRUE(
       EncodeImageJXL(cparams, ppf, /*jpeg_bytes=*/nullptr, &compressed));
-  EXPECT_LE(compressed.size(), 18300u);
+  EXPECT_LE(compressed.size(), 20000u);
 
   JXLDecompressParams dparams;
   DefaultAcceptedFormats(dparams);
@@ -360,7 +360,7 @@ TEST(PassesTest, ProgressiveDownsample2DegradesCorrectly) {
 
   ASSERT_TRUE(
       EncodeImageJXL(cparams, ppf, /*jpeg_bytes=*/nullptr, &compressed));
-  EXPECT_LE(compressed.size(), 55750u);
+  EXPECT_LE(compressed.size(), 56500u);
 
   JXLDecompressParams dparams;
   DefaultAcceptedFormats(dparams);

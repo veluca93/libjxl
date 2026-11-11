@@ -62,6 +62,7 @@
 #include "lib/jxl/enc_photon_noise.h"
 #include "lib/jxl/enc_progressive_split.h"
 #include "lib/jxl/enc_quant_weights.h"
+#include "lib/jxl/enc_rdoq.h"
 #include "lib/jxl/enc_splines.h"
 #include "lib/jxl/enc_toc.h"
 #include "lib/jxl/enc_xyb.h"
@@ -295,8 +296,10 @@ uint64_t FrameFlagsFromParams(const CompressParams& cparams) {
 
   // We don't add noise at low butteraugli distances because the original
   // noise is stored within the compressed image and adding noise makes things
-  // worse.
-  if (ApplyOverride(cparams.noise, dist >= kMinButteraugliForNoise) ||
+  // worse. In VarDCT mode, noise synthesis defaults to off unless explicitly
+  // enabled.
+  if (ApplyOverride(cparams.noise,
+                    cparams.modular_mode && dist >= kMinButteraugliForNoise) ||
       cparams.photon_noise_iso > 0 ||
       cparams.manual_noise.size() == NoiseParams::kNumNoisePoints) {
     flags |= FrameHeader::kNoise;
@@ -1141,6 +1144,11 @@ Status ComputeJPEGTranscodingData(const jpeg::JPEGData& jpeg_data,
   return true;
 }
 
+Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
+                             const FrameDimensions& frame_dim);
+Status TokenizeAllCoefficients(const FrameHeader& frame_header,
+                               ThreadPool* pool, PassesEncoderState* enc_state);
+
 Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
                                  const Image3F* linear,
                                  Image3F* JXL_RESTRICT opsin, const Rect& rect,
@@ -1151,13 +1159,179 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
   JXL_ENSURE((rect.xsize() % kBlockDim) == 0 &&
              (rect.ysize() % kBlockDim) == 0);
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
-  // Save pre-Gaborish opsin for AR control field heuristics computation.
+  // Save pre-Gaborish opsin for AR / EPF control field heuristics computation.
   Image3F orig_opsin;
   JXL_ASSIGN_OR_RETURN(
       orig_opsin, Image3F::Create(memory_manager, rect.xsize(), rect.ysize()));
   JXL_RETURN_IF_ERROR(CopyImageTo(rect, *opsin, Rect(orig_opsin), &orig_opsin));
   JXL_RETURN_IF_ERROR(orig_opsin.ShrinkTo(enc_state->shared.frame_dim.xsize,
                                           enc_state->shared.frame_dim.ysize));
+
+  const CompressParams& cparams = enc_state->cparams;
+  if (cparams.speed_tier <= SpeedTier::kSquirrel && !cparams.max_error_mode &&
+      frame_header.color_transform == ColorTransform::kXYB &&
+      frame_header.chroma_subsampling.Is444()) {
+    (void)linear;
+    PassesSharedState& shared = enc_state->shared;
+    const FrameDimensions& frame_dim = shared.frame_dim;
+
+    enc_state->x_qm_multiplier =
+        std::pow(1.25f, frame_header.x_qm_scale - 2.0f);
+    enc_state->b_qm_multiplier =
+        std::pow(1.25f, frame_header.b_qm_scale - 2.0f);
+
+    const size_t num_passes = frame_header.passes.num_passes;
+    if (enc_state->coeffs.size() < num_passes) {
+      enc_state->coeffs.reserve(num_passes);
+      for (size_t i = enc_state->coeffs.size(); i < num_passes; ++i) {
+        JXL_ASSIGN_OR_RETURN(
+            std::unique_ptr<ACImageT<int32_t>> coeffs,
+            ACImageT<int32_t>::Make(memory_manager, kGroupDim * kGroupDim,
+                                    frame_dim.num_groups));
+        enc_state->coeffs.emplace_back(std::move(coeffs));
+      }
+    }
+    while (enc_state->coeffs.size() > num_passes) {
+      enc_state->coeffs.pop_back();
+    }
+
+    FillPlane(static_cast<uint8_t>(4), &shared.epf_sharpness,
+              Rect(shared.epf_sharpness));
+
+    ImageF initial_quant_field;
+    JXL_RETURN_IF_ERROR(InitializeVarDCTPreHeuristics(
+        frame_header, enc_state, enc_modular, opsin, rect, cms, pool, aux_out,
+        &initial_quant_field));
+
+    if (enc_state->initialize_global_state) {
+      float scale = shared.quantizer.ScaleGlobalScale(cparams.quant_ac_rescale);
+      JXL_RETURN_IF_ERROR(
+          DequantMatricesScaleDC(memory_manager, &shared.matrices, scale));
+      shared.quantizer.RecomputeFromGlobalScale();
+      if (cparams.quant_ac_rescale != 1.0f) {
+        ScaleImage(cparams.quant_ac_rescale, &initial_quant_field);
+      }
+    }
+
+    JXL_RETURN_IF_ERROR(shared.matrices.EnsureComputed(
+        memory_manager,
+        (1u << static_cast<uint32_t>(AcStrategyType::DCT128X128)) - 1u));
+
+    for (size_t p = 0; p < num_passes; ++p) {
+      coeff_order_t* pass_orders =
+          &shared.coeff_orders[p * shared.coeff_order_size];
+      uint16_t computed = 0;
+      for (uint8_t raw = 0; raw < AcStrategy::kNumValidStrategies; ++raw) {
+        const uint8_t ord = kStrategyOrder[raw];
+        if (computed & (1 << ord)) continue;
+        computed |= (1 << ord);
+        const AcStrategy acs = AcStrategy::FromRawStrategy(raw);
+        for (size_t c = 0; c < 3; ++c) {
+          acs.ComputeNaturalCoeffOrder(&pass_orders[CoeffOrderOffset(ord, c)]);
+        }
+      }
+    }
+
+    RDORateModel rate_model;
+    rate_model.InitPreset(shared.block_ctx_map, cparams.butteraugli_distance,
+                          cparams.decoding_speed_tier);
+
+    size_t num_rdo_passes = 1;
+    if (num_passes == 1) {
+      if (cparams.speed_tier <= SpeedTier::kTortoise) {
+        num_rdo_passes = 3;
+      } else if (cparams.speed_tier <= SpeedTier::kKitten) {
+        num_rdo_passes = 2;
+      }
+    }
+
+    const size_t base_special_frames = enc_state->special_frames.size();
+    for (size_t rdo_pass = 0; rdo_pass < num_rdo_passes; ++rdo_pass) {
+      const bool last_pass = (rdo_pass + 1 == num_rdo_passes);
+
+      JXL_RETURN_IF_ERROR(ProcessAllTilesRDO(
+          cparams, frame_header, *opsin, rect, initial_quant_field,
+          enc_state->initial_quant_masking1x1, rate_model, pool, enc_state,
+          last_pass ? aux_out : nullptr));
+
+      JXL_ASSIGN_OR_RETURN(
+          Image3F dc, Image3F::Create(memory_manager, frame_dim.xsize_blocks,
+                                      frame_dim.ysize_blocks));
+      JXL_RETURN_IF_ERROR(
+          ComputeDCFromOpsin(*opsin, rect, shared.ac_strategy, pool, &dc));
+      JXL_RETURN_IF_ERROR(ComputeVarDCTDC(frame_header, std::move(dc), cms,
+                                          pool, enc_state, enc_modular,
+                                          last_pass ? aux_out : nullptr));
+      if (!last_pass) {
+        enc_state->special_frames.resize(base_special_frames);
+      }
+
+      if (rdo_pass == 0) {
+        if (enc_state->initialize_global_state) {
+          shared.block_ctx_map = BlockCtxMap();
+          FindBestBlockEntropyModel(cparams, shared.raw_quant_field,
+                                    shared.ac_strategy, &shared.block_ctx_map);
+        }
+        rate_model.InitPreset(shared.block_ctx_map,
+                              cparams.butteraugli_distance,
+                              cparams.decoding_speed_tier);
+      }
+
+      JXL_RETURN_IF_ERROR(ComputeCoefficientsRDOQ(
+          frame_header, *opsin, rect, initial_quant_field,
+          enc_state->initial_quant_masking1x1, rate_model, pool, enc_state));
+
+      JXL_RETURN_IF_ERROR(ComputeEPFSharpnessRDO(frame_header, orig_opsin, rect,
+                                                 rate_model, pool, enc_state));
+
+      if (!last_pass) {
+        if (enc_state->initialize_global_state) {
+          shared.block_ctx_map = BlockCtxMap();
+          FindBestBlockEntropyModel(cparams, shared.raw_quant_field,
+                                    shared.ac_strategy, &shared.block_ctx_map);
+        }
+        shared.num_histograms = 1;
+        enc_state->histogram_idx.assign(frame_dim.num_groups, 0);
+        enc_state->used_acs = 0;
+        enc_state->used_orders.assign(num_passes, 0);
+        JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(*enc_state, frame_dim));
+        JXL_RETURN_IF_ERROR(
+            TokenizeAllCoefficients(frame_header, pool, enc_state));
+
+        enc_state->passes[0].codes = EntropyEncodingData();
+        HistogramParams hist_params(cparams.speed_tier,
+                                    shared.block_ctx_map.NumACContexts());
+        hist_params.lz77_method = HistogramParams::LZ77Method::kNone;
+        hist_params.ans_histogram_strategy =
+            (rdo_pass == 0)
+                ? HistogramParams::ANSHistogramStrategy::kApproximate
+                : HistogramParams::ANSHistogramStrategy::kPrecise;
+        if (cparams.decoding_speed_tier >= 1) {
+          hist_params.max_histograms = 6;
+        }
+        hist_params.streaming_mode = false;
+        hist_params.initialize_global_state = true;
+        JXL_ASSIGN_OR_RETURN(
+            size_t cost,
+            BuildAndEncodeHistograms(
+                memory_manager, hist_params,
+                shared.block_ctx_map.NumACContexts(),
+                enc_state->passes[0].ac_tokens, &enc_state->passes[0].codes,
+                /*writer=*/nullptr, LayerType::Ac, /*aux_out=*/nullptr));
+        (void)cost;
+        rate_model.InitFromEmpiricalPass(
+            shared.block_ctx_map, enc_state->passes[0].codes,
+            shared.ac_strategy, shared.raw_quant_field, shared.cmap,
+            shared.epf_sharpness, frame_dim);
+        enc_state->passes[0].codes = EntropyEncodingData();
+      }
+    }
+
+    enc_state->used_acs = 0;
+    enc_state->used_orders.clear();
+    JXL_RETURN_IF_ERROR(ComputeACMetadata(pool, enc_state, enc_modular));
+    return true;
+  }
 
   JXL_RETURN_IF_ERROR(LossyFrameHeuristics(frame_header, enc_state, enc_modular,
                                            linear, opsin, rect, cms, pool,
@@ -1600,19 +1774,11 @@ Status ComputeEncodingData(
 
   enc_state.cparams = cparams;
 
-  Image3F linear_storage;
   Image3F* linear = nullptr;
 
   if (!jpeg_data) {
     if (frame_header.color_transform == ColorTransform::kXYB &&
         frame_info.ib_needs_color_transform) {
-      if (frame_header.encoding == FrameEncoding::kVarDCT &&
-          cparams.speed_tier <= SpeedTier::kKitten) {
-        JXL_ASSIGN_OR_RETURN(linear_storage,
-                             Image3F::Create(memory_manager, patch_rect.xsize(),
-                                             patch_rect.ysize()));
-        linear = &linear_storage;
-      }
       JXL_RETURN_IF_ERROR(ToXYB(c_enc, metadata->m.IntensityTarget(), black,
                                 pool, &color, cms, linear));
     } else {
@@ -1814,6 +1980,9 @@ bool CanDoStreamingEncoding(const CompressParams& cparams,
                             const FrameInfo& frame_info,
                             const CodecMetadata& metadata,
                             const JxlEncoderChunkedFrameAdapter& frame_data) {
+  if (!cparams.modular_mode && cparams.speed_tier <= SpeedTier::kSquirrel) {
+    return false;
+  }
   if (cparams.buffering == -1) {
     if (cparams.speed_tier < SpeedTier::kTortoise) return false;
     if (cparams.speed_tier < SpeedTier::kSquirrel &&

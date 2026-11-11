@@ -40,8 +40,12 @@ const std::array<size_t, 3> kEllipseIntensityQ{{10, 36, 10}};
 StatusOr<std::vector<PatchInfo>> FindDotDictionary(
     const CompressParams& cparams, const Image3F& opsin, const Rect& rect,
     const ColorCorrelation& color_correlation, ThreadPool* pool) {
-  if (ApplyOverride(cparams.dots,
-                    cparams.butteraugli_distance >= kMinButteraugliForDots)) {
+  const bool enable_dots =
+      cparams.modular_mode
+          ? ApplyOverride(cparams.dots, cparams.butteraugli_distance >=
+                                            kMinButteraugliForDots)
+          : (cparams.dots == Override::kOn);
+  if (enable_dots) {
     GaussianDetectParams ellipse_params;
     ellipse_params.t_high = 0.04;
     ellipse_params.t_low = 0.02;

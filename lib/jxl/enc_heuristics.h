@@ -10,6 +10,9 @@
 
 #include <jxl/cms_interface.h>
 
+#include <memory>
+#include <vector>
+
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/rect.h"
 #include "lib/jxl/base/status.h"
@@ -18,8 +21,13 @@
 
 namespace jxl {
 
+class ACImage;
+class AcStrategyImage;
 struct AuxOut;
+struct BlockCtxMap;
+struct CompressParams;
 struct PassesEncoderState;
+struct PassesSharedState;
 class DequantMatrices;
 class ImageBundle;
 class ModularFrameEncoder;
@@ -36,12 +44,26 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             const Rect& rect, const JxlCmsInterface& cms,
                             ThreadPool* pool, AuxOut* aux_out);
 
+Status InitializeVarDCTPreHeuristics(const FrameHeader& frame_header,
+                                     PassesEncoderState* enc_state,
+                                     ModularFrameEncoder* modular_frame_encoder,
+                                     Image3F* opsin, const Rect& rect,
+                                     const JxlCmsInterface& cms,
+                                     ThreadPool* pool, AuxOut* aux_out,
+                                     ImageF* initial_quant_field);
+
 Status ComputeARHeuristics(const FrameHeader& frame_header,
                            PassesEncoderState* enc_state,
                            const Image3F& orig_opsin, const Rect& rect,
                            ThreadPool* pool);
 
-void FindBestBlockEntropyModel(PassesEncoderState& enc_state);
+void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
+                               const AcStrategyImage& ac_strategy,
+                               BlockCtxMap* block_ctx_map);
+
+StatusOr<Image3F> ReconstructImage(
+    const FrameHeader& orig_frame_header, const PassesSharedState& shared,
+    const std::vector<std::unique_ptr<ACImage>>& coeffs, ThreadPool* pool);
 
 Status DownsampleImage2_Iterative(Image3F* opsin);
 Status DownsampleImage2_Sharper(Image3F* opsin);

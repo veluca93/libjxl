@@ -80,10 +80,10 @@ void FindBestBlockEntropyModel(const CompressParams& cparams, const ImageI& rqf,
         3 * kNumOrders == sizeof(kSimpleCtxMap) / sizeof *kSimpleCtxMap,
         "Update simple context map");
 
-    auto bcm = *block_ctx_map;
-    bcm.ctx_map.assign(std::begin(kSimpleCtxMap), std::end(kSimpleCtxMap));
-    bcm.num_ctxs = 2;
-    bcm.num_dc_ctxs = 1;
+    block_ctx_map->ctx_map.assign(std::begin(kSimpleCtxMap),
+                                  std::end(kSimpleCtxMap));
+    block_ctx_map->num_ctxs = 2;
+    block_ctx_map->num_dc_ctxs = 1;
     return;
   }
   if (cparams.speed_tier >= SpeedTier::kFalcon) {
@@ -1020,6 +1020,91 @@ Status ComputeARHeuristics(const FrameHeader& frame_header,
   return true;
 }
 
+Status InitializeVarDCTPreHeuristics(const FrameHeader& frame_header,
+                                     PassesEncoderState* enc_state,
+                                     ModularFrameEncoder* modular_frame_encoder,
+                                     Image3F* opsin, const Rect& rect,
+                                     const JxlCmsInterface& cms,
+                                     ThreadPool* pool, AuxOut* aux_out,
+                                     ImageF* initial_quant_field) {
+  const CompressParams& cparams = enc_state->cparams;
+  const bool streaming_mode = enc_state->streaming_mode;
+  const bool initialize_global_state = enc_state->initialize_global_state;
+  PassesSharedState& shared = enc_state->shared;
+  const FrameDimensions& frame_dim = shared.frame_dim;
+  ImageFeatures& image_features = shared.image_features;
+  DequantMatrices& matrices = shared.matrices;
+  Quantizer& quantizer = shared.quantizer;
+  ImageF& initial_quant_masking1x1 = enc_state->initial_quant_masking1x1;
+  ColorCorrelationMap& cmap = shared.cmap;
+  JxlMemoryManager* memory_manager = enc_state->memory_manager();
+
+  // Subtract splines only if explicitly requested.
+  if (!streaming_mode && cparams.custom_splines.HasAny()) {
+    image_features.splines.SetData(cparams.custom_splines);
+    JXL_RETURN_IF_ERROR(image_features.splines.InitializeDrawCache(
+        opsin->xsize(), opsin->ysize(), cmap.base()));
+    image_features.splines.SubtractFrom(opsin);
+  }
+
+  // Subtract patches / dots only if explicitly requested.
+  if (!streaming_mode &&
+      (cparams.patches == Override::kOn || cparams.dots == Override::kOn)) {
+    JXL_RETURN_IF_ERROR(
+        FindBestPatchDictionary(*opsin, enc_state, cms, pool, aux_out));
+    JXL_RETURN_IF_ERROR(
+        PatchDictionaryEncoder::SubtractFrom(image_features.patches, opsin));
+  }
+
+  const float eff_butteraugli = cparams.butteraugli_distance;
+  const float quant_dc = InitialQuantDC(eff_butteraugli);
+  ImageF initial_quant_masking;
+
+  if (cparams.speed_tier > SpeedTier::kHare ||
+      cparams.disable_perceptual_optimizations) {
+    JXL_ASSIGN_OR_RETURN(*initial_quant_field,
+                         ImageF::Create(memory_manager, frame_dim.xsize_blocks,
+                                        frame_dim.ysize_blocks));
+    JXL_ASSIGN_OR_RETURN(initial_quant_masking,
+                         ImageF::Create(memory_manager, frame_dim.xsize_blocks,
+                                        frame_dim.ysize_blocks));
+    float q = 0.79f / eff_butteraugli;
+    FillImage(q, initial_quant_field);
+    float masking = 1.0f / (q + 0.001f);
+    FillImage(masking, &initial_quant_masking);
+    if (cparams.disable_perceptual_optimizations) {
+      JXL_ASSIGN_OR_RETURN(
+          initial_quant_masking1x1,
+          ImageF::Create(memory_manager, frame_dim.xsize, frame_dim.ysize));
+      FillImage(masking, &initial_quant_masking1x1);
+    }
+    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
+  } else {
+    float butteraugli_distance_for_iqf = eff_butteraugli;
+    if (!frame_header.loop_filter.gab) {
+      butteraugli_distance_for_iqf *= 0.62f;
+    }
+    JXL_ASSIGN_OR_RETURN(
+        *initial_quant_field,
+        InitialQuantField(butteraugli_distance_for_iqf, *opsin, rect, pool,
+                          1.0f, &initial_quant_masking,
+                          &initial_quant_masking1x1));
+    float q = 0.39f / eff_butteraugli;
+    quantizer.ComputeGlobalScaleAndQuant(quant_dc, q, 0);
+  }
+
+  if (frame_header.loop_filter.gab) {
+    float weight[3] = {1.0f, 1.0f, 1.0f};
+    JXL_RETURN_IF_ERROR(GaborishInverse(opsin, rect, weight, pool));
+  }
+
+  if (initialize_global_state) {
+    JXL_RETURN_IF_ERROR(FindBestDequantMatrices(
+        memory_manager, cparams, modular_frame_encoder, &matrices));
+  }
+  return true;
+}
+
 Status LossyFrameHeuristics(const FrameHeader& frame_header,
                             PassesEncoderState* enc_state,
                             ModularFrameEncoder* modular_frame_encoder,
@@ -1041,24 +1126,17 @@ Status LossyFrameHeuristics(const FrameHeader& frame_header,
   BlockCtxMap& block_ctx_map = shared.block_ctx_map;
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
 
-  // Find and subtract splines.
-  bool override_splines = cparams.custom_splines.HasAny();
-  if (override_splines) {
+  // Subtract splines only if explicitly requested.
+  if (!streaming_mode && cparams.custom_splines.HasAny()) {
     image_features.splines.SetData(cparams.custom_splines);
-  }
-  if (!streaming_mode && cparams.speed_tier <= SpeedTier::kSquirrel) {
-    if (!override_splines) {
-      image_features.splines = FindSplines(*opsin);
-    }
     JXL_RETURN_IF_ERROR(image_features.splines.InitializeDrawCache(
         opsin->xsize(), opsin->ysize(), cmap.base()));
     image_features.splines.SubtractFrom(opsin);
   }
 
-  // Find and subtract patches/dots.
+  // Find and subtract patches/dots only if explicitly requested.
   if (!streaming_mode &&
-      ApplyOverride(cparams.patches,
-                    cparams.speed_tier <= SpeedTier::kSquirrel)) {
+      (cparams.patches == Override::kOn || cparams.dots == Override::kOn)) {
     JXL_RETURN_IF_ERROR(
         FindBestPatchDictionary(*opsin, enc_state, cms, pool, aux_out));
     JXL_RETURN_IF_ERROR(
