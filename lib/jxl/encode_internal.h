@@ -27,10 +27,10 @@
 
 #include "lib/jxl/base/c_callback_support.h"
 #include "lib/jxl/base/common.h"
-#include "lib/jxl/common.h"
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/common.h"
 #include "lib/jxl/enc_fast_lossless.h"
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/image_metadata.h"
@@ -143,7 +143,6 @@ constexpr BoxType MakeBoxType(const char* type) {
       {{static_cast<uint8_t>(type[0]), static_cast<uint8_t>(type[1]),
         static_cast<uint8_t>(type[2]), static_cast<uint8_t>(type[3])}});
 }
-
 
 static JXL_INLINE size_t BitsPerChannel(JxlDataType data_type) {
   switch (data_type) {
@@ -435,8 +434,8 @@ inline std::vector<uint8_t> MakeContainerHeader(int ftyp_version) {
   std::vector<uint8_t> out(kJxlSignatureBox.begin(), kJxlSignatureBox.end());
   // ftyp box: major brand "jxl ", minor version, compatible brand "jxl ".
   const uint8_t ftyp[] = {'j', 'x', 'l', ' ',
-                           0,   0,   0,   static_cast<uint8_t>(ftyp_version),
-                           'j', 'x', 'l', ' '};
+                          0,   0,   0,   static_cast<uint8_t>(ftyp_version),
+                          'j', 'x', 'l', ' '};
   AppendBoxHeader(MakeBoxType("ftyp"), sizeof(ftyp), /*unbounded=*/false, &out);
   out.insert(out.end(), ftyp, ftyp + sizeof(ftyp));
   return out;
@@ -670,6 +669,8 @@ struct JxlEncoder {
   // frame or box, such as signature, basic info, ICC profile or jpeg
   // reconstruction box.
   bool wrote_bytes;
+  bool has_preencoded_first_frame = false;
+  std::vector<uint8_t> preencoded_first_frame_bytes;
 
   bool frames_closed;
   bool boxes_closed;

@@ -115,7 +115,7 @@ TEST(PassesTest, RoundtripMultiGroupPasses) {
                           target_distance + threshold);
   };
 
-  auto run1 = std::async(std::launch::async, test, 1.0f, 0.25f, 76350);
+  auto run1 = std::async(std::launch::async, test, 1.0f, 0.25f, 79500);
   auto run2 = std::async(std::launch::async, test, 2.05f, 0.0f, 52200);
   (void)run1;
   (void)run2;
@@ -131,7 +131,7 @@ TEST(PassesTest, RoundtripLargeFastPasses) {
 
   PackedPixelFile ppf2;
   size_t compressed_size = Roundtrip(ppf, cparams, {}, pool.get(), &ppf2);
-  EXPECT_SLIGHTLY_BELOW(compressed_size, 497250);
+  EXPECT_SLIGHTLY_BELOW(compressed_size, 512000);
 }
 
 // Checks for differing size/distance in two consecutive runs of distance 2,

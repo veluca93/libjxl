@@ -38,6 +38,7 @@
 #include "lib/jxl/base/compiler_specific.h"
 #include "lib/jxl/base/data_parallel.h"
 #include "lib/jxl/base/float.h"
+#include "lib/jxl/base/override.h"
 #include "lib/jxl/base/printf_macros.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
@@ -55,7 +56,9 @@
 #include "lib/jxl/enc_frame.h"
 #include "lib/jxl/enc_icc_codec.h"
 #include "lib/jxl/enc_params.h"
+#include "lib/jxl/enc_rdoq.h"
 #include "lib/jxl/field_encodings.h"
+#include "lib/jxl/fields.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/icc_codec.h"
 #include "lib/jxl/image.h"
@@ -809,6 +812,8 @@ Status PrepareCodecMetadataFromIO(const CompressParams& cparams,
 
   metadata->m.xyb_encoded =
       cparams.color_transform == ColorTransform::kXYB ? true : false;
+  metadata->m.num_extra_channels = metadata->m.extra_channel_info.size();
+  metadata->transform_data.nonserialized_xyb_encoded = metadata->m.xyb_encoded;
 
   // TODO(firsching): move this EncodeFile to test_utils / re-implement this
   // using API functions
@@ -862,38 +867,71 @@ Status EncodeFile(const CompressParams& params, CodecInOut* io,
 
   std::unique_ptr<CodecMetadata> metadata = jxl::make_unique<CodecMetadata>();
   JXL_RETURN_IF_ERROR(PrepareCodecMetadataFromIO(cparams, io, metadata.get()));
-  JXL_RETURN_IF_ERROR(
-      WriteCodestreamHeaders(metadata.get(), &writer, /*aux_out*/ nullptr));
 
-  // Only send ICC (at least several hundred bytes) if fields aren't enough.
-  if (metadata->m.color_encoding.WantICC()) {
+  const bool defer_codestream_header =
+      ActiveQuantBiasMode() != QuantBiasMode::kDefault &&
+      io->frames.size() == 1 && !metadata->m.have_preview &&
+      metadata->m.xyb_encoded &&
+      cparams.color_transform == ColorTransform::kXYB &&
+      !cparams.IsLossless() && !cparams.modular_mode &&
+      !cparams.max_error_mode && cparams.speed_tier <= SpeedTier::kSquirrel &&
+      cparams.progressive_dc <= 0 && cparams.patches != Override::kOn &&
+      cparams.dots != Override::kOn && !io->frames[0].IsJPEG() &&
+      Bundle::AllDefault(metadata->transform_data.opsin_inverse_matrix);
+
+  auto write_codestream_headers = [&]() -> Status {
     JXL_RETURN_IF_ERROR(
-        WriteICC(Span<const uint8_t>(metadata->m.color_encoding.ICC()), &writer,
-                 LayerType::Header, /* aux_out */ nullptr));
-  }
+        WriteCodestreamHeaders(metadata.get(), &writer, /*aux_out*/ nullptr));
 
-  if (metadata->m.have_preview) {
-    JXL_RETURN_IF_ERROR(EncodePreview(cparams, io->preview_frame,
-                                      metadata.get(), cms, pool, &writer));
-  }
+    // Only send ICC (at least several hundred bytes) if fields aren't enough.
+    if (metadata->m.color_encoding.WantICC()) {
+      JXL_RETURN_IF_ERROR(
+          WriteICC(Span<const uint8_t>(metadata->m.color_encoding.ICC()),
+                   &writer, LayerType::Header, /* aux_out */ nullptr));
+    }
 
-  // Each frame should start on byte boundaries.
-  JXL_RETURN_IF_ERROR(
-      writer.WithMaxBits(8, LayerType::Header, /*aux_out=*/nullptr, [&] {
-        writer.ZeroPadToByte();
-        return true;
-      }));
+    if (metadata->m.have_preview) {
+      JXL_RETURN_IF_ERROR(EncodePreview(cparams, io->preview_frame,
+                                        metadata.get(), cms, pool, &writer));
+    }
 
-  for (size_t i = 0; i < io->frames.size(); i++) {
+    // Each frame should start on byte boundaries.
+    JXL_RETURN_IF_ERROR(
+        writer.WithMaxBits(8, LayerType::Header, /*aux_out=*/nullptr, [&] {
+          writer.ZeroPadToByte();
+          return true;
+        }));
+    return true;
+  };
+
+  if (defer_codestream_header) {
+    BitWriter frame_writer{memory_manager};
     FrameInfo info;
-    info.is_last = i == io->frames.size() - 1;
-    if (io->frames[i].use_for_next_frame) {
+    info.is_last = true;
+    if (io->frames[0].use_for_next_frame) {
       info.save_as_reference = 1;
     }
-    JXL_RETURN_IF_ERROR(EncodeFrame(memory_manager, cparams, info,
-                                    metadata.get(), io->frames[i], cms, pool,
-                                    &writer,
-                                    /* aux_out */ nullptr));
+    JXL_RETURN_IF_ERROR(EncodeFrame(
+        memory_manager, cparams, info, metadata.get(), io->frames[0], cms, pool,
+        &frame_writer,
+        /* aux_out */ nullptr, &metadata->transform_data.opsin_inverse_matrix));
+    metadata->transform_data.all_default =
+        Bundle::AllDefault(metadata->transform_data);
+    JXL_RETURN_IF_ERROR(write_codestream_headers());
+    JXL_RETURN_IF_ERROR(writer.AppendByteAligned(frame_writer.GetSpan()));
+  } else {
+    JXL_RETURN_IF_ERROR(write_codestream_headers());
+    for (size_t i = 0; i < io->frames.size(); i++) {
+      FrameInfo info;
+      info.is_last = i == io->frames.size() - 1;
+      if (io->frames[i].use_for_next_frame) {
+        info.save_as_reference = 1;
+      }
+      JXL_RETURN_IF_ERROR(EncodeFrame(memory_manager, cparams, info,
+                                      metadata.get(), io->frames[i], cms, pool,
+                                      &writer,
+                                      /* aux_out */ nullptr));
+    }
   }
 
   PaddedBytes output = std::move(writer).TakeBytes();

@@ -46,7 +46,9 @@
 #include "lib/jxl/enc_frame.h"
 #include "lib/jxl/enc_icc_codec.h"
 #include "lib/jxl/enc_params.h"
+#include "lib/jxl/enc_rdoq.h"
 #include "lib/jxl/encode_internal.h"
+#include "lib/jxl/fields.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image_metadata.h"
 #include "lib/jxl/jpeg/enc_jpeg_data.h"
@@ -858,9 +860,11 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
 
   if (!wrote_bytes) {
     jxl::JxlEncoderQueuedFrame* first_frame = nullptr;
+    jxl::JxlEncoderQueuedInput* first_frame_input = nullptr;
     for (auto& qi : input_queue) {
       if (qi.frame) {
         first_frame = qi.frame.get();
+        first_frame_input = &qi;
         break;
       }
     }
@@ -1010,6 +1014,82 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
     }
     jxl::AuxOut* aux_out =
         first_frame ? first_frame->option_values.aux_out : nullptr;
+    metadata.m.num_extra_channels = metadata.m.extra_channel_info.size();
+    metadata.transform_data.nonserialized_xyb_encoded = metadata.m.xyb_encoded;
+    if (jxl::ActiveQuantBiasMode() != jxl::QuantBiasMode::kDefault &&
+        !store_jpeg_metadata && first_frame && first_frame_input &&
+        frames_closed && num_queued_frames == 1 && !metadata.m.have_animation &&
+        !metadata.m.have_preview && metadata.m.xyb_encoded &&
+        first_frame_input->output_mode != 2 &&
+        !first_frame->frame_data.IsJPEG() &&
+        jxl::Bundle::AllDefault(metadata.transform_data.opsin_inverse_matrix)) {
+      bool all_ec_init = true;
+      for (unsigned idx = 0; idx < first_frame->ec_initialized.size(); idx++) {
+        if (!first_frame->ec_initialized[idx]) {
+          all_ec_init = false;
+          break;
+        }
+      }
+      const auto& ov = first_frame->option_values;
+      const auto& cp = ov.cparams;
+      size_t save_as_reference = ov.header.layer_info.save_as_reference;
+      if (all_ec_init && save_as_reference < 3 && !ov.lossless &&
+          !cp.IsLossless() && !cp.modular_mode && !cp.max_error_mode &&
+          cp.speed_tier <= jxl::SpeedTier::kSquirrel &&
+          cp.progressive_dc <= 0 && cp.patches != jxl::Override::kOn &&
+          cp.dots != jxl::Override::kOn) {
+        first_frame->option_values.cparams.color_transform =
+            jxl::ColorTransform::kXYB;
+        jxl::FrameInfo frame_info;
+        frame_info.is_last = true;
+        frame_info.save_as_reference = save_as_reference;
+        frame_info.source = ov.header.layer_info.blend_info.source;
+        frame_info.clamp = FROM_JXL_BOOL(ov.header.layer_info.blend_info.clamp);
+        frame_info.alpha_channel = ov.header.layer_info.blend_info.alpha;
+        frame_info.extra_channel_blending_info.resize(
+            metadata.m.num_extra_channels);
+        JxlBlendInfo default_blend_info = ov.header.layer_info.blend_info;
+        for (size_t i = 0; i < metadata.m.num_extra_channels; ++i) {
+          auto& to = frame_info.extra_channel_blending_info[i];
+          const auto& from = i < ov.extra_channel_blend_info.size()
+                                 ? ov.extra_channel_blend_info[i]
+                                 : default_blend_info;
+          to.mode = static_cast<jxl::BlendMode>(from.blendmode);
+          to.source = from.source;
+          to.alpha_channel = from.alpha;
+          to.clamp = (from.clamp != 0);
+        }
+        frame_info.origin.x0 = ov.header.layer_info.crop_x0;
+        frame_info.origin.y0 = ov.header.layer_info.crop_y0;
+        frame_info.blendmode = static_cast<jxl::BlendMode>(
+            ov.header.layer_info.blend_info.blendmode);
+        frame_info.blend =
+            ov.header.layer_info.blend_info.blendmode != JXL_BLEND_REPLACE;
+        frame_info.image_bit_depth = ov.image_bit_depth;
+        frame_info.duration = 0;
+        frame_info.timecode = 0;
+        frame_info.name = ov.frame_name;
+        jxl::CompressParams frame_cparams = first_frame->option_values.cparams;
+        frame_cparams.output_mode = first_frame_input->output_mode;
+        JxlEncoderOutputProcessorWrapper frame_output(&memory_manager);
+        if (!jxl::EncodeFrame(&memory_manager, frame_cparams, frame_info,
+                              &metadata, first_frame->frame_data, cms,
+                              thread_pool.get(), &frame_output, ov.aux_out,
+                              nullptr,
+                              &metadata.transform_data.opsin_inverse_matrix)) {
+          return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
+                               "Failed to encode frame");
+        }
+        JXL_RETURN_IF_ERROR(frame_output.SetFinalizedPosition());
+        preencoded_first_frame_bytes.clear();
+        JXL_RETURN_IF_ERROR(
+            frame_output.CopyOutput(preencoded_first_frame_bytes));
+        has_preencoded_first_frame = true;
+        metadata.transform_data.all_default =
+            jxl::Bundle::AllDefault(metadata.transform_data);
+      }
+    }
+
     jxl::BitWriter writer{&memory_manager};
     if (!WriteCodestreamHeaders(&metadata, &writer, aux_out)) {
       return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
@@ -1210,65 +1290,72 @@ jxl::Status JxlEncoder::ProcessOneEnqueuedInput() {
       frame_index_box.AddFrame(codestream_bytes_written_end_of_frame, duration,
                                input_frame->option_values.frame_index_box);
 
-      size_t save_as_reference =
-          input_frame->option_values.header.layer_info.save_as_reference;
-      if (save_as_reference >= 3) {
-        return JXL_API_ERROR(
-            this, JXL_ENC_ERR_API_USAGE,
-            "Cannot use save_as_reference values >=3 (found: %d)",
-            static_cast<int>(save_as_reference));
-      }
+      if (has_preencoded_first_frame) {
+        JXL_RETURN_IF_ERROR(
+            AppendData(output_processor, preencoded_first_frame_bytes));
+        preencoded_first_frame_bytes.clear();
+        has_preencoded_first_frame = false;
+      } else {
+        size_t save_as_reference =
+            input_frame->option_values.header.layer_info.save_as_reference;
+        if (save_as_reference >= 3) {
+          return JXL_API_ERROR(
+              this, JXL_ENC_ERR_API_USAGE,
+              "Cannot use save_as_reference values >=3 (found: %d)",
+              static_cast<int>(save_as_reference));
+        }
 
-      jxl::FrameInfo frame_info;
-      frame_info.is_last = last_frame;
-      frame_info.save_as_reference = save_as_reference;
-      frame_info.source =
-          input_frame->option_values.header.layer_info.blend_info.source;
-      frame_info.clamp = FROM_JXL_BOOL(
-          input_frame->option_values.header.layer_info.blend_info.clamp);
-      frame_info.alpha_channel =
-          input_frame->option_values.header.layer_info.blend_info.alpha;
-      frame_info.extra_channel_blending_info.resize(
-          metadata.m.num_extra_channels);
-      // If extra channel blend info has not been set, use the blend mode from
-      // the layer_info.
-      JxlBlendInfo default_blend_info =
-          input_frame->option_values.header.layer_info.blend_info;
-      for (size_t i = 0; i < metadata.m.num_extra_channels; ++i) {
-        auto& to = frame_info.extra_channel_blending_info[i];
-        const auto& from =
-            i < input_frame->option_values.extra_channel_blend_info.size()
-                ? input_frame->option_values.extra_channel_blend_info[i]
-                : default_blend_info;
-        to.mode = static_cast<jxl::BlendMode>(from.blendmode);
-        to.source = from.source;
-        to.alpha_channel = from.alpha;
-        to.clamp = (from.clamp != 0);
+        jxl::FrameInfo frame_info;
+        frame_info.is_last = last_frame;
+        frame_info.save_as_reference = save_as_reference;
+        frame_info.source =
+            input_frame->option_values.header.layer_info.blend_info.source;
+        frame_info.clamp = FROM_JXL_BOOL(
+            input_frame->option_values.header.layer_info.blend_info.clamp);
+        frame_info.alpha_channel =
+            input_frame->option_values.header.layer_info.blend_info.alpha;
+        frame_info.extra_channel_blending_info.resize(
+            metadata.m.num_extra_channels);
+        // If extra channel blend info has not been set, use the blend mode from
+        // the layer_info.
+        JxlBlendInfo default_blend_info =
+            input_frame->option_values.header.layer_info.blend_info;
+        for (size_t i = 0; i < metadata.m.num_extra_channels; ++i) {
+          auto& to = frame_info.extra_channel_blending_info[i];
+          const auto& from =
+              i < input_frame->option_values.extra_channel_blend_info.size()
+                  ? input_frame->option_values.extra_channel_blend_info[i]
+                  : default_blend_info;
+          to.mode = static_cast<jxl::BlendMode>(from.blendmode);
+          to.source = from.source;
+          to.alpha_channel = from.alpha;
+          to.clamp = (from.clamp != 0);
+        }
+        frame_info.origin.x0 =
+            input_frame->option_values.header.layer_info.crop_x0;
+        frame_info.origin.y0 =
+            input_frame->option_values.header.layer_info.crop_y0;
+        frame_info.blendmode = static_cast<jxl::BlendMode>(
+            input_frame->option_values.header.layer_info.blend_info.blendmode);
+        frame_info.blend =
+            input_frame->option_values.header.layer_info.blend_info.blendmode !=
+            JXL_BLEND_REPLACE;
+        frame_info.image_bit_depth = input_frame->option_values.image_bit_depth;
+        frame_info.duration = duration;
+        frame_info.timecode = timecode;
+        frame_info.name = input_frame->option_values.frame_name;
+        jxl::CompressParams frame_cparams = input_frame->option_values.cparams;
+        frame_cparams.output_mode = output_mode;
+        uint32_t jxlp_ctr = static_cast<uint32_t>(jxlp_counter);
+        if (!jxl::EncodeFrame(&memory_manager, frame_cparams, frame_info,
+                              &metadata, input_frame->frame_data, cms,
+                              thread_pool.get(), &output_processor,
+                              input_frame->option_values.aux_out, &jxlp_ctr)) {
+          return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
+                               "Failed to encode frame");
+        }
+        jxlp_counter = jxlp_ctr;
       }
-      frame_info.origin.x0 =
-          input_frame->option_values.header.layer_info.crop_x0;
-      frame_info.origin.y0 =
-          input_frame->option_values.header.layer_info.crop_y0;
-      frame_info.blendmode = static_cast<jxl::BlendMode>(
-          input_frame->option_values.header.layer_info.blend_info.blendmode);
-      frame_info.blend =
-          input_frame->option_values.header.layer_info.blend_info.blendmode !=
-          JXL_BLEND_REPLACE;
-      frame_info.image_bit_depth = input_frame->option_values.image_bit_depth;
-      frame_info.duration = duration;
-      frame_info.timecode = timecode;
-      frame_info.name = input_frame->option_values.frame_name;
-      jxl::CompressParams frame_cparams = input_frame->option_values.cparams;
-      frame_cparams.output_mode = output_mode;
-      uint32_t jxlp_ctr = static_cast<uint32_t>(jxlp_counter);
-      if (!jxl::EncodeFrame(&memory_manager, frame_cparams, frame_info,
-                            &metadata, input_frame->frame_data, cms,
-                            thread_pool.get(), &output_processor,
-                            input_frame->option_values.aux_out, &jxlp_ctr)) {
-        return JXL_API_ERROR(this, JXL_ENC_ERR_GENERIC,
-                             "Failed to encode frame");
-      }
-      jxlp_counter = jxlp_ctr;
       last_used_cparams = input_frame->option_values.cparams;
     } else {
       JXL_ENSURE(fast_lossless_frame);
@@ -2268,6 +2355,8 @@ void JxlEncoderReset(JxlEncoder* enc) {
   enc->encoder_options.clear();
   enc->codestream_bytes_written_end_of_frame = 0;
   enc->wrote_bytes = false;
+  enc->has_preencoded_first_frame = false;
+  enc->preencoded_first_frame_bytes.clear();
   enc->jxlp_counter = 0;
   enc->metadata = jxl::CodecMetadata();
   enc->last_used_cparams = jxl::CompressParams();

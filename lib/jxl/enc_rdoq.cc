@@ -9,9 +9,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -40,9 +42,11 @@
 #include "lib/jxl/enc_params.h"
 #include "lib/jxl/entropy_coder.h"
 #include "lib/jxl/epf.h"
+#include "lib/jxl/fields.h"
 #include "lib/jxl/frame_dimensions.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image.h"
+#include "lib/jxl/image_metadata.h"
 #include "lib/jxl/image_ops.h"
 #include "lib/jxl/memory_manager_internal.h"
 #include "lib/jxl/pack_signed.h"
@@ -66,6 +70,22 @@ namespace {
 
 constexpr float kKappaPix = 0.40f;
 constexpr float kTileArea = 64.0f;
+constexpr float kLambdaBase = 0.062f;
+constexpr float kLambdaExp = 0.04f;
+constexpr float kTexContrastMul = 0.40f;
+constexpr float kMaskDct8Min = 0.27f;
+
+JXL_INLINE float ComputeTexVarDist(float orig_e, float recon_e, float mul) {
+  if (mul <= 0.0f || orig_e <= 0.0f) return 0.0f;
+  const float s0 = std::sqrt(orig_e);
+  const float sr = (recon_e > 0.0f) ? std::sqrt(recon_e) : 0.0f;
+  const float d = s0 - sr;
+  return mul * d * d;
+}
+
+JXL_INLINE float Dct8PixelMaskWeight(float mask_val) {
+  return Clamp1((mask_val + 8.0f) / 80.0f, kMaskDct8Min, 1.12f);
+}
 
 JXL_INLINE int32_t ClampQF(int32_t qf) {
   return Clamp1<int32_t>(qf, 1, Quantizer::kQuantMax);
@@ -104,12 +124,13 @@ float ComputeBlockTargetQ(const ImageF& initial_quant_field, size_t bx,
 // Exact AC coefficient dequantization bias model matching Quantizer /
 // AdjustQuantBias:
 //   0 -> 0, +-1 -> +-biases[c], |k| >= 2 -> k - biases[3] / k.
-JXL_INLINE float DebiasCoeffLevel(size_t c, int32_t k) {
+JXL_INLINE float DebiasCoeffLevel(size_t c, int32_t k,
+                                  const float* quant_biases) {
   if (k == 0) return 0.0f;
-  if (k == 1) return kDefaultQuantBias[c];
-  if (k == -1) return -kDefaultQuantBias[c];
+  if (k == 1) return quant_biases[c];
+  if (k == -1) return -quant_biases[c];
   float fk = static_cast<float>(k);
-  return fk - kDefaultQuantBias[3] / fk;
+  return fk - quant_biases[3] / fk;
 }
 
 // Perceptual channel parameters for pixel L8-quad distortion matching
@@ -194,6 +215,101 @@ UnmaskedHFInfo DetectUnmaskedHF(AcStrategyType acs_type, const float* coeffs_in,
   return info;
 }
 
+// Accumulates weighted least-squares sufficient statistics for fitting
+// quant_biases[0..3] over one transformed block using the winning (qf, k).
+void AccumulateBlockQuantBiasStats(
+    size_t c, AcStrategyType acs_type, const float* coeffs_in,
+    const Quantizer& quantizer, float qm_multiplier, int32_t qf, float q_target,
+    int32_t predicted_nzeros, const coeff_order_t* order,
+    bool non_perceptual_mse, float unmasked_lf_dist_mul,
+    float unmasked_hf_dist_mul, const int32_t* quantized,
+    QuantBiasStats* stats) {
+  const AcStrategy acs = AcStrategy::FromRawStrategy(acs_type);
+  size_t cx = acs.covered_blocks_x();
+  size_t cy = acs.covered_blocks_y();
+  CoefficientLayout(&cy, &cx);
+  const size_t covered_blocks = cx * cy;
+  const size_t size = covered_blocks * kDCTBlockSize;
+
+  const float* inv = quantizer.InvDequantMatrix(acs_type, c);
+  const int32_t qf_clamped = ClampQF(qf);
+  const float qac = quantizer.Scale() * static_cast<float>(qf_clamped);
+  const float qtarget_qm = q_target * qm_multiplier;
+  const float s_base = (qac > 0.0f) ? (q_target / qac) : 1.0f;
+  const float sqrt_b = std::sqrt(static_cast<float>(covered_blocks));
+  const size_t num_cols = cx * kBlockDim;
+
+  const bool is_pure_dct =
+      (acs_type == AcStrategyType::DCT || covered_blocks >= 2);
+  bool has_mf_hf = false;
+  if (is_pure_dct && unmasked_lf_dist_mul > 1.0f && !non_perceptual_mse &&
+      predicted_nzeros <= 1) {
+    for (size_t p = covered_blocks; p < size; ++p) {
+      const coeff_order_t idx = order[p];
+      const size_t r_pos = idx / num_cols;
+      const size_t c_pos = idx % num_cols;
+      if (r_pos >= 2 * cy || c_pos >= 2 * cx) {
+        if (inv[idx] > 0.0f && std::abs(coeffs_in[idx] * inv[idx] *
+                                        qtarget_qm) >= 0.52f * s_base) {
+          has_mf_hf = true;
+          break;
+        }
+      }
+    }
+  }
+  const float eff_lf_dist_mul =
+      (is_pure_dct && unmasked_lf_dist_mul > 1.0f && !non_perceptual_mse &&
+       predicted_nzeros <= 1 && !has_mf_hf)
+          ? unmasked_lf_dist_mul
+          : 1.0f;
+  const UnmaskedHFInfo unmasked_hf =
+      (!non_perceptual_mse && unmasked_hf_dist_mul > 1.0f)
+          ? DetectUnmaskedHF(acs_type, coeffs_in, inv, qtarget_qm)
+          : UnmaskedHFInfo{};
+
+  for (size_t p = covered_blocks; p < size; ++p) {
+    const coeff_order_t idx = order[p];
+    const int32_t k = quantized[idx];
+    if (k == 0 || inv[idx] <= 0.0f) continue;
+
+    const size_t r_pos = idx / num_cols;
+    const size_t c_pos = idx % num_cols;
+    const double w_dist = static_cast<double>(
+        (unmasked_hf.active && (r_pos >= 3 * cy || c_pos >= 3 * cx))
+            ? unmasked_hf_dist_mul
+            : ((r_pos < 2 * cy && c_pos < 2 * cx) ? eff_lf_dist_mul : 1.0f));
+    float mse_mul = 1.0f;
+    if (non_perceptual_mse && covered_blocks > 1) {
+      const float norm_rc =
+          (r_pos == 0 ? 2.0f : 1.0f) * (c_pos == 0 ? 2.0f : 1.0f);
+      mse_mul = sqrt_b * std::sqrt(norm_rc);
+    } else if (non_perceptual_mse) {
+      const float norm_rc =
+          (r_pos == 0 ? 2.0f : 1.0f) * (c_pos == 0 ? 2.0f : 1.0f);
+      mse_mul = std::sqrt(norm_rc);
+    }
+    const double u_val =
+        static_cast<double>(coeffs_in[idx] * (inv[idx] * qtarget_qm) * mse_mul);
+    const double eff_s = static_cast<double>(s_base * mse_mul);
+    const bool is_mf_hf =
+        (!non_perceptual_mse && (r_pos >= 2 * cy || c_pos >= 2 * cx));
+    const double tex_g = is_mf_hf ? 0.08 : 0.0;
+    if (k == 1 || k == -1) {
+      const double sk = static_cast<double>(k) * eff_s;
+      stats->num[c] += w_dist * sk * u_val;
+      stats->den[c] += (1.0 - tex_g) * w_dist * sk * sk;
+      stats->count[c] += 1.0;
+    } else {
+      const double fk = static_cast<double>(k);
+      const double a = eff_s / fk;
+      const double target = (1.0 - tex_g) * eff_s * fk - u_val;
+      stats->num[3] += w_dist * a * target;
+      stats->den[3] += (1.0 - tex_g) * w_dist * a * a;
+      stats->count[3] += 1.0;
+    }
+  }
+}
+
 // Computes exact backward-DP trellis RDOQ for one canonical transform block on
 // channel `c` using target-normalized coefficients and rate model.
 // `nzeros_out` returns total nonzero AC coefficients in the block.
@@ -203,10 +319,10 @@ RDOQTrellisResult RunTrellisRDOQCore(
     int32_t predicted_nzeros, size_t block_ctx, const BlockCtxMap& bcm,
     const coeff_order_t* order, const RDORateModel& rate_model, float lambda,
     int band_width, int multi_level, bool non_perceptual_mse,
-    float jnd_zero_floor, float unmasked_lf_dist_mul,
-    float unmasked_hf_dist_mul, const float* coupled_x_coeffs,
-    const float* coupled_b_coeffs, float coupled_x_factor,
-    float coupled_b_factor, const float* coupled_x_inv,
+    float jnd_zero_floor, float tex_contrast_mul, float unmasked_lf_dist_mul,
+    float unmasked_hf_dist_mul, const float* quant_biases,
+    const float* coupled_x_coeffs, const float* coupled_b_coeffs,
+    float coupled_x_factor, float coupled_b_factor, const float* coupled_x_inv,
     const float* coupled_b_inv, float coupled_x_qm_mul, float coupled_b_qm_mul,
     float coupled_x_scale, float coupled_b_scale, bool enable_cfl_coupling,
     BlockTrellisWorkspace* ws, int32_t* quantized_out) {
@@ -289,6 +405,7 @@ RDOQTrellisResult RunTrellisRDOQCore(
   size_t last_active_p = covered_blocks - 1;
   float tail_dist_sum = 0.0f;
   float all_zero_dist_sum = 0.0f;
+  float hf_orig_e = 0.0f;
 
   for (size_t p = covered_blocks; p < size; ++p) {
     const coeff_order_t idx = order[p];
@@ -315,13 +432,17 @@ RDOQTrellisResult RunTrellisRDOQCore(
     const float abs_u = std::abs(u_val);
     const float abs_u_unscaled = (mse_mul > 0.0f) ? (abs_u / mse_mul) : abs_u;
     const float d0_freq = w_dist * (u_val * u_val);
+    if (r_pos >= 2 * cy || c_pos >= 2 * cx) {
+      hf_orig_e += u_val * u_val;
+    }
 
     // Optional cross-channel CfL coupling at kTortoise on channel Y (c == 1).
     auto chroma_extra_cost = [&](int32_t k_y) -> float {
       if (!enable_cfl_coupling) return 0.0f;
       float recon_y_raw = 0.0f;
       if (k_y != 0 && qac_qm > 0.0f) {
-        recon_y_raw = DebiasCoeffLevel(1, k_y) * deq[idx] / qac_qm;
+        recon_y_raw =
+            DebiasCoeffLevel(1, k_y, quant_biases) * deq[idx] / qac_qm;
       }
       auto eval_ch = [&](const float* ch_in, const float* ch_inv,
                          float ch_qm_mul, float ch_scale, float factor,
@@ -339,11 +460,13 @@ RDOQTrellisResult RunTrellisRDOQCore(
         const float abs_uch_unscaled =
             (mse_mul > 0.0f) ? (std::abs(u_ch) / mse_mul) : std::abs(u_ch);
         const float ch_dz =
-            std::max(jnd_zero_floor, 0.5f * s_base * kDefaultQuantBias[ch_idx]);
+            std::max(jnd_zero_floor,
+                     0.5f * s_base * std::min(1.0f, quant_biases[ch_idx]));
         if (abs_uch_unscaled < ch_dz) k_ch = 0;
         const float d_ch0 = u_ch * u_ch;
         if (k_ch == 0) return d_ch0;
-        const float diff_ch = u_ch - eff_s_ch * DebiasCoeffLevel(ch_idx, k_ch);
+        const float diff_ch =
+            u_ch - eff_s_ch * DebiasCoeffLevel(ch_idx, k_ch, quant_biases);
         const float d_chk = diff_ch * diff_ch + lambda * 4.5f;
         return std::min(d_ch0, d_chk);
       };
@@ -374,7 +497,9 @@ RDOQTrellisResult RunTrellisRDOQCore(
       k1 = k_near;
       if (multi_level > 1 && abs_scaled >= 0.35f) {
         if (std::abs(k_near) == 1) {
-          k2 = (k_near > 0) ? 2 : -2;
+          if (abs_scaled > 1.25f) {
+            k2 = (k_near > 0) ? 2 : -2;
+          }
         } else {
           float resid = scaled_in - static_cast<float>(k_near);
           k2 = (resid >= 0.0f) ? (k_near + 1) : (k_near - 1);
@@ -394,7 +519,7 @@ RDOQTrellisResult RunTrellisRDOQCore(
 
     if (k1 != 0) {
       last_active_p = p;
-      const float r1 = u_val - eff_s * DebiasCoeffLevel(c, k1);
+      const float r1 = u_val - eff_s * DebiasCoeffLevel(c, k1, quant_biases);
       ws->dist1[p] = w_dist * (r1 * r1);
       if (enable_cfl_coupling) {
         ws->cfl_extra_k1[p] = Clamp1(0.25f * (chroma_extra_cost(k1) - extra0),
@@ -407,7 +532,7 @@ RDOQTrellisResult RunTrellisRDOQCore(
       }
     }
     if (k2 != 0) {
-      const float r2 = u_val - eff_s * DebiasCoeffLevel(c, k2);
+      const float r2 = u_val - eff_s * DebiasCoeffLevel(c, k2, quant_biases);
       ws->dist2[p] = w_dist * (r2 * r2);
       if (enable_cfl_coupling) {
         ws->cfl_extra_k2[p] = Clamp1(0.25f * (chroma_extra_cost(k2) - extra0),
@@ -422,10 +547,11 @@ RDOQTrellisResult RunTrellisRDOQCore(
   }
 
   const float r_zero_block = lambda * rate_model.TokenCost(nz_ctx, 0);
+  const float d_var_zero = ComputeTexVarDist(hf_orig_e, 0.0f, tex_contrast_mul);
   if (last_active_p < covered_blocks) {
-    return RDOQTrellisResult{all_zero_dist_sum + r_zero_block,
-                             all_zero_dist_sum, rate_model.TokenCost(nz_ctx, 0),
-                             0};
+    return RDOQTrellisResult{all_zero_dist_sum + d_var_zero + r_zero_block,
+                             all_zero_dist_sum, d_var_zero,
+                             rate_model.TokenCost(nz_ctx, 0), 0};
   }
 
   for (size_t p = last_active_p + 1; p < size; ++p) {
@@ -434,31 +560,77 @@ RDOQTrellisResult RunTrellisRDOQCore(
 
   // Reference nonzero count from backward local RDO for narrow-band trellis.
   const size_t dp_len = last_active_p + 1;
-  ws->band.z_ref[dp_len] = 0;
-  for (size_t p = last_active_p; p >= covered_blocks; --p) {
-    const int32_t z_next = ws->band.z_ref[p + 1];
-    const int32_t k1 = ws->cand_k1[p];
-    bool nz_ref = false;
-    if (k1 != 0) {
-      const size_t ctx1 =
-          zd_offset + ZeroDensityContext(static_cast<size_t>(z_next + 1), p,
-                                         covered_blocks, log2_covered_blocks,
-                                         0);
-      const float cfl1 = enable_cfl_coupling ? ws->cfl_extra_k1[p] : 0.0f;
-      const float j1_est = ws->dist1[p] + cfl1 +
-                           lambda * rate_model.TokenCost(ctx1, PackSigned(k1));
-      float r0_est = 0.0f;
-      if (z_next > 0) {
-        const size_t ctx0 =
-            zd_offset + ZeroDensityContext(static_cast<size_t>(z_next), p,
+  auto compute_z_ref = [&](float* hf_recon_e_out) {
+    if (hf_recon_e_out != nullptr) *hf_recon_e_out = 0.0f;
+    ws->band.z_ref[dp_len] = 0;
+    for (size_t p = last_active_p; p >= covered_blocks; --p) {
+      const int32_t z_next = ws->band.z_ref[p + 1];
+      const int32_t k1 = ws->cand_k1[p];
+      bool nz_ref = false;
+      if (k1 != 0) {
+        const size_t ctx1 =
+            zd_offset + ZeroDensityContext(static_cast<size_t>(z_next + 1), p,
                                            covered_blocks, log2_covered_blocks,
                                            0);
-        r0_est = rate_model.TokenCost(ctx0, 0);
+        const float cfl1 = enable_cfl_coupling ? ws->cfl_extra_k1[p] : 0.0f;
+        const float j1_est =
+            ws->dist1[p] + cfl1 +
+            lambda * rate_model.TokenCost(ctx1, PackSigned(k1));
+        float r0_est = 0.0f;
+        if (z_next > 0) {
+          const size_t ctx0 =
+              zd_offset + ZeroDensityContext(static_cast<size_t>(z_next), p,
+                                             covered_blocks,
+                                             log2_covered_blocks, 0);
+          r0_est = rate_model.TokenCost(ctx0, 0);
+        }
+        const float j0_est = ws->dist0[p] + lambda * r0_est;
+        nz_ref = (j1_est < j0_est);
       }
-      const float j0_est = ws->dist0[p] + lambda * r0_est;
-      nz_ref = (j1_est < j0_est);
+      if (nz_ref && hf_recon_e_out != nullptr) {
+        const coeff_order_t idx = order[p];
+        const size_t r_pos = idx / num_cols;
+        const size_t c_pos = idx % num_cols;
+        if (r_pos >= 2 * cy || c_pos >= 2 * cx) {
+          const float eff_s_p = s_base * ws->mse_scale[p];
+          const float v1 = eff_s_p * DebiasCoeffLevel(c, k1, quant_biases);
+          *hf_recon_e_out += v1 * v1;
+        }
+      }
+      ws->band.z_ref[p] = z_next + (nz_ref ? 1 : 0);
     }
-    ws->band.z_ref[p] = z_next + (nz_ref ? 1 : 0);
+  };
+
+  float hf_recon_e_ref = 0.0f;
+  compute_z_ref(&hf_recon_e_ref);
+  if (tex_contrast_mul > 0.0f && hf_orig_e > 1e-8f &&
+      hf_orig_e > hf_recon_e_ref) {
+    const float s0 = std::sqrt(hf_orig_e);
+    const float sr = std::sqrt(hf_recon_e_ref);
+    const float g_tex = (sr > 1e-6f)
+                            ? std::min(0.32f, tex_contrast_mul * (s0 - sr) / sr)
+                            : 0.32f;
+    if (g_tex > 0.0f) {
+      for (size_t p = covered_blocks; p <= last_active_p; ++p) {
+        const coeff_order_t idx = order[p];
+        const size_t r_pos = idx / num_cols;
+        const size_t c_pos = idx % num_cols;
+        if (r_pos < 2 * cy && c_pos < 2 * cx) continue;
+        const float u2 = ws->u[p] * ws->u[p];
+        const float eff_s_p = s_base * ws->mse_scale[p];
+        if (ws->cand_k1[p] != 0) {
+          const float v1 =
+              eff_s_p * DebiasCoeffLevel(c, ws->cand_k1[p], quant_biases);
+          ws->dist1[p] -= g_tex * std::min(v1 * v1, u2);
+        }
+        if (ws->cand_k2[p] != 0) {
+          const float v2 =
+              eff_s_p * DebiasCoeffLevel(c, ws->cand_k2[p], quant_biases);
+          ws->dist2[p] -= g_tex * std::min(v2 * v2, u2);
+        }
+      }
+      compute_z_ref(nullptr);
+    }
   }
 
   // For full precision when dp_len is modest relative to band_width, allow full
@@ -625,11 +797,12 @@ RDOQTrellisResult RunTrellisRDOQCore(
       rate_model.TokenCost(nz_ctx, static_cast<uint32_t>(best_nz));
 
   if (best_nz == 0) {
-    return RDOQTrellisResult{all_zero_dist_sum + r_zero_block,
-                             all_zero_dist_sum, rate_model.TokenCost(nz_ctx, 0),
-                             0};
+    return RDOQTrellisResult{all_zero_dist_sum + d_var_zero + r_zero_block,
+                             all_zero_dist_sum, d_var_zero,
+                             rate_model.TokenCost(nz_ctx, 0), 0};
   }
 
+  float hf_recon_e = 0.0f;
   for (size_t p = covered_blocks; p <= last_active_p; ++p) {
     if (z_cur == 0) {
       exact_dist += ws->dist0[p];
@@ -647,30 +820,36 @@ RDOQTrellisResult RunTrellisRDOQCore(
       exact_dist += ws->dist0[p];
       prev_cur = 0;
     } else {
-      quantized_out[order[p]] = k;
-      if (k == ws->cand_k1[p]) {
-        exact_dist += ws->dist1[p];
-      } else if (k == ws->cand_k2[p]) {
-        exact_dist += ws->dist2[p];
-      } else {
-        const coeff_order_t idx = order[p];
-        const size_t r_pos = idx / num_cols;
-        const size_t c_pos = idx % num_cols;
-        const float w_dist =
-            (unmasked_hf.active && (r_pos >= 3 * cy || c_pos >= 3 * cx))
-                ? unmasked_hf_dist_mul
-                : ((r_pos < 2 * cy && c_pos < 2 * cx) ? eff_lf_dist_mul : 1.0f);
-        const float eff_s = s_base * ws->mse_scale[p];
-        const float r = ws->u[p] - eff_s * DebiasCoeffLevel(c, k);
-        exact_dist += w_dist * (r * r);
+      const coeff_order_t idx = order[p];
+      quantized_out[idx] = k;
+      const size_t r_pos = idx / num_cols;
+      const size_t c_pos = idx % num_cols;
+      const float w_dist =
+          (unmasked_hf.active && (r_pos >= 3 * cy || c_pos >= 3 * cx))
+              ? unmasked_hf_dist_mul
+              : ((r_pos < 2 * cy && c_pos < 2 * cx) ? eff_lf_dist_mul : 1.0f);
+      const float eff_s = s_base * ws->mse_scale[p];
+      const float recon_v = eff_s * DebiasCoeffLevel(c, k, quant_biases);
+      const float r = ws->u[p] - recon_v;
+      exact_dist += w_dist * (r * r);
+      if (r_pos >= 2 * cy || c_pos >= 2 * cx) {
+        hf_recon_e += recon_v * recon_v;
       }
       prev_cur = 1;
       --z_cur;
     }
   }
   JXL_DASSERT(z_cur == 0);
-  return RDOQTrellisResult{exact_dist + lambda * exact_rate, exact_dist,
-                           exact_rate, best_nz};
+  const float d_var =
+      ComputeTexVarDist(hf_orig_e, hf_recon_e, tex_contrast_mul);
+  const float total_j = exact_dist + d_var + lambda * exact_rate;
+  const float all_zero_j = all_zero_dist_sum + d_var_zero + r_zero_block;
+  if (total_j >= all_zero_j) {
+    std::fill_n(quantized_out, size, 0);
+    return RDOQTrellisResult{all_zero_j, all_zero_dist_sum, d_var_zero,
+                             rate_model.TokenCost(nz_ctx, 0), 0};
+  }
+  return RDOQTrellisResult{total_j, exact_dist, d_var, exact_rate, best_nz};
 }
 
 // Fast exact-rate O(size) RDO quantization used during tile search at e7 to
@@ -681,8 +860,9 @@ RDOQTrellisResult RunFastExactRDOBlock(
     const Quantizer& quantizer, float qm_multiplier, int32_t qf, float q_target,
     int32_t predicted_nzeros, size_t block_ctx, const BlockCtxMap& bcm,
     const coeff_order_t* order, const RDORateModel& rate_model, float lambda,
-    bool non_perceptual_mse, float unmasked_hf_dist_mul,
-    BlockTrellisWorkspace* ws, int32_t* quantized_out) {
+    bool non_perceptual_mse, float tex_contrast_mul, float unmasked_hf_dist_mul,
+    const float* quant_biases, BlockTrellisWorkspace* ws,
+    int32_t* quantized_out) {
   const AcStrategy acs = AcStrategy::FromRawStrategy(acs_type);
   size_t cx = acs.covered_blocks_x();
   size_t cy = acs.covered_blocks_y();
@@ -714,7 +894,7 @@ RDOQTrellisResult RunFastExactRDOBlock(
 
   const float sqrt_b = std::sqrt(static_cast<float>(covered_blocks));
   const size_t num_cols = cx * kBlockDim;
-  const float deadzone = 0.5f * s_base * kDefaultQuantBias[c];
+  const float deadzone = 0.5f * s_base * std::min(1.0f, quant_biases[c]);
 
   const UnmaskedHFInfo unmasked_hf =
       (!non_perceptual_mse && unmasked_hf_dist_mul > 1.0f)
@@ -729,6 +909,8 @@ RDOQTrellisResult RunFastExactRDOBlock(
   size_t nz = 0;
   size_t last_nz_p = 0;
   float total_dist0 = 0.0f;
+  float hf_orig_e = 0.0f;
+  float hf_recon_e_init = 0.0f;
   for (size_t p = covered_blocks; p < size; ++p) {
     const coeff_order_t idx = order[p];
     const size_t r = idx / num_cols;
@@ -745,6 +927,10 @@ RDOQTrellisResult RunFastExactRDOBlock(
     const float d0 = w_dist * (u_val * u_val);
     ws->dist0[p] = d0;
     total_dist0 += d0;
+    const bool is_mf_hf = (r >= 2 * cy || col >= 2 * cx);
+    if (is_mf_hf) {
+      hf_orig_e += u_val * u_val;
+    }
 
     if (inv[idx] > 0.0f) {
       const float abs_u_unscaled =
@@ -755,13 +941,29 @@ RDOQTrellisResult RunFastExactRDOBlock(
         quantized_out[idx] = k;
         ++nz;
         last_nz_p = p;
+        if (is_mf_hf) {
+          const float rv =
+              (s_base * mse_mul) * DebiasCoeffLevel(c, k, quant_biases);
+          hf_recon_e_init += rv * rv;
+        }
       }
     }
   }
 
   const float r0 = rate_model.TokenCost(nz_ctx, 0);
+  const float d_var_zero = ComputeTexVarDist(hf_orig_e, 0.0f, tex_contrast_mul);
   if (nz == 0) {
-    return RDOQTrellisResult{total_dist0 + lambda * r0, total_dist0, r0, 0};
+    return RDOQTrellisResult{total_dist0 + d_var_zero + lambda * r0,
+                             total_dist0, d_var_zero, r0, 0};
+  }
+
+  float g_tex = 0.0f;
+  if (tex_contrast_mul > 0.0f && hf_orig_e > 1e-8f &&
+      hf_orig_e > hf_recon_e_init) {
+    const float s0 = std::sqrt(hf_orig_e);
+    const float sr = std::sqrt(hf_recon_e_init);
+    g_tex = (sr > 1e-6f) ? std::min(0.32f, tex_contrast_mul * (s0 - sr) / sr)
+                         : 0.32f;
   }
 
   // Backward RDO filter pass tracking running rem_nz so sparse multi-block
@@ -773,19 +975,28 @@ RDOQTrellisResult RunFastExactRDOBlock(
     if (k == 0) continue;
     const size_t r = idx / num_cols;
     const size_t col = idx % num_cols;
+    const bool is_mf_hf = (r >= 2 * cy || col >= 2 * cx);
     const float w_dist = coeff_w_dist(r, col);
     const size_t ctx1 =
         zd_offset + ZeroDensityContext(back_nz + 1, p, covered_blocks,
                                        log2_covered_blocks, 0);
     const float eff_s = s_base * ws->mse_scale[p];
-    const float diff = ws->u[p] - eff_s * DebiasCoeffLevel(c, k);
-    float best_j = w_dist * (diff * diff) +
+    const float u2 = ws->u[p] * ws->u[p];
+    const float rv = eff_s * DebiasCoeffLevel(c, k, quant_biases);
+    const float diff = ws->u[p] - rv;
+    const float bonus =
+        (is_mf_hf && g_tex > 0.0f) ? (g_tex * std::min(rv * rv, u2)) : 0.0f;
+    float best_j = w_dist * (diff * diff) - bonus +
                    lambda * rate_model.TokenCost(ctx1, PackSigned(k));
     if (std::abs(k) > 1) {
       const int32_t k_alt = (k > 0) ? (k - 1) : (k + 1);
-      const float diff_alt = ws->u[p] - eff_s * DebiasCoeffLevel(c, k_alt);
+      const float rv_alt = eff_s * DebiasCoeffLevel(c, k_alt, quant_biases);
+      const float diff_alt = ws->u[p] - rv_alt;
+      const float bonus_alt = (is_mf_hf && g_tex > 0.0f)
+                                  ? (g_tex * std::min(rv_alt * rv_alt, u2))
+                                  : 0.0f;
       const float j_alt =
-          w_dist * (diff_alt * diff_alt) +
+          w_dist * (diff_alt * diff_alt) - bonus_alt +
           lambda * rate_model.TokenCost(ctx1, PackSigned(k_alt));
       if (j_alt < best_j) {
         k = k_alt;
@@ -809,7 +1020,8 @@ RDOQTrellisResult RunFastExactRDOBlock(
   }
   nz = back_nz;
   if (nz == 0) {
-    return RDOQTrellisResult{total_dist0 + lambda * r0, total_dist0, r0, 0};
+    return RDOQTrellisResult{total_dist0 + d_var_zero + lambda * r0,
+                             total_dist0, d_var_zero, r0, 0};
   }
   while (last_nz_p > covered_blocks && quantized_out[order[last_nz_p]] == 0) {
     --last_nz_p;
@@ -821,6 +1033,7 @@ RDOQTrellisResult RunFastExactRDOBlock(
   size_t prev = (nz > size / 16) ? size_t{0} : size_t{1};
   float total_dist = 0.0f;
   float total_rate = rate_model.TokenCost(nz_ctx, static_cast<uint32_t>(nz));
+  float hf_recon_e = 0.0f;
 
   for (size_t p = covered_blocks; p <= last_nz_p; ++p) {
     const coeff_order_t idx = order[p];
@@ -831,29 +1044,40 @@ RDOQTrellisResult RunFastExactRDOBlock(
     if (k != 0) {
       const size_t r = idx / num_cols;
       const size_t col = idx % num_cols;
+      const bool is_mf_hf = (r >= 2 * cy || col >= 2 * cx);
       const float w_dist = coeff_w_dist(r, col);
       const float eff_s = s_base * ws->mse_scale[p];
-      const float diff = ws->u[p] - eff_s * DebiasCoeffLevel(c, k);
+      const float u2 = ws->u[p] * ws->u[p];
+      const float rv = eff_s * DebiasCoeffLevel(c, k, quant_biases);
+      const float diff = ws->u[p] - rv;
       const float dk = w_dist * (diff * diff);
       const float rk = rate_model.TokenCost(ctx, PackSigned(k));
+      const float bonus =
+          (is_mf_hf && g_tex > 0.0f) ? (g_tex * std::min(rv * rv, u2)) : 0.0f;
       // Consider +/-1 magnitude refinement in-place without changing nzeros.
       if (std::abs(k) > 1) {
         int32_t k_alt = (k > 0) ? (k - 1) : (k + 1);
-        const float diff_alt = ws->u[p] - eff_s * DebiasCoeffLevel(c, k_alt);
+        const float rv_alt = eff_s * DebiasCoeffLevel(c, k_alt, quant_biases);
+        const float diff_alt = ws->u[p] - rv_alt;
         const float dk_alt = w_dist * (diff_alt * diff_alt);
         const float rk_alt = rate_model.TokenCost(ctx, PackSigned(k_alt));
-        if (dk_alt + lambda * rk_alt < dk + lambda * rk) {
+        const float bonus_alt = (is_mf_hf && g_tex > 0.0f)
+                                    ? (g_tex * std::min(rv_alt * rv_alt, u2))
+                                    : 0.0f;
+        if (dk_alt - bonus_alt + lambda * rk_alt < dk - bonus + lambda * rk) {
           k = k_alt;
           quantized_out[idx] = k;
           total_dist += dk_alt;
           total_rate += rk_alt;
+          if (is_mf_hf) hf_recon_e += rv_alt * rv_alt;
         } else {
           total_dist += dk;
           total_rate += rk;
+          if (is_mf_hf) hf_recon_e += rv * rv;
         }
       } else {
         // Test dropping the very last nonzero coefficient if rem_nz == 1.
-        if (rem_nz == 1 && ws->dist0[p] < dk + lambda * rk) {
+        if (rem_nz == 1 && ws->dist0[p] < dk - bonus + lambda * rk) {
           quantized_out[idx] = 0;
           total_dist += ws->dist0[p];
           --nz;
@@ -862,6 +1086,7 @@ RDOQTrellisResult RunFastExactRDOBlock(
         }
         total_dist += dk;
         total_rate += rk;
+        if (is_mf_hf) hf_recon_e += rv * rv;
       }
       prev = 1;
       --rem_nz;
@@ -875,11 +1100,16 @@ RDOQTrellisResult RunFastExactRDOBlock(
     total_dist += ws->dist0[p];
   }
   // Adjust NonZeroContext token if last nonzero was pruned.
-  if (rem_nz == 0 && nz == 0) {
-    return RDOQTrellisResult{total_dist0 + lambda * r0, total_dist0, r0, 0};
+  const float d_var =
+      ComputeTexVarDist(hf_orig_e, hf_recon_e, tex_contrast_mul);
+  const float total_j = total_dist + d_var + lambda * total_rate;
+  const float all_zero_j = total_dist0 + d_var_zero + lambda * r0;
+  if ((rem_nz == 0 && nz == 0) || total_j >= all_zero_j) {
+    std::fill_n(quantized_out, size, 0);
+    return RDOQTrellisResult{all_zero_j, total_dist0, d_var_zero, r0, 0};
   }
-  return RDOQTrellisResult{total_dist + lambda * total_rate, total_dist,
-                           total_rate, static_cast<int32_t>(nz)};
+  return RDOQTrellisResult{total_j, total_dist, d_var, total_rate,
+                           static_cast<int32_t>(nz)};
 }
 
 }  // namespace
@@ -901,6 +1131,7 @@ using hwy::HWY_NAMESPACE::Store;
 void ReconstructQuantizedCoeffs(size_t c, AcStrategyType acs_type,
                                 const Quantizer& quantizer, float qm_multiplier,
                                 int32_t qf, const int32_t* quantized,
+                                const float* quant_biases,
                                 float* recon_coeffs) {
   const AcStrategy acs = AcStrategy::FromRawStrategy(acs_type);
   const size_t size =
@@ -910,7 +1141,8 @@ void ReconstructQuantizedCoeffs(size_t c, AcStrategyType acs_type,
   for (size_t i = 0; i < size; ++i) {
     int32_t k = quantized[i];
     recon_coeffs[i] =
-        (k == 0) ? 0.0f : (DebiasCoeffLevel(c, k) * deq[i] * inv_qac_qm);
+        (k == 0) ? 0.0f
+                 : (DebiasCoeffLevel(c, k, quant_biases) * deq[i] * inv_qac_qm);
   }
 }
 
@@ -922,7 +1154,7 @@ int8_t OptimizeCfLTilesDiscrete(
     size_t num_cands, const Quantizer& quantizer, size_t channel, float qm_mul,
     float q_tile, int32_t qf_tile, float base_corr, int32_t pred_m,
     const RDORateModel& rate_model, float lambda, bool tile_unmasked_hf,
-    float unmasked_hf_dist_mul) {
+    float unmasked_hf_dist_mul, const float* quant_biases) {
   constexpr float kInvColorFactor = 1.0f / kDefaultColorFactor;
   const double hf_w =
       tile_unmasked_hf ? static_cast<double>(2.0f * unmasked_hf_dist_mul) : 1.0;
@@ -1022,11 +1254,14 @@ int8_t OptimizeCfLTilesDiscrete(
         const float res = oc[i] - factor * ry[i];
         const float u = res * (eff_inv_qm * q_tile);
         const float scaled = u / s_q;
-        if (std::abs(scaled) < 0.58f) {
+        const float cfl_dz =
+            0.58f *
+            std::min(1.08f, quant_biases[channel] / kDefaultQuantBias[channel]);
+        if (std::abs(scaled) < cfl_dz) {
           dist += w_bin * static_cast<double>(u) * u;
         } else {
           const int32_t k = RoundToNearestInt(scaled);
-          const float r = u - s_q * DebiasCoeffLevel(channel, k);
+          const float r = u - s_q * DebiasCoeffLevel(channel, k, quant_biases);
           dist += w_bin * static_cast<double>(r) * r;
           approx_ac_bits +=
               2.2 + sparse_hf_bits + 0.6 * std::log2(std::abs(k) + 1.0);
@@ -1069,13 +1304,13 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
   const bool is_progressive =
       (enc_state->progressive_splitter.GetNumPasses() > 1);
   const float upsample_lambda_mul =
-      (frame_header.upsampling > 1 && butteraugli >= 4.0f)
-          ? std::pow(static_cast<float>(frame_header.upsampling), 0.58f)
-          : 1.0f;
+      ComputeUpsampleLambdaMul(frame_header.upsampling, butteraugli);
   const float prog_lambda_mul = is_progressive ? 0.88f : 1.0f;
-  const float lambda =
-      ComputeRDOLambda(butteraugli) * upsample_lambda_mul * prog_lambda_mul;
+  const float preset_rate_mul = rate_model.has_empirical_ac ? 1.0f : 0.90f;
+  const float lambda = ComputeRDOLambda(butteraugli) * upsample_lambda_mul *
+                       prog_lambda_mul * preset_rate_mul;
   const bool non_perceptual = cparams.disable_perceptual_optimizations;
+  const float tex_contrast_mul = !non_perceptual ? kTexContrastMul : 0.0f;
   const float unmasked_hf_dist_mul = !non_perceptual ? 14.0f : 1.0f;
   const bool is_e7 = cparams.speed_tier >= SpeedTier::kSquirrel;
   const bool is_e9 = cparams.speed_tier <= SpeedTier::kTortoise;
@@ -1083,6 +1318,11 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
   const int tile_multi_level = is_e9 ? 2 : 1;
 
   const coeff_order_t* coeff_orders0 = shared.coeff_orders.data();
+  const float* quant_biases =
+      (frame_header.nonserialized_metadata != nullptr)
+          ? frame_header.nonserialized_metadata->transform_data
+                .opsin_inverse_matrix.quant_biases
+          : kDefaultQuantBias;
   const size_t opsin_stride = opsin.PixelsPerRow();
 
   const size_t dct_scratch_size =
@@ -1244,9 +1484,10 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
         RunFastExactRDOBlock(
             1, AcStrategyType::DCT, recon_y, quantizer, 1.0f, qf_sub, q_sub, 3,
             bctx_y, bcm, coeff_orders0 + ord0, rate_model, lambda,
-            non_perceptual, unmasked_hf_dist_mul, &ws, quantized_buf);
+            non_perceptual, tex_contrast_mul, unmasked_hf_dist_mul,
+            quant_biases, &ws, quantized_buf);
         ReconstructQuantizedCoeffs(1, AcStrategyType::DCT, quantizer, 1.0f,
-                                   qf_sub, quantized_buf, ob_y);
+                                   qf_sub, quantized_buf, quant_biases, ob_y);
         x_ptrs[n_1x1] = ob_x;
         b_ptrs[n_1x1] = ob_b;
         ry_ptrs[n_1x1] = ob_y;
@@ -1260,12 +1501,12 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
         x_ptrs.data(), ry_ptrs.data(), b_sizes.data(), b_types.data(), n_1x1,
         quantizer, 0, enc_state->x_qm_multiplier, q_tile, qf_tile,
         shared.cmap.base().GetBaseCorrelationX(), 0, rate_model, lambda,
-        tile_hf_y.active, unmasked_hf_dist_mul);
+        tile_hf_y.active, unmasked_hf_dist_mul, quant_biases);
     int8_t mb = OptimizeCfLTilesDiscrete(
         b_ptrs.data(), ry_ptrs.data(), b_sizes.data(), b_types.data(), n_1x1,
         quantizer, 2, enc_state->b_qm_multiplier, q_tile, qf_tile,
         shared.cmap.base().GetBaseCorrelationB(), 0, rate_model, lambda,
-        tile_hf_y.active, unmasked_hf_dist_mul);
+        tile_hf_y.active, unmasked_hf_dist_mul, quant_biases);
 
     // Candidate evaluator for any sub-rectangle (rx, ry, rw, rh) inside tile.
     auto eval_candidate = [&](size_t rx, size_t ry_loc, AcStrategyType type,
@@ -1326,16 +1567,19 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
                                        1.0f, qf, q_target, pred_nz, bctx_y, bcm,
                                        coeff_orders0 + CoeffOrderOffset(ord, 1),
                                        rate_model, lambda, non_perceptual,
-                                       unmasked_hf_dist_mul, &ws, qy)
+                                       tex_contrast_mul, unmasked_hf_dist_mul,
+                                       quant_biases, &ws, qy)
                 : RunTrellisRDOQCore(
                       1, type, orig_block + size, quantizer, 1.0f, qf, q_target,
                       pred_nz, bctx_y, bcm,
                       coeff_orders0 + CoeffOrderOffset(ord, 1), rate_model,
                       lambda, tile_band, tile_multi_level, non_perceptual, 0.0f,
-                      1.0f, unmasked_hf_dist_mul, nullptr, nullptr, 0.0f, 0.0f,
-                      nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f, false, &ws, qy);
+                      tex_contrast_mul, 1.0f, unmasked_hf_dist_mul,
+                      quant_biases, nullptr, nullptr, 0.0f, 0.0f, nullptr,
+                      nullptr, 1.0f, 1.0f, 1.0f, 1.0f, false, &ws, qy);
 
-      ReconstructQuantizedCoeffs(1, type, quantizer, 1.0f, qf, qy, recon_y);
+      ReconstructQuantizedCoeffs(1, type, quantizer, 1.0f, qf, qy, quant_biases,
+                                 recon_y);
 
       // Subtract CfL prediction using quantized Y_hat for X and B.
       const float x_fac = shared.cmap.base().YtoXRatio(cur_mx);
@@ -1349,36 +1593,39 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
       const size_t bctx_x = bcm.Context(0, qf, ord, 0);
       const size_t bctx_b = bcm.Context(0, qf, ord, 2);
       RDOQTrellisResult rx_res =
-          is_e7 ? RunFastExactRDOBlock(0, type, res_block, quantizer,
-                                       enc_state->x_qm_multiplier, qf, q_target,
-                                       pred_nz, bctx_x, bcm,
-                                       coeff_orders0 + CoeffOrderOffset(ord, 0),
-                                       rate_model, lambda, non_perceptual,
-                                       unmasked_hf_dist_mul, &ws, quantized_buf)
-                : RunTrellisRDOQCore(
-                      0, type, res_block, quantizer, enc_state->x_qm_multiplier,
-                      qf, q_target, pred_nz, bctx_x, bcm,
-                      coeff_orders0 + CoeffOrderOffset(ord, 0), rate_model,
-                      lambda, tile_band, tile_multi_level, non_perceptual, 0.0f,
-                      1.0f, unmasked_hf_dist_mul, nullptr, nullptr, 0.0f, 0.0f,
-                      nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f, false, &ws,
-                      quantized_buf);
+          is_e7
+              ? RunFastExactRDOBlock(
+                    0, type, res_block, quantizer, enc_state->x_qm_multiplier,
+                    qf, q_target, pred_nz, bctx_x, bcm,
+                    coeff_orders0 + CoeffOrderOffset(ord, 0), rate_model,
+                    lambda, non_perceptual, tex_contrast_mul,
+                    unmasked_hf_dist_mul, quant_biases, &ws, quantized_buf)
+              : RunTrellisRDOQCore(
+                    0, type, res_block, quantizer, enc_state->x_qm_multiplier,
+                    qf, q_target, pred_nz, bctx_x, bcm,
+                    coeff_orders0 + CoeffOrderOffset(ord, 0), rate_model,
+                    lambda, tile_band, tile_multi_level, non_perceptual, 0.0f,
+                    tex_contrast_mul, 1.0f, unmasked_hf_dist_mul, quant_biases,
+                    nullptr, nullptr, 0.0f, 0.0f, nullptr, nullptr, 1.0f, 1.0f,
+                    1.0f, 1.0f, false, &ws, quantized_buf);
 
       RDOQTrellisResult rb_res =
-          is_e7 ? RunFastExactRDOBlock(
-                      2, type, res_block + 2 * size, quantizer,
-                      enc_state->b_qm_multiplier, qf, q_target, pred_nz, bctx_b,
-                      bcm, coeff_orders0 + CoeffOrderOffset(ord, 2), rate_model,
-                      lambda, non_perceptual, unmasked_hf_dist_mul, &ws,
-                      quantized_buf + 2 * size)
-                : RunTrellisRDOQCore(
-                      2, type, res_block + 2 * size, quantizer,
-                      enc_state->b_qm_multiplier, qf, q_target, pred_nz, bctx_b,
-                      bcm, coeff_orders0 + CoeffOrderOffset(ord, 2), rate_model,
-                      lambda, tile_band, tile_multi_level, non_perceptual, 0.0f,
-                      1.0f, unmasked_hf_dist_mul, nullptr, nullptr, 0.0f, 0.0f,
-                      nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f, false, &ws,
-                      quantized_buf + 2 * size);
+          is_e7
+              ? RunFastExactRDOBlock(
+                    2, type, res_block + 2 * size, quantizer,
+                    enc_state->b_qm_multiplier, qf, q_target, pred_nz, bctx_b,
+                    bcm, coeff_orders0 + CoeffOrderOffset(ord, 2), rate_model,
+                    lambda, non_perceptual, tex_contrast_mul,
+                    unmasked_hf_dist_mul, quant_biases, &ws,
+                    quantized_buf + 2 * size)
+              : RunTrellisRDOQCore(
+                    2, type, res_block + 2 * size, quantizer,
+                    enc_state->b_qm_multiplier, qf, q_target, pred_nz, bctx_b,
+                    bcm, coeff_orders0 + CoeffOrderOffset(ord, 2), rate_model,
+                    lambda, tile_band, tile_multi_level, non_perceptual, 0.0f,
+                    tex_contrast_mul, 1.0f, unmasked_hf_dist_mul, quant_biases,
+                    nullptr, nullptr, 0.0f, 0.0f, nullptr, nullptr, 1.0f, 1.0f,
+                    1.0f, 1.0f, false, &ws, quantized_buf + 2 * size);
 
       float d_freq =
           non_perceptual ? 0.0f : (rx_res.dist + ry_res.dist + rb_res.dist);
@@ -1390,13 +1637,13 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
         // zero canonical LLF positions, and inverse-transform to `err_pix`.
         ReconstructQuantizedCoeffs(0, type, quantizer,
                                    enc_state->x_qm_multiplier, qf,
-                                   quantized_buf, err_work);
+                                   quantized_buf, quant_biases, err_work);
         for (size_t i = 0; i < size; ++i) res_block[i] -= err_work[i];
         // Note for Y: res_block[size..2*size) held orig_y!
         for (size_t i = 0; i < size; ++i) res_block[size + i] -= recon_y[i];
-        ReconstructQuantizedCoeffs(2, type, quantizer,
-                                   enc_state->b_qm_multiplier, qf,
-                                   quantized_buf + 2 * size, err_work);
+        ReconstructQuantizedCoeffs(
+            2, type, quantizer, enc_state->b_qm_multiplier, qf,
+            quantized_buf + 2 * size, quant_biases, err_work);
         for (size_t i = 0; i < size; ++i)
           res_block[2 * size + i] -= err_work[i];
         size_t lcx = acs.covered_blocks_x();
@@ -1454,7 +1701,7 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
           const double cw2 = static_cast<double>(kChannelWeightL8[2]);
           const double cw[3] = {cw0, cw1, cw2};
           const float inv_d = 1.0f / std::max(0.25f, butteraugli);
-          const float d_scale = std::min(1.0f, lambda / 0.0465f);
+          const float d_scale = 1.0f;
           double total_sum8 = 0.0;
           for (size_t sy = 0; sy < rh; ++sy) {
             const float* q_row = initial_quant_field.Row(abs_by + sy);
@@ -1488,32 +1735,68 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
           d_pix = d_scale * inv_d * static_cast<float>(rw * rh) *
                   static_cast<float>(std::sqrt(std::sqrt(std::sqrt(mean8))));
         }
-        // Equalize distortion scale against canonical DCT8 CSF weights across
-        // all non-DCT8 strategies (1x1 sub-8x8 transforms like DCT4X4/AFV as
-        // well as multi-block transforms and IDENTITY).
-        if (!non_perceptual &&
-            (tile_hf_y.active ||
-             !(rw == 1 && rh == 1 && type == AcStrategyType::DCT))) {
+        // Equalize distortion scale against canonical pixel-masked DCT8 CSF
+        // weights uniformly across all strategies (1x1 DCT and sub-8x8 as well
+        // as multi-block transforms and IDENTITY).
+        if (!non_perceptual) {
           const float dct8_hf_w =
               tile_hf_y.active ? (2.0f * unmasked_hf_dist_mul) : 1.0f;
+          HWY_ALIGN float masked_sub[kDCTBlockSize];
+          float norm_w[kDCTBlockSize];
           std::array<float, 3> d_dct8 = {0.0f, 0.0f, 0.0f};
-          for (size_t c = 0; c < 3; ++c) {
-            const float qm_c =
-                (c == 0) ? enc_state->x_qm_multiplier
-                         : ((c == 2) ? enc_state->b_qm_multiplier : 1.0f);
-            const float* inv_dct8 =
-                quantizer.InvDequantMatrix(AcStrategyType::DCT, c);
-            const float inv0 = inv_dct8[1];
-            float dist_c = 0.0f;
-            for (size_t sy = 0; sy < rh; ++sy) {
-              const float* q_row = initial_quant_field.Row(abs_by + sy);
-              for (size_t sx = 0; sx < rw; ++sx) {
-                const float q_sub = q_row[abs_bx + sx];
-                const float w_scale = q_sub * qm_c;
+          const float* inv_dct8_arr[3] = {
+              quantizer.InvDequantMatrix(AcStrategyType::DCT, 0),
+              quantizer.InvDequantMatrix(AcStrategyType::DCT, 1),
+              quantizer.InvDequantMatrix(AcStrategyType::DCT, 2),
+          };
+          const float qm_arr[3] = {enc_state->x_qm_multiplier, 1.0f,
+                                   enc_state->b_qm_multiplier};
+          for (size_t sy = 0; sy < rh; ++sy) {
+            const float* q_row = initial_quant_field.Row(abs_by + sy);
+            for (size_t sx = 0; sx < rw; ++sx) {
+              const float q_sub = q_row[abs_bx + sx];
+              if (has_mask) {
+                double sum_w2 = 0.0;
+                for (size_t dy = 0; dy < kBlockDim; ++dy) {
+                  const size_t mpy =
+                      std::min((abs_by + sy) * kBlockDim + dy, mask_y_max);
+                  const float* mrow = initial_quant_masking1x1.ConstRow(mpy);
+                  for (size_t dx = 0; dx < kBlockDim; ++dx) {
+                    const float mask_val = mrow[std::min(
+                        (abs_bx + sx) * kBlockDim + dx, mask_x_max)];
+                    const float w = Dct8PixelMaskWeight(mask_val);
+                    norm_w[dy * kBlockDim + dx] = w;
+                    sum_w2 += static_cast<double>(w) * static_cast<double>(w);
+                  }
+                }
+                const float inv_rms =
+                    (sum_w2 > 1e-12)
+                        ? static_cast<float>(8.0 / std::sqrt(sum_w2))
+                        : 1.0f;
+                for (size_t i = 0; i < kDCTBlockSize; ++i) {
+                  norm_w[i] *= inv_rms;
+                }
+              }
+              for (size_t c = 0; c < 3; ++c) {
+                const float w_scale = q_sub * qm_arr[c];
+                const float* inv_dct8 = inv_dct8_arr[c];
+                const float inv0 = inv_dct8[1];
                 const float* sub_pix = err_pix + c * size +
                                        (sy * kBlockDim) * px_s + sx * kBlockDim;
-                TransformFromPixels(AcStrategyType::DCT, sub_pix, px_s,
-                                    err_work, dct_scratch);
+                if (has_mask) {
+                  for (size_t dy = 0; dy < kBlockDim; ++dy) {
+                    for (size_t dx = 0; dx < kBlockDim; ++dx) {
+                      const size_t idx = dy * kBlockDim + dx;
+                      masked_sub[idx] = norm_w[idx] * sub_pix[dy * px_s + dx];
+                    }
+                  }
+                  TransformFromPixels(AcStrategyType::DCT, masked_sub,
+                                      kBlockDim, err_work, dct_scratch);
+                } else {
+                  TransformFromPixels(AcStrategyType::DCT, sub_pix, px_s,
+                                      err_work, dct_scratch);
+                }
+                float dist_c = 0.0f;
                 for (size_t i = 0; i < kDCTBlockSize; ++i) {
                   const float inv_w = (i == 0)
                                           ? (0.5f * kSqrt2 * inv0 * w_scale)
@@ -1525,17 +1808,12 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
                                        : 1.0f;
                   dist_c += hw * u_err * u_err;
                 }
+                d_dct8[c] += dist_c;
               }
             }
-            d_dct8[c] = dist_c;
           }
-          if (rw == 1 && rh == 1 && !tile_hf_y.active) {
-            d_freq = d_dct8[0] + d_dct8[1] + d_dct8[2];
-          } else {
-            d_freq = std::max(rx_res.dist, d_dct8[0]) +
-                     std::max(ry_res.dist, d_dct8[1]) +
-                     std::max(rb_res.dist, d_dct8[2]);
-          }
+          d_freq = (d_dct8[0] + d_dct8[1] + d_dct8[2]) +
+                   (rx_res.var_dist + ry_res.var_dist + rb_res.var_dist);
         }
       }
 
@@ -1779,9 +2057,11 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
       RunFastExactRDOBlock(
           1, cb.type, orig_block, quantizer, 1.0f, cb.qf, q_target, pred_nz_d,
           bctx_y, bcm, coeff_orders0 + CoeffOrderOffset(ord, 1), rate_model,
-          lambda, non_perceptual, unmasked_hf_dist_mul, &ws, quantized_buf);
+          lambda, non_perceptual, tex_contrast_mul, unmasked_hf_dist_mul,
+          quant_biases, &ws, quantized_buf);
       ReconstructQuantizedCoeffs(1, cb.type, quantizer, 1.0f, cb.qf,
-                                 quantized_buf, win_recon_y.data() + w_off);
+                                 quantized_buf, quant_biases,
+                                 win_recon_y.data() + w_off);
       w_x_ptrs[w_cnt] = win_orig_x.data() + w_off;
       w_b_ptrs[w_cnt] = win_orig_b.data() + w_off;
       w_ry_ptrs[w_cnt] = win_recon_y.data() + w_off;
@@ -1795,12 +2075,12 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
         w_x_ptrs.data(), w_ry_ptrs.data(), w_sizes.data(), w_types.data(),
         w_cnt, quantizer, 0, enc_state->x_qm_multiplier, q_tile, qf_tile,
         shared.cmap.base().GetBaseCorrelationX(), 0, rate_model, lambda,
-        tile_hf_y.active, unmasked_hf_dist_mul);
+        tile_hf_y.active, unmasked_hf_dist_mul, quant_biases);
     const int8_t mb_refined = OptimizeCfLTilesDiscrete(
         w_b_ptrs.data(), w_ry_ptrs.data(), w_sizes.data(), w_types.data(),
         w_cnt, quantizer, 2, enc_state->b_qm_multiplier, q_tile, qf_tile,
         shared.cmap.base().GetBaseCorrelationB(), 0, rate_model, lambda,
-        tile_hf_y.active, unmasked_hf_dist_mul);
+        tile_hf_y.active, unmasked_hf_dist_mul, quant_biases);
 
     const int cfl_re_dp_thresh = tile_hf_y.active ? 1 : (is_e7 ? 6 : 3);
     if (std::abs(mx_refined - mx) >= cfl_re_dp_thresh ||
@@ -1872,13 +2152,11 @@ Status ProcessAllTilesRDO_HWY(const CompressParams& cparams,
 // ============================================================================
 // ComputeCoefficientsRDOQ_HWY
 // ============================================================================
-Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
-                                   const Image3F& opsin, const Rect& rect,
-                                   const ImageF& initial_quant_field,
-                                   const ImageF& initial_quant_masking1x1,
-                                   const RDORateModel& rate_model,
-                                   ThreadPool* pool,
-                                   PassesEncoderState* enc_state) {
+Status ComputeCoefficientsRDOQ_HWY(
+    const FrameHeader& frame_header, const Image3F& opsin, const Rect& rect,
+    const ImageF& initial_quant_field, const ImageF& initial_quant_masking1x1,
+    const RDORateModel& rate_model, ThreadPool* pool,
+    PassesEncoderState* enc_state, QuantBiasStats* qb_stats = nullptr) {
   PassesSharedState& shared = enc_state->shared;
   const FrameDimensions& frame_dim = shared.frame_dim;
   const Quantizer& quantizer = shared.quantizer;
@@ -1890,13 +2168,13 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
   JXL_ENSURE(num_passes > 0);
   const float butteraugli = cparams.butteraugli_distance;
   const float upsample_lambda_mul =
-      (frame_header.upsampling > 1 && butteraugli >= 4.0f)
-          ? std::pow(static_cast<float>(frame_header.upsampling), 0.58f)
-          : 1.0f;
+      ComputeUpsampleLambdaMul(frame_header.upsampling, butteraugli);
   const float prog_lambda_mul = (num_passes > 1) ? 0.88f : 1.0f;
-  const float lambda =
-      ComputeRDOLambda(butteraugli) * upsample_lambda_mul * prog_lambda_mul;
+  const float preset_rate_mul = rate_model.has_empirical_ac ? 1.0f : 0.90f;
+  const float lambda = ComputeRDOLambda(butteraugli) * upsample_lambda_mul *
+                       prog_lambda_mul * preset_rate_mul;
   const bool non_perceptual = cparams.disable_perceptual_optimizations;
+  const float tex_contrast_mul = !non_perceptual ? kTexContrastMul : 0.0f;
   const float unmasked_lf_dist_mul = !non_perceptual ? 1.6f : 1.0f;
   const float unmasked_hf_dist_mul = !non_perceptual ? 14.0f : 1.0f;
 
@@ -1908,6 +2186,13 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
   const bool enable_cfl_coupling = true;
   const size_t opsin_stride = opsin.PixelsPerRow();
   const coeff_order_t* coeff_orders0 = shared.coeff_orders.data();
+  const float* quant_biases =
+      (frame_header.nonserialized_metadata != nullptr)
+          ? frame_header.nonserialized_metadata->transform_data
+                .opsin_inverse_matrix.quant_biases
+          : kDefaultQuantBias;
+  std::vector<QuantBiasStats> group_qb_stats(
+      (qb_stats != nullptr) ? frame_dim.num_groups : 0);
 
   const size_t dct_scratch_size =
       3 * (MaxVectorSize() / sizeof(float)) * AcStrategy::kMaxBlockDim;
@@ -1980,6 +2265,7 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
 
     const YCbCrChromaSubsampling& cs = frame_header.chroma_subsampling;
     int32_t prev_qf = -1;
+    QuantBiasStats local_qb;
 
     for (size_t by = 0; by < ysize_blocks; ++by) {
       const size_t abs_by = block_group_rect.y0() + by;
@@ -2053,7 +2339,7 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
           // local qf_ideal (e.g. smooth gradient next to high-activity region).
           const int32_t qf_min_safe = ClampQF(std::min(
               qf_ideal, static_cast<int32_t>(
-                            std::ceil(static_cast<float>(qf_ideal) / 1.08f))));
+                            std::ceil(static_cast<float>(qf_ideal) / 1.15f))));
           const int32_t qf_max_safe = ClampQF(
               std::max(qf_ideal, static_cast<int32_t>(std::lround(
                                      static_cast<float>(qf_ideal) * 1.20f))));
@@ -2108,9 +2394,7 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
 
             const float qac_cand =
                 quantizer.Scale() * static_cast<float>(cand_qf);
-            const float q_eff = (cand_qf == qf_ideal)
-                                    ? std::max(q_target, 0.92f * qac_cand)
-                                    : q_target;
+            const float q_eff = q_target;
             const float s_cand = (qac_cand > 0.0f) ? (q_eff / qac_cand) : 1.0f;
             // When keeping a finer prev_qf (s_cand < 1) in perceptual mode,
             // widen the effective deadzone on sub-JND noise so AQ avoids paying
@@ -2130,13 +2414,15 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
                 q_eff, pred_nz[1], bctx_y, bcm,
                 coeff_orders0 + CoeffOrderOffset(ord, 1), rate_model, lambda,
                 band_width, multi_level, non_perceptual, jnd_floor,
-                unmasked_lf_dist_mul, unmasked_hf_dist_mul, orig_coeffs,
-                orig_coeffs + 2 * size, x_factor, b_factor, inv_x, inv_b,
-                enc_state->x_qm_multiplier, enc_state->b_qm_multiplier, s_cand,
-                s_cand, enable_cfl_coupling, &ws, quantized + size);
+                tex_contrast_mul, unmasked_lf_dist_mul, unmasked_hf_dist_mul,
+                quant_biases, orig_coeffs, orig_coeffs + 2 * size, x_factor,
+                b_factor, inv_x, inv_b, enc_state->x_qm_multiplier,
+                enc_state->b_qm_multiplier, s_cand, s_cand, enable_cfl_coupling,
+                &ws, quantized + size);
 
             ReconstructQuantizedCoeffs(1, acs.Strategy(), quantizer, 1.0f,
-                                       cand_qf, quantized + size, cand_recon_y);
+                                       cand_qf, quantized + size, quant_biases,
+                                       cand_recon_y);
 
             // Unapply CfL using quantized Y_hat.
             for (size_t k = 0; k < size; k += Lanes(d_vec)) {
@@ -2152,21 +2438,25 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
                 enc_state->x_qm_multiplier, cand_qf, q_eff, pred_nz[0], bctx_x,
                 bcm, coeff_orders0 + CoeffOrderOffset(ord, 0), rate_model,
                 lambda, band_width, multi_level, non_perceptual, jnd_floor,
-                unmasked_lf_dist_mul, unmasked_hf_dist_mul, nullptr, nullptr,
-                0.0f, 0.0f, nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f, false,
-                &ws, quantized);
+                tex_contrast_mul, unmasked_lf_dist_mul, unmasked_hf_dist_mul,
+                quant_biases, nullptr, nullptr, 0.0f, 0.0f, nullptr, nullptr,
+                1.0f, 1.0f, 1.0f, 1.0f, false, &ws, quantized);
 
             const RDOQTrellisResult res_b = RunTrellisRDOQCore(
                 2, acs.Strategy(), res_xb + size, quantizer,
                 enc_state->b_qm_multiplier, cand_qf, q_eff, pred_nz[2], bctx_b,
                 bcm, coeff_orders0 + CoeffOrderOffset(ord, 2), rate_model,
                 lambda, band_width, multi_level, non_perceptual, jnd_floor,
-                unmasked_lf_dist_mul, unmasked_hf_dist_mul, nullptr, nullptr,
-                0.0f, 0.0f, nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f, false,
-                &ws, quantized + 2 * size);
+                tex_contrast_mul, unmasked_lf_dist_mul, unmasked_hf_dist_mul,
+                quant_biases, nullptr, nullptr, 0.0f, 0.0f, nullptr, nullptr,
+                1.0f, 1.0f, 1.0f, 1.0f, false, &ws, quantized + 2 * size);
 
             float d_pix = 0.0f;
-            float cand_freq = res_y.dist + res_x.dist + res_b.dist;
+            const float cand_freq =
+                non_perceptual
+                    ? 0.0f
+                    : ((res_y.dist + res_x.dist + res_b.dist) +
+                       (res_y.var_dist + res_x.var_dist + res_b.var_dist));
             float cand_rate =
                 res_y.rate_bits + res_x.rate_bits + res_b.rate_bits;
 
@@ -2186,9 +2476,9 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
                   const float qm_m = (ch == 0) ? enc_state->x_qm_multiplier
                                                : enc_state->b_qm_multiplier;
                   const float* res_src = (ch == 0) ? res_xb : (res_xb + size);
-                  ReconstructQuantizedCoeffs(ch, acs.Strategy(), quantizer,
-                                             qm_m, cand_qf,
-                                             quantized + ch * size, work_coeff);
+                  ReconstructQuantizedCoeffs(
+                      ch, acs.Strategy(), quantizer, qm_m, cand_qf,
+                      quantized + ch * size, quant_biases, work_coeff);
                   for (size_t i = 0; i < size; ++i) {
                     work_coeff[i] = res_src[i] - work_coeff[i];
                   }
@@ -2243,7 +2533,7 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
                 const double cw2 = static_cast<double>(kChannelWeightL8[2]);
                 const double cw[3] = {cw0, cw1, cw2};
                 const float inv_d = 1.0f / std::max(0.25f, butteraugli);
-                const float d_scale = std::min(1.0f, lambda / 0.0465f);
+                const float d_scale = 1.0f;
                 double total_sum8 = 0.0;
                 for (size_t sy = 0; sy < bh; ++sy) {
                   const float* q_row = initial_quant_field.Row(abs_by + sy);
@@ -2297,6 +2587,38 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
 
           prev_qf = best_qf;
 
+          if (qb_stats != nullptr) {
+            const float q_eff_best = q_target;
+            ReconstructQuantizedCoeffs(1, acs.Strategy(), quantizer, 1.0f,
+                                       best_qf, best_quantized + size,
+                                       quant_biases, cand_recon_y);
+            for (size_t k = 0; k < size; k += Lanes(d_vec)) {
+              const auto in_x = Load(d_vec, orig_coeffs + k);
+              const auto in_b = Load(d_vec, orig_coeffs + 2 * size + k);
+              const auto ry = Load(d_vec, cand_recon_y + k);
+              Store(NegMulAdd(x_factor_v, ry, in_x), d_vec, res_xb + k);
+              Store(NegMulAdd(b_factor_v, ry, in_b), d_vec, res_xb + size + k);
+            }
+            AccumulateBlockQuantBiasStats(
+                1, acs.Strategy(), orig_coeffs + size, quantizer, 1.0f, best_qf,
+                q_eff_best, pred_nz[1],
+                coeff_orders0 + CoeffOrderOffset(ord, 1), non_perceptual,
+                unmasked_lf_dist_mul, unmasked_hf_dist_mul,
+                best_quantized + size, &local_qb);
+            AccumulateBlockQuantBiasStats(
+                0, acs.Strategy(), res_xb, quantizer,
+                enc_state->x_qm_multiplier, best_qf, q_eff_best, pred_nz[0],
+                coeff_orders0 + CoeffOrderOffset(ord, 0), non_perceptual,
+                unmasked_lf_dist_mul, unmasked_hf_dist_mul, best_quantized,
+                &local_qb);
+            AccumulateBlockQuantBiasStats(
+                2, acs.Strategy(), res_xb + size, quantizer,
+                enc_state->b_qm_multiplier, best_qf, q_eff_best, pred_nz[2],
+                coeff_orders0 + CoeffOrderOffset(ord, 2), non_perceptual,
+                unmasked_lf_dist_mul, unmasked_hf_dist_mul,
+                best_quantized + 2 * size, &local_qb);
+          }
+
           // Write winning qf across ALL covered_blocks_y * covered_blocks_x
           // cells in shared.raw_quant_field.
           for (size_t iy = 0; iy < acs.covered_blocks_y(); ++iy) {
@@ -2334,11 +2656,20 @@ Status ComputeCoefficientsRDOQ_HWY(const FrameHeader& frame_header,
         }
       }
     }
+    if (qb_stats != nullptr) {
+      group_qb_stats[group_idx] = local_qb;
+    }
     return true;
   };
 
   JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, frame_dim.num_groups, prepare_threads,
                                 process_group, "ComputeCoefficientsRDOQ"));
+  if (qb_stats != nullptr) {
+    *qb_stats = QuantBiasStats{};
+    for (size_t g = 0; g < frame_dim.num_groups; ++g) {
+      qb_stats->Merge(group_qb_stats[g]);
+    }
+  }
   return true;
 }
 
@@ -2403,7 +2734,137 @@ HWY_EXPORT(ComputeDCFromOpsin_HWY);
 
 float ComputeRDOLambda(float butteraugli_distance) {
   const float d = Clamp1(butteraugli_distance, 0.12f, 12.0f);
-  return 0.0465f * std::pow(d, -0.44f);
+  return kLambdaBase * std::pow(d, kLambdaExp);
+}
+
+float ComputeUpsampleLambdaMul(uint32_t upsampling,
+                               float butteraugli_distance) {
+  if (upsampling <= 1) return 1.0f;
+  const float u_scale = std::pow(static_cast<float>(upsampling), -0.40f);
+  const float d_scale =
+      (butteraugli_distance > 1.0f)
+          ? std::pow(Clamp1(butteraugli_distance, 1.0f, 12.0f), -0.42f)
+          : 1.0f;
+  return u_scale * d_scale;
+}
+
+namespace {
+std::atomic<int> g_quant_bias_mode_override{-1};
+}  // namespace
+
+QuantBiasMode ActiveQuantBiasMode() {
+  const int ov = g_quant_bias_mode_override.load(std::memory_order_relaxed);
+  if (ov >= 0 && ov <= static_cast<int>(QuantBiasMode::kImageAdaptiveLS)) {
+    return static_cast<QuantBiasMode>(ov);
+  }
+  return QuantBiasMode::kDefault;
+}
+
+void SetActiveQuantBiasModeForTest(int mode_or_minus1) {
+  g_quant_bias_mode_override.store(mode_or_minus1, std::memory_order_relaxed);
+}
+
+float RoundToF16(float v) {
+  if (!std::isfinite(v) || v == 0.0f) return 0.0f;
+  const float sign = (v < 0.0f) ? -1.0f : 1.0f;
+  const float av = std::min(std::abs(v), 65504.0f);
+  int exp = 0;
+  const float mant = std::frexp(av, &exp);
+  if (exp < -13) {
+    return sign * std::ldexp(std::nearbyint(std::ldexp(av, 24)), -24);
+  }
+  return sign * std::min(65504.0f,
+                         std::ldexp(std::nearbyint(mant * 2048.0f), exp - 11));
+}
+
+void SetOpsinInverseMatrixQuantBiases(const float biases[4],
+                                      OpsinInverseMatrix* im) {
+  bool is_default = true;
+  for (size_t c = 0; c < 4; ++c) {
+    if (std::abs(biases[c] - kDefaultQuantBias[c]) >= 1e-5f) {
+      is_default = false;
+    }
+  }
+  if (is_default) {
+    Bundle::SetDefault(im);
+    return;
+  }
+  // Exact IEEE-754 binary16 matrix entries whose row sums are exactly 1.0,
+  // preserving the white-point constraint and fast sRGB8 decoder path.
+  static constexpr Matrix3x3 kExactF16InverseOpsin = {
+      {{11.03125f, -9.8671875f, -0.1640625f},
+       {-3.2578125f, 4.421875f, -0.1640625f},
+       {-3.65625f, 2.7109375f, 1.9453125f}}};
+  static constexpr float kExactF16NegOpsinBias = -0.0037937164306640625f;
+  im->inverse_matrix = kExactF16InverseOpsin;
+  for (size_t c = 0; c < 3; ++c) {
+    im->opsin_biases[c] = kExactF16NegOpsinBias;
+  }
+  for (size_t c = 0; c < 4; ++c) {
+    im->quant_biases[c] = RoundToF16(biases[c]);
+  }
+  im->all_default = Bundle::AllDefault(*im);
+}
+
+void ComputeInitialQuantBiases(QuantBiasMode mode, float butteraugli_distance,
+                               float out_biases[4]) {
+  if (mode == QuantBiasMode::kNoBias) {
+    out_biases[0] = 1.0f;
+    out_biases[1] = 1.0f;
+    out_biases[2] = 1.0f;
+    out_biases[3] = 0.0f;
+    return;
+  }
+  if (mode == QuantBiasMode::kDistanceSchedule ||
+      mode == QuantBiasMode::kImageAdaptiveLS) {
+    const float u = std::log2(Clamp1(butteraugli_distance, 0.25f, 8.0f));
+    out_biases[0] = RoundToF16(Clamp1(0.945f - 0.015f * u, 0.90f, 0.95f));
+    out_biases[1] = RoundToF16(Clamp1(0.940f - 0.012f * u, 0.90f, 0.95f));
+    out_biases[2] = RoundToF16(Clamp1(0.950f - 0.018f * u, 0.90f, 0.95f));
+    out_biases[3] = RoundToF16(Clamp1(0.160f + 0.015f * u, 0.14f, 0.20f));
+    return;
+  }
+  std::copy_n(kDefaultQuantBias, 4, out_biases);
+}
+
+bool GateQuantBiasesFromStats(const QuantBiasStats& stats,
+                              const float cand_biases[4], float rd_lambda,
+                              float header_bits, float out_biases[4]) {
+  float b[4];
+  double delta_d = 0.0;
+  for (size_t c = 0; c < 4; ++c) {
+    const float lo = (c < 3) ? 0.88f : 0.03f;
+    const float hi = (c < 3) ? 1.00f : 0.24f;
+    b[c] = RoundToF16(Clamp1(cand_biases[c], lo, hi));
+    if (stats.den[c] > 1e-12) {
+      const double bc = static_cast<double>(b[c]);
+      const double dc = static_cast<double>(kDefaultQuantBias[c]);
+      delta_d +=
+          2.0 * stats.num[c] * (bc - dc) - stats.den[c] * (bc * bc - dc * dc);
+    }
+  }
+  if (stats.count[1] >= 16.0 &&
+      delta_d >
+          static_cast<double>(rd_lambda) * static_cast<double>(header_bits)) {
+    std::copy_n(b, 4, out_biases);
+    return true;
+  }
+  std::copy_n(kDefaultQuantBias, 4, out_biases);
+  return false;
+}
+
+bool OptimizeQuantBiasesFromStats(const QuantBiasStats& stats, float rd_lambda,
+                                  float header_bits, float out_biases[4]) {
+  float cand[4];
+  for (size_t c = 0; c < 4; ++c) {
+    if (stats.count[c] >= 16.0 && stats.den[c] > 1e-12) {
+      cand[c] = static_cast<float>(stats.num[c] / stats.den[c]);
+    } else {
+      cand[c] = kDefaultQuantBias[c];
+    }
+  }
+  return GateQuantBiasesFromStats(stats, cand, rd_lambda, header_bits,
+                                  out_biases);
 }
 
 // ============================================================================
@@ -2802,10 +3263,11 @@ Status ComputeCoefficientsRDOQ(const FrameHeader& frame_header,
                                const ImageF& initial_quant_field,
                                const ImageF& initial_quant_masking1x1,
                                const RDORateModel& rate_model, ThreadPool* pool,
-                               PassesEncoderState* enc_state) {
+                               PassesEncoderState* enc_state,
+                               QuantBiasStats* qb_stats) {
   return HWY_DYNAMIC_DISPATCH(ComputeCoefficientsRDOQ_HWY)(
       frame_header, opsin, rect, initial_quant_field, initial_quant_masking1x1,
-      rate_model, pool, enc_state);
+      rate_model, pool, enc_state, qb_stats);
 }
 
 Status ComputeDCFromOpsin(const Image3F& opsin, const Rect& rect,
@@ -2838,9 +3300,7 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
   if (cparams.butteraugli_distance > 4.5f) {
     epf_steps = std::vector<uint8_t>{0, 4};
   } else {
-    epf_steps = (cparams.speed_tier <= SpeedTier::kKitten)
-                    ? std::vector<uint8_t>{0, 1, 2, 3, 4, 5, 6, 7}
-                    : std::vector<uint8_t>{0, 2, 4, 7};
+    epf_steps = std::vector<uint8_t>{0, 2, 4, 7};
   }
 
   const bool has_mask = (initial_quant_masking1x1.xsize() > 0 &&
@@ -2849,8 +3309,11 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
   const size_t mask_h = initial_quant_masking1x1.ysize();
   const size_t xb = frame_dim.xsize_blocks;
   const size_t yb = frame_dim.ysize_blocks;
+  const size_t img_w = orig_opsin.xsize();
+  const size_t img_h = orig_opsin.ysize();
 
   static constexpr double kChanW[3] = {12.339445295782363, 1.0, 0.2};
+  static constexpr double kEpfDetailLossW = 0.55;
 
   std::array<ImageF, 8> error_images;
   for (uint8_t val : epf_steps) {
@@ -2858,16 +3321,15 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
     JXL_ASSIGN_OR_RETURN(
         Image3F decoded,
         ReconstructImage(frame_header, shared, enc_state->coeffs, pool));
-    JXL_ASSIGN_OR_RETURN(error_images[val],
-                         ImageF::Create(memory_manager, xb, yb));
     auto compute_row = [&](uint32_t by, size_t /*thread*/) -> Status {
       float* erow = error_images[val].Row(by);
       const size_t py0 = by * kBlockDim;
-      const size_t py1 = std::min(py0 + kBlockDim, orig_opsin.ysize());
+      const size_t py1 = std::min(py0 + kBlockDim, img_h);
       for (size_t bx = 0; bx < xb; ++bx) {
         const size_t px0 = bx * kBlockDim;
-        const size_t px1 = std::min(px0 + kBlockDim, orig_opsin.xsize());
+        const size_t px1 = std::min(px0 + kBlockDim, img_w);
         double e2[3] = {0.0, 0.0, 0.0};
+        double gl2[2] = {0.0, 0.0};
         for (size_t y = py0; y < py1; ++y) {
           const float* mr =
               has_mask
@@ -2879,6 +3341,13 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
           const float* b0 = decoded.ConstPlaneRow(0, y);
           const float* b1 = decoded.ConstPlaneRow(1, y);
           const float* b2 = decoded.ConstPlaneRow(2, y);
+          const bool has_yn = (y + 1 < img_h);
+          const float* a0n =
+              has_yn ? orig_opsin.ConstPlaneRow(0, y + 1) : nullptr;
+          const float* a1n =
+              has_yn ? orig_opsin.ConstPlaneRow(1, y + 1) : nullptr;
+          const float* b0n = has_yn ? decoded.ConstPlaneRow(0, y + 1) : nullptr;
+          const float* b1n = has_yn ? decoded.ConstPlaneRow(1, y + 1) : nullptr;
           for (size_t x = px0; x < px1; ++x) {
             const float m = has_mask ? mr[std::min(x, mask_w - 1)] : 1.0f;
             const float m2 = m * m;
@@ -2888,13 +3357,47 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
             e2[0] += m2 * d0 * d0;
             e2[1] += m2 * d1 * d1;
             e2[2] += m2 * d2 * d2;
+
+            const float mg = Clamp1(m, 16.0f, 36.0f);
+            const float mg2 = mg * mg;
+            if (x + 1 < img_w) {
+              const float go0 = std::abs(a0[x + 1] - a0[x]);
+              const float gd0 = std::abs(b0[x + 1] - b0[x]);
+              if (gd0 < go0) {
+                const float dl = go0 - gd0;
+                gl2[0] += mg2 * dl * dl;
+              }
+              const float go1 = std::abs(a1[x + 1] - a1[x]);
+              const float gd1 = std::abs(b1[x + 1] - b1[x]);
+              if (gd1 < go1) {
+                const float dl = go1 - gd1;
+                gl2[1] += mg2 * dl * dl;
+              }
+            }
+            if (has_yn) {
+              const float go0 = std::abs(a0n[x] - a0[x]);
+              const float gd0 = std::abs(b0n[x] - b0[x]);
+              if (gd0 < go0) {
+                const float dl = go0 - gd0;
+                gl2[0] += mg2 * dl * dl;
+              }
+              const float go1 = std::abs(a1n[x] - a1[x]);
+              const float gd1 = std::abs(b1n[x] - b1[x]);
+              if (gd1 < go1) {
+                const float dl = go1 - gd1;
+                gl2[1] += mg2 * dl * dl;
+              }
+            }
           }
         }
-        erow[bx] = static_cast<float>(kChanW[0] * e2[0] + kChanW[1] * e2[1] +
-                                      kChanW[2] * e2[2]);
+        erow[bx] = static_cast<float>(
+            kChanW[0] * (e2[0] + kEpfDetailLossW * gl2[0]) +
+            kChanW[1] * (e2[1] + kEpfDetailLossW * gl2[1]) + kChanW[2] * e2[2]);
       }
       return true;
     };
+    JXL_ASSIGN_OR_RETURN(error_images[val],
+                         ImageF::Create(memory_manager, xb, yb));
     JXL_RETURN_IF_ERROR(RunOnPool(pool, 0, yb, ThreadPool::NoInit, compute_row,
                                   "EPFErrorBlocks"));
   }
@@ -2911,9 +3414,8 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
   }
   const double mean_err4 =
       std::max(1e-8, sum_err4 / static_cast<double>(xb * yb));
-  const double lambda_epf =
-      (0.065 / Clamp1<double>(cparams.butteraugli_distance, 0.5, 5.0)) *
-      mean_err4;
+  const double lam_scale =
+      0.055 / Clamp1<double>(cparams.butteraugli_distance, 0.5, 5.0);
 
   // Empirical EPF conditional counts updated after Pass 1.
   std::array<std::array<double, 8>, 4> emp_cnt{};
@@ -2943,15 +3445,19 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
       for (size_t by = 0; by < yb; ++by) {
         uint8_t* row = epf_sharpness.Row(by);
         const uint8_t* trow = (by > 0) ? epf_sharpness.ConstRow(by - 1) : row;
+        const float* er4 = error_images[4].ConstRow(by);
         for (size_t bx = 0; bx < xb; ++bx) {
           const uint8_t top = (by > 0) ? trow[bx] : 4;
           const uint8_t left = (bx > 0) ? row[bx - 1] : 4;
+          const double loc_lambda =
+              lam_scale *
+              (0.70 * static_cast<double>(er4[bx]) + 0.30 * mean_err4);
           uint8_t best_s = epf_steps[0];
           double best_j = std::numeric_limits<double>::infinity();
           for (uint8_t s : epf_steps) {
             const size_t ctx = ((s == top) ? 1 : 0) + ((s == left) ? 2 : 0);
             const double d = error_images[s].Row(by)[bx];
-            const double j = d + lambda_epf * emp_rate[ctx][s];
+            const double j = d + loc_lambda * emp_rate[ctx][s];
             if (j < best_j) {
               best_j = j;
               best_s = s;
@@ -2974,15 +3480,21 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
       for (size_t by = 0; by < yb; ++by) {
         uint8_t* row = epf_sharpness.Row(by);
         const uint8_t* trow = (by > 0) ? epf_sharpness.ConstRow(by - 1) : row;
+        const float* er4 = error_images[4].ConstRow(by);
+        const double loc_lambda0 =
+            lam_scale * (0.70 * static_cast<double>(er4[0]) + 0.30 * mean_err4);
         for (size_t si = 0; si < ns; ++si) {
           const uint8_t s = epf_steps[si];
           const uint8_t top = (by > 0) ? trow[0] : 4;
           const size_t ctx = ((s == top) ? 1 : 0) + ((s == 4) ? 2 : 0);
           prev_cost[si] =
-              error_images[s].Row(by)[0] + lambda_epf * emp_rate[ctx][s];
+              error_images[s].Row(by)[0] + loc_lambda0 * emp_rate[ctx][s];
         }
         for (size_t bx = 1; bx < xb; ++bx) {
           const uint8_t top = (by > 0) ? trow[bx] : 4;
+          const double loc_lambda =
+              lam_scale *
+              (0.70 * static_cast<double>(er4[bx]) + 0.30 * mean_err4);
           for (size_t si = 0; si < ns; ++si) {
             const uint8_t s = epf_steps[si];
             const double err = error_images[s].Row(by)[bx];
@@ -2992,7 +3504,7 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
               const uint8_t left = epf_steps[pi];
               const size_t ctx = ((s == top) ? 1 : 0) + ((s == left) ? 2 : 0);
               const double c_val =
-                  prev_cost[pi] + err + lambda_epf * emp_rate[ctx][s];
+                  prev_cost[pi] + err + loc_lambda * emp_rate[ctx][s];
               if (c_val < best) {
                 best = c_val;
                 best_prev = static_cast<uint8_t>(pi);
@@ -3022,14 +3534,18 @@ RDOQTrellisResult RunTrellisRDOQSingleBlockForTest(
     const Quantizer& quantizer, float qm_multiplier, int32_t qf, float q_target,
     int32_t predicted_nzeros, size_t block_ctx, const BlockCtxMap& bcm,
     const coeff_order_t* order, const RDORateModel& rate_model, float lambda,
-    int band_width, int multi_level, int32_t* quantized_out) {
+    int band_width, int multi_level, int32_t* quantized_out,
+    const float* quant_biases) {
   BlockTrellisWorkspace ws;
+  const float* eff_biases =
+      (quant_biases != nullptr) ? quant_biases : kDefaultQuantBias;
   return RunTrellisRDOQCore(
       channel, acs_type, coeffs_in, quantizer, qm_multiplier, qf, q_target,
       predicted_nzeros, block_ctx, bcm, order, rate_model, lambda, band_width,
       multi_level, /*non_perceptual_mse=*/false, /*jnd_zero_floor=*/0.0f,
-      /*unmasked_lf_dist_mul=*/1.0f, /*unmasked_hf_dist_mul=*/1.0f, nullptr,
-      nullptr, 0.0f, 0.0f, nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f,
+      /*tex_contrast_mul=*/0.0f, /*unmasked_lf_dist_mul=*/1.0f,
+      /*unmasked_hf_dist_mul=*/1.0f, eff_biases, nullptr, nullptr, 0.0f, 0.0f,
+      nullptr, nullptr, 1.0f, 1.0f, 1.0f, 1.0f,
       /*enable_cfl_coupling=*/false, &ws, quantized_out);
 }
 

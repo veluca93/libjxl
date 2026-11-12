@@ -31,12 +31,54 @@
 #include "lib/jxl/frame_dimensions.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/image.h"
+#include "lib/jxl/image_metadata.h"
 
 namespace jxl {
+
+// Quantization bias exploration modes encoded in CustomTransformData.
+enum class QuantBiasMode : uint8_t {
+  kDefault = 0,
+  kNoBias = 1,
+  kDistanceSchedule = 2,
+  kImageAdaptiveLS = 3,
+};
+
+// Accumulated per-image weighted least-squares sufficient statistics for
+// fitting AC dequantization biases quant_biases[0..3]:
+//   c in {0,1,2} (|k| == 1): minimize sum w * (u - b_c * sign(k) * eff_s)^2
+//   c == 3      (|k| >= 2): minimize sum w * (eff_s * k - u - b_3 * eff_s /
+//   k)^2
+struct QuantBiasStats {
+  double num[4] = {};
+  double den[4] = {};
+  double count[4] = {};
+
+  void Merge(const QuantBiasStats& o) {
+    for (size_t i = 0; i < 4; ++i) {
+      num[i] += o.num[i];
+      den[i] += o.den[i];
+      count[i] += o.count[i];
+    }
+  }
+};
+
+QuantBiasMode ActiveQuantBiasMode();
+void SetActiveQuantBiasModeForTest(int mode_or_minus1);
+float RoundToF16(float v);
+void SetOpsinInverseMatrixQuantBiases(const float biases[4],
+                                      OpsinInverseMatrix* im);
+void ComputeInitialQuantBiases(QuantBiasMode mode, float butteraugli_distance,
+                               float out_biases[4]);
+bool GateQuantBiasesFromStats(const QuantBiasStats& stats,
+                              const float cand_biases[4], float rd_lambda,
+                              float header_bits, float out_biases[4]);
+bool OptimizeQuantBiasesFromStats(const QuantBiasStats& stats, float rd_lambda,
+                                  float header_bits, float out_biases[4]);
 
 // Calibrated Lagrangian multiplier lambda(d) mapping rate in bits to normalized
 // distortion units.
 float ComputeRDOLambda(float butteraugli_distance);
+float ComputeUpsampleLambdaMul(uint32_t upsampling, float butteraugli_distance);
 
 // Immutable per-pass rate model providing fast O(1) small-symbol bit estimates
 // for AC tokens (NonZeroContext & ZeroDensityContext) and kACMeta control
@@ -108,7 +150,8 @@ Status ComputeCoefficientsRDOQ(const FrameHeader& frame_header,
                                const ImageF& initial_quant_field,
                                const ImageF& initial_quant_masking1x1,
                                const RDORateModel& rate_model, ThreadPool* pool,
-                               PassesEncoderState* enc_state);
+                               PassesEncoderState* enc_state,
+                               QuantBiasStats* qb_stats = nullptr);
 
 // Transforms `opsin` blocks according to `ac_strategy` and extracts lowest
 // frequencies into `dc` across all 3 channels.
@@ -129,6 +172,7 @@ Status ComputeEPFSharpnessRDO(const FrameHeader& frame_header,
 struct RDOQTrellisResult {
   float rd_cost = 0.0f;
   float dist = 0.0f;
+  float var_dist = 0.0f;
   float rate_bits = 0.0f;
   int32_t nzeros = 0;
 };
@@ -138,7 +182,8 @@ RDOQTrellisResult RunTrellisRDOQSingleBlockForTest(
     const Quantizer& quantizer, float qm_multiplier, int32_t qf, float q_target,
     int32_t predicted_nzeros, size_t block_ctx, const BlockCtxMap& bcm,
     const coeff_order_t* order, const RDORateModel& rate_model, float lambda,
-    int band_width, int multi_level, int32_t* quantized_out);
+    int band_width, int multi_level, int32_t* quantized_out,
+    const float* quant_biases = nullptr);
 
 }  // namespace jxl
 

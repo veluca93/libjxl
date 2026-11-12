@@ -99,13 +99,15 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
                    JxlEncoderChunkedFrameAdapter& frame_data,
                    const JxlCmsInterface& cms, ThreadPool* pool,
                    JxlEncoderOutputProcessorWrapper* output_processor,
-                   AuxOut* aux_out, uint32_t* jxlp_counter);
+                   AuxOut* aux_out, uint32_t* jxlp_counter,
+                   OpsinInverseMatrix* mutable_opsin_inverse_matrix = nullptr);
 
 Status EncodeFrame(JxlMemoryManager* memory_manager,
                    const CompressParams& cparams_orig,
                    const FrameInfo& frame_info, const CodecMetadata* metadata,
                    ImageBundle& ib, const JxlCmsInterface& cms,
-                   ThreadPool* pool, BitWriter* writer, AuxOut* aux_out);
+                   ThreadPool* pool, BitWriter* writer, AuxOut* aux_out,
+                   OpsinInverseMatrix* mutable_opsin_inverse_matrix = nullptr);
 
 }  // namespace jxl
 

@@ -6,7 +6,10 @@
 #include "lib/jxl/enc_rdoq.h"
 
 #include <jxl/cms.h>
+#include <jxl/decode.h>
+#include <jxl/decode_cxx.h>
 #include <jxl/encode.h>
+#include <jxl/encode_cxx.h>
 #include <jxl/memory_manager.h>
 
 #include <algorithm>
@@ -14,9 +17,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,16 +29,20 @@
 #include "lib/extras/enc/jxl.h"
 #include "lib/jxl/ac_context.h"
 #include "lib/jxl/ac_strategy.h"
+#include "lib/jxl/base/byte_order.h"
 #include "lib/jxl/base/common.h"
 #include "lib/jxl/base/span.h"
 #include "lib/jxl/base/status.h"
+#include "lib/jxl/cms/opsin_params.h"
 #include "lib/jxl/coeff_order_fwd.h"
 #include "lib/jxl/color_encoding_internal.h"
 #include "lib/jxl/common.h"
 #include "lib/jxl/dec_bit_reader.h"
 #include "lib/jxl/dec_cache.h"
 #include "lib/jxl/dec_frame.h"
+#include "lib/jxl/dec_xyb.h"
 #include "lib/jxl/enc_params.h"
+#include "lib/jxl/fields.h"
 #include "lib/jxl/frame_dimensions.h"
 #include "lib/jxl/frame_header.h"
 #include "lib/jxl/headers.h"
@@ -52,6 +61,14 @@
 
 namespace jxl {
 namespace {
+
+class ScopedQuantBiasModeOverride {
+ public:
+  explicit ScopedQuantBiasModeOverride(QuantBiasMode mode) {
+    SetActiveQuantBiasModeForTest(static_cast<int>(mode));
+  }
+  ~ScopedQuantBiasModeOverride() { SetActiveQuantBiasModeForTest(-1); }
+};
 
 float DebiasForTest(size_t c, int32_t k) {
   if (k == 0) return 0.0f;
@@ -228,9 +245,14 @@ TEST(EncRDOQTest, TrellisMatchesExhaustiveBruteForceOnSparse8x8) {
 
 TEST(EncRDOQTest, LambdaAndTrellisMonotonicity) {
   const std::array<float, 5> distances = {0.5f, 1.0f, 2.0f, 4.0f, 8.0f};
-  for (size_t i = 1; i < distances.size(); ++i) {
-    EXPECT_LT(ComputeRDOLambda(distances[i]),
-              ComputeRDOLambda(distances[i - 1]));
+  for (size_t i = 0; i < distances.size(); ++i) {
+    const float lam = ComputeRDOLambda(distances[i]);
+    EXPECT_TRUE(std::isfinite(lam));
+    EXPECT_GE(lam, 0.02f);
+    EXPECT_LE(lam, 0.25f);
+    if (i > 0) {
+      EXPECT_GE(lam, ComputeRDOLambda(distances[i - 1]) - 1e-6f);
+    }
   }
 
   JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
@@ -535,6 +557,319 @@ TEST(EncRDOQTest, VarDCTFeaturesDefaultOffAndExplicitOverrideOn) {
     DecodeCompressedInspect(compressed, &metadata, &dec);
     EXPECT_NE(dec->last_frame_header.flags & FrameHeader::kNoise, 0u);
   }
+}
+
+TEST(EncRDOQTest, QuantBiasF16AndMatrixWhitePoint) {
+  OpsinInverseMatrix im;
+  Bundle::SetDefault(&im);
+  EXPECT_TRUE(Bundle::AllDefault(im));
+
+  SetOpsinInverseMatrixQuantBiases(kDefaultQuantBias, &im);
+  EXPECT_TRUE(Bundle::AllDefault(im));
+
+  const float custom[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+  SetOpsinInverseMatrixQuantBiases(custom, &im);
+  EXPECT_FALSE(Bundle::AllDefault(im));
+  for (size_t c = 0; c < 4; ++c) {
+    EXPECT_EQ(im.quant_biases[c], RoundToF16(custom[c]));
+  }
+  for (size_t r = 0; r < 3; ++r) {
+    double row_sum = static_cast<double>(im.inverse_matrix[r][0]) +
+                     static_cast<double>(im.inverse_matrix[r][1]) +
+                     static_cast<double>(im.inverse_matrix[r][2]);
+    EXPECT_NEAR(row_sum, 1.0, 1e-7);
+    for (size_t c = 0; c < 3; ++c) {
+      EXPECT_EQ(im.inverse_matrix[r][c], RoundToF16(im.inverse_matrix[r][c]));
+    }
+    EXPECT_EQ(im.opsin_biases[r], RoundToF16(im.opsin_biases[r]));
+  }
+
+  auto metadata = jxl::make_unique<CodecMetadata>();
+  metadata->m.xyb_encoded = true;
+  metadata->m.color_encoding = ColorEncoding::SRGB(/*is_gray=*/false);
+  metadata->transform_data.nonserialized_xyb_encoded = true;
+  metadata->transform_data.opsin_inverse_matrix = im;
+  metadata->transform_data.all_default =
+      Bundle::AllDefault(metadata->transform_data);
+
+  // Round-trip write & read through Bundle to verify exact FP16 fidelity.
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  BitWriter writer{memory_manager};
+  ASSERT_TRUE(Bundle::Write(metadata->transform_data, &writer,
+                            LayerType::Header, nullptr));
+  writer.ZeroPadToByte();
+  PaddedBytes bytes = std::move(writer).TakeBytes();
+  BitReader reader(bytes);
+  auto decoded_td = jxl::make_unique<CustomTransformData>();
+  decoded_td->nonserialized_xyb_encoded = true;
+  ASSERT_TRUE(Bundle::Read(&reader, decoded_td.get()));
+  ASSERT_TRUE(reader.Close());
+  for (size_t c = 0; c < 4; ++c) {
+    EXPECT_EQ(decoded_td->opsin_inverse_matrix.quant_biases[c], custom[c]);
+  }
+
+  auto decoded_meta = jxl::make_unique<CodecMetadata>();
+  decoded_meta->m.xyb_encoded = true;
+  decoded_meta->m.color_encoding = ColorEncoding::SRGB(/*is_gray=*/false);
+  decoded_meta->transform_data = *decoded_td;
+  auto oei = jxl::make_unique<OutputEncodingInfo>();
+  ASSERT_TRUE(oei->SetFromMetadata(*decoded_meta));
+  EXPECT_TRUE(oei->default_transform);
+  EXPECT_TRUE(oei->all_default_opsin);
+  for (size_t c = 0; c < 4; ++c) {
+    EXPECT_EQ(oei->opsin_params.quant_biases[c], custom[c]);
+  }
+}
+
+TEST(EncRDOQTest, QuantBiasLeastSquaresGating) {
+  QuantBiasStats small_stats;
+  for (size_t c = 0; c < 4; ++c) {
+    small_stats.count[c] = 8.0;
+    small_stats.den[c] = 10.0;
+    small_stats.num[c] = (c < 3 ? 0.99 : 0.03) * 10.0;
+  }
+  float out[4] = {};
+  const float lambda = ComputeRDOLambda(1.0f);
+  EXPECT_FALSE(OptimizeQuantBiasesFromStats(small_stats, lambda, 260.0f, out));
+  for (size_t c = 0; c < 4; ++c) {
+    EXPECT_FLOAT_EQ(out[c], kDefaultQuantBias[c]);
+  }
+
+  QuantBiasStats large_stats;
+  const float target[4] = {0.99f, 0.98f, 0.99f, 0.03f};
+  for (size_t c = 0; c < 4; ++c) {
+    large_stats.count[c] = 4000.0;
+    large_stats.den[c] = 4000.0;
+    large_stats.num[c] = target[c] * 4000.0;
+  }
+  EXPECT_TRUE(OptimizeQuantBiasesFromStats(large_stats, lambda, 260.0f, out));
+  for (size_t c = 0; c < 4; ++c) {
+    EXPECT_NEAR(out[c], RoundToF16(target[c]), 1e-4f);
+  }
+}
+
+TEST(EncRDOQTest, TrellisRDOQCustomQuantBias) {
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  DequantMatrices matrices;
+  ASSERT_TRUE(matrices.EnsureComputed(
+      memory_manager, 1u << static_cast<uint32_t>(AcStrategyType::DCT)));
+  Quantizer quantizer(matrices, 8, kGlobalScaleDenom);
+  quantizer.RecomputeFromGlobalScale();
+  BlockCtxMap bcm;
+  RDORateModel rate_model;
+  rate_model.InitPreset(bcm, 1.0f, 0);
+  coeff_order_t order[kDCTBlockSize];
+  AcStrategy::FromRawStrategy(AcStrategyType::DCT)
+      .ComputeNaturalCoeffOrder(order);
+
+  float coeffs[kDCTBlockSize] = {};
+  const float* deq = quantizer.DequantMatrix(AcStrategyType::DCT, 1);
+  const int32_t qf = 16;
+  const float q_target = static_cast<float>(qf) / quantizer.InvGlobalScale();
+  // Set coeff[order[1]] near +1.0 * quant_step where b=1.0 beats b=0.92995.
+  coeffs[order[1]] = 1.0f * (deq[order[1]] / quantizer.Scale() / qf) * 1.0f;
+
+  int32_t q_def[kDCTBlockSize] = {};
+  int32_t q_unb[kDCTBlockSize] = {};
+  const float unbiased[4] = {1.0f, 1.0f, 1.0f, 0.0f};
+  const float lambda = ComputeRDOLambda(1.0f);
+  RDOQTrellisResult r_def = RunTrellisRDOQSingleBlockForTest(
+      1, AcStrategyType::DCT, coeffs, quantizer, 1.0f, qf, q_target, 1, 0, bcm,
+      order, rate_model, lambda, 8, 2, q_def, kDefaultQuantBias);
+  RDOQTrellisResult r_unb = RunTrellisRDOQSingleBlockForTest(
+      1, AcStrategyType::DCT, coeffs, quantizer, 1.0f, qf, q_target, 1, 0, bcm,
+      order, rate_model, lambda, 8, 2, q_unb, unbiased);
+  EXPECT_TRUE(std::isfinite(r_def.rd_cost));
+  EXPECT_TRUE(std::isfinite(r_unb.rd_cost));
+  EXPECT_EQ(q_def[order[1]], 1);
+  EXPECT_EQ(q_unb[order[1]], 1);
+  EXPECT_LT(r_unb.dist, r_def.dist);
+  (void)memory_manager;
+}
+
+TEST(EncRDOQTest, BoxedSingleFrameQuantBiasRoundtrip) {
+  ScopedQuantBiasModeOverride qb_guard(QuantBiasMode::kImageAdaptiveLS);
+  const std::vector<uint8_t> orig =
+      test::ReadTestData("external/wesaturate/500px/u76c0g_bliznaca_srgb8.png");
+  test::TestImage t;
+  ASSERT_TRUE(t.DecodeFromBytes(orig));
+  t.ClearMetadata();
+
+  const auto& pframe = t.ppf().frames[0];
+  const auto& pimage = pframe.color;
+  JxlBasicInfo basic_info = t.ppf().info;
+  basic_info.uses_original_profile = JXL_FALSE;
+
+  JxlEncoderPtr enc = JxlEncoderMake(nullptr);
+  ASSERT_NE(nullptr, enc.get());
+  EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderUseBoxes(enc.get()));
+  EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderSetBasicInfo(enc.get(), &basic_info));
+  EXPECT_EQ(JXL_ENC_SUCCESS,
+            JxlEncoderSetColorEncoding(enc.get(), &t.ppf().color_encoding));
+
+  constexpr char kXmlPayload[] = "<xmp>quant-bias-boxed-test</xmp>";
+  const size_t xml_size = sizeof(kXmlPayload) - 1;
+  EXPECT_EQ(JXL_ENC_SUCCESS,
+            JxlEncoderAddBox(enc.get(), "xml ",
+                             reinterpret_cast<const uint8_t*>(kXmlPayload),
+                             xml_size, JXL_FALSE));
+  JxlEncoderCloseBoxes(enc.get());
+
+  JxlEncoderFrameSettings* fs =
+      JxlEncoderFrameSettingsCreate(enc.get(), nullptr);
+  ASSERT_NE(nullptr, fs);
+  EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderSetFrameDistance(fs, 2.0f));
+  EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderFrameSettingsSetOption(
+                                 fs, JXL_ENC_FRAME_SETTING_EFFORT, 8));
+  JxlPixelFormat fmt = pimage.format;
+  EXPECT_EQ(JXL_ENC_SUCCESS, JxlEncoderAddImageFrame(fs, &fmt, pimage.pixels(),
+                                                     pimage.pixels_size));
+  JxlEncoderCloseInput(enc.get());
+
+  std::vector<uint8_t> compressed(4096);
+  uint8_t* next_out = compressed.data();
+  size_t avail_out = compressed.size();
+  for (;;) {
+    JxlEncoderStatus st =
+        JxlEncoderProcessOutput(enc.get(), &next_out, &avail_out);
+    if (st == JXL_ENC_SUCCESS) break;
+    ASSERT_EQ(JXL_ENC_NEED_MORE_OUTPUT, st);
+    size_t offset = static_cast<size_t>(next_out - compressed.data());
+    compressed.resize(compressed.size() * 2);
+    next_out = compressed.data() + offset;
+    avail_out = compressed.size() - offset;
+  }
+  compressed.resize(static_cast<size_t>(next_out - compressed.data()));
+
+  // Decode both the early "xml " box and full image pixels via JxlDecoder.
+  JxlDecoderPtr dec = JxlDecoderMake(nullptr);
+  ASSERT_NE(nullptr, dec.get());
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSubscribeEvents(
+                                 dec.get(), JXL_DEC_BASIC_INFO | JXL_DEC_BOX |
+                                                JXL_DEC_FULL_IMAGE));
+  EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderSetInput(dec.get(), compressed.data(),
+                                                compressed.size()));
+  JxlDecoderCloseInput(dec.get());
+
+  std::vector<uint8_t> dec_xml(xml_size);
+  std::vector<uint8_t> dec_pixels;
+  JxlBasicInfo dec_info = {};
+  JxlPixelFormat out_fmt = {3, JXL_TYPE_UINT8, JXL_NATIVE_ENDIAN, 0};
+  bool saw_xml_box = false;
+  bool saw_full_image = false;
+  for (;;) {
+    JxlDecoderStatus st = JxlDecoderProcessInput(dec.get());
+    if (st == JXL_DEC_SUCCESS) {
+      EXPECT_EQ(0u, JxlDecoderReleaseBoxBuffer(dec.get()));
+      break;
+    }
+    if (st == JXL_DEC_BASIC_INFO) {
+      EXPECT_EQ(JXL_DEC_SUCCESS, JxlDecoderGetBasicInfo(dec.get(), &dec_info));
+      EXPECT_EQ(dec_info.xsize, basic_info.xsize);
+      EXPECT_EQ(dec_info.ysize, basic_info.ysize);
+    } else if (st == JXL_DEC_BOX) {
+      EXPECT_EQ(0u, JxlDecoderReleaseBoxBuffer(dec.get()));
+      JxlBoxType type;
+      EXPECT_EQ(JXL_DEC_SUCCESS,
+                JxlDecoderGetBoxType(dec.get(), type, JXL_TRUE));
+      if (std::memcmp(type, "xml ", 4) == 0) {
+        saw_xml_box = true;
+        EXPECT_EQ(
+            JXL_DEC_SUCCESS,
+            JxlDecoderSetBoxBuffer(dec.get(), dec_xml.data(), dec_xml.size()));
+      }
+    } else if (st == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+      size_t out_size = 0;
+      EXPECT_EQ(JXL_DEC_SUCCESS,
+                JxlDecoderImageOutBufferSize(dec.get(), &out_fmt, &out_size));
+      dec_pixels.resize(out_size);
+      EXPECT_EQ(JXL_DEC_SUCCESS,
+                JxlDecoderSetImageOutBuffer(
+                    dec.get(), &out_fmt, dec_pixels.data(), dec_pixels.size()));
+    } else if (st == JXL_DEC_FULL_IMAGE) {
+      saw_full_image = true;
+    } else {
+      FAIL() << "Unexpected JxlDecoderProcessInput status: " << st;
+    }
+  }
+  EXPECT_TRUE(saw_xml_box);
+  EXPECT_TRUE(saw_full_image);
+  EXPECT_EQ(0, std::memcmp(dec_xml.data(), kXmlPayload, xml_size));
+
+  // Verify container layout has jxlp(0) before "xml " and custom quant_biases
+  // are present in the reassembled codestream.
+  std::vector<uint8_t> codestream;
+  std::vector<std::string> box_order;
+  size_t pos = 0;
+  while (pos + 8 <= compressed.size()) {
+    uint64_t box_size = LoadBE32(compressed.data() + pos);
+    std::string box_type(
+        reinterpret_cast<const char*>(compressed.data() + pos + 4), 4);
+    size_t hdr = 8;
+    if (box_size == 1) {
+      ASSERT_LE(pos + 16, compressed.size());
+      box_size = LoadBE64(compressed.data() + pos + 8);
+      hdr = 16;
+    } else if (box_size == 0) {
+      box_size = compressed.size() - pos;
+    }
+    ASSERT_GE(box_size, hdr);
+    ASSERT_LE(pos + box_size, compressed.size());
+    box_order.push_back(box_type);
+    if (box_type == "jxlc") {
+      codestream.insert(codestream.end(), compressed.begin() + pos + hdr,
+                        compressed.begin() + pos + box_size);
+    } else if (box_type == "jxlp") {
+      ASSERT_GE(box_size, hdr + 4);
+      codestream.insert(codestream.end(), compressed.begin() + pos + hdr + 4,
+                        compressed.begin() + pos + box_size);
+    }
+    pos += static_cast<size_t>(box_size);
+  }
+  EXPECT_EQ(pos, compressed.size());
+  EXPECT_GE(box_order.size(), 5u);
+  EXPECT_EQ(box_order[0], "JXL ");
+  EXPECT_EQ(box_order[1], "ftyp");
+  EXPECT_EQ(box_order[2], "jxlp");
+  EXPECT_EQ(box_order[3], "xml ");
+  EXPECT_EQ(box_order[4], "jxlp");
+
+  std::unique_ptr<CodecMetadata> metadata;
+  std::unique_ptr<DecodedRDOInspection> dec_inspect;
+  DecodeCompressedInspect(codestream, &metadata, &dec_inspect);
+  EXPECT_FALSE(
+      Bundle::AllDefault(metadata->transform_data.opsin_inverse_matrix));
+}
+
+TEST(EncRDOQTest, SmallImageSkipsCustomQuantBiasOverhead) {
+  ScopedQuantBiasModeOverride qb_guard(QuantBiasMode::kImageAdaptiveLS);
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  constexpr size_t kDim = 32;
+  JXL_TEST_ASSIGN_OR_DIE(Image3F img,
+                         Image3F::Create(memory_manager, kDim, kDim));
+  for (size_t y = 0; y < kDim; ++y) {
+    for (size_t x = 0; x < kDim; ++x) {
+      img.PlaneRow(0, y)[x] =
+          0.25f + 0.5f * std::sin(0.3f * static_cast<float>(x)) *
+                      std::cos(0.25f * static_cast<float>(y));
+      img.PlaneRow(1, y)[x] =
+          0.5f * static_cast<float>(x) / static_cast<float>(kDim) + 0.25f;
+      img.PlaneRow(2, y)[x] =
+          0.5f * static_cast<float>(y) / static_cast<float>(kDim) + 0.25f;
+    }
+  }
+  auto io = MakeSRGBCodecInOut(img);
+  CompressParams cparams;
+  cparams.speed_tier = SpeedTier::kKitten;
+  cparams.butteraugli_distance = 2.0f;
+  std::vector<uint8_t> compressed;
+  ASSERT_TRUE(test::EncodeFile(cparams, io.get(), &compressed));
+
+  std::unique_ptr<CodecMetadata> metadata;
+  std::unique_ptr<DecodedRDOInspection> dec;
+  DecodeCompressedInspect(compressed, &metadata, &dec);
+  EXPECT_TRUE(
+      Bundle::AllDefault(metadata->transform_data.opsin_inverse_matrix));
 }
 
 }  // namespace

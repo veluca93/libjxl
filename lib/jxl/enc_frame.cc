@@ -515,12 +515,11 @@ Status MakeFrameHeader(size_t xsize, size_t ysize,
     frame_header->UpdateFlag(false, FrameHeader::kUseDcFrame);
     // Skip smoothing if set to 0, default to 444 only and on when set to 1.
     // Flag is whether to skip, so logic is inverted.
-      if (!((cparams.force_lfs_jpeg_recompression == -1 &&
-        frame_header->chroma_subsampling.Is444()) ||
-        cparams.force_lfs_jpeg_recompression == 1)) {
-        frame_header->UpdateFlag(true,
-        FrameHeader::kSkipAdaptiveDCSmoothing);
-      }
+    if (!((cparams.force_lfs_jpeg_recompression == -1 &&
+           frame_header->chroma_subsampling.Is444()) ||
+          cparams.force_lfs_jpeg_recompression == 1)) {
+      frame_header->UpdateFlag(true, FrameHeader::kSkipAdaptiveDCSmoothing);
+    }
   }
 
   return true;
@@ -711,8 +710,8 @@ void ComputeNoiseParams(const CompressParams& cparams, bool streaming_mode,
   }
   if (cparams.photon_noise_iso > 0) {
     FrameDimensions full_frame_dim = frame_header->ToFrameDimensions();
-    *noise_params = SimulatePhotonNoise(full_frame_dim.xsize, full_frame_dim.ysize,
-                                        cparams.photon_noise_iso);
+    *noise_params = SimulatePhotonNoise(
+        full_frame_dim.xsize, full_frame_dim.ysize, cparams.photon_noise_iso);
   } else if (cparams.manual_noise.size() == NoiseParams::kNumNoisePoints) {
     for (size_t i = 0; i < NoiseParams::kNumNoisePoints; i++) {
       noise_params->lut[i] = cparams.manual_noise[i];
@@ -1149,13 +1148,12 @@ Status ComputeAllCoeffOrders(PassesEncoderState& enc_state,
 Status TokenizeAllCoefficients(const FrameHeader& frame_header,
                                ThreadPool* pool, PassesEncoderState* enc_state);
 
-Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
-                                 const Image3F* linear,
-                                 Image3F* JXL_RESTRICT opsin, const Rect& rect,
-                                 const JxlCmsInterface& cms, ThreadPool* pool,
-                                 ModularFrameEncoder* enc_modular,
-                                 PassesEncoderState* enc_state,
-                                 AuxOut* aux_out) {
+Status ComputeVarDCTEncodingData(
+    const FrameHeader& frame_header, const Image3F* linear,
+    Image3F* JXL_RESTRICT opsin, const Rect& rect, const JxlCmsInterface& cms,
+    ThreadPool* pool, ModularFrameEncoder* enc_modular,
+    PassesEncoderState* enc_state, AuxOut* aux_out,
+    OpsinInverseMatrix* mutable_opsin_inverse_matrix = nullptr) {
   JXL_ENSURE((rect.xsize() % kBlockDim) == 0 &&
              (rect.ysize() % kBlockDim) == 0);
   JxlMemoryManager* memory_manager = enc_state->memory_manager();
@@ -1245,6 +1243,28 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
       }
     }
 
+    const QuantBiasMode qb_mode = ActiveQuantBiasMode();
+    const bool can_opt_qbias =
+        (qb_mode != QuantBiasMode::kDefault &&
+         mutable_opsin_inverse_matrix != nullptr &&
+         frame_header.nonserialized_metadata != nullptr &&
+         Bundle::AllDefault(*mutable_opsin_inverse_matrix) && num_passes == 1 &&
+         frame_dim.xsize_blocks * frame_dim.ysize_blocks >= 1024);
+    const float upsample_lambda_mul = ComputeUpsampleLambdaMul(
+        frame_header.upsampling, cparams.butteraugli_distance);
+    const float qbias_lambda =
+        ComputeRDOLambda(cparams.butteraugli_distance) * upsample_lambda_mul;
+    const float hdr_bits =
+        (can_opt_qbias && frame_header.nonserialized_metadata->transform_data
+                                  .custom_weights_mask != 0)
+            ? 256.0f
+            : 260.0f;
+    if (can_opt_qbias) {
+      float init_b[4];
+      ComputeInitialQuantBiases(qb_mode, cparams.butteraugli_distance, init_b);
+      SetOpsinInverseMatrixQuantBiases(init_b, mutable_opsin_inverse_matrix);
+    }
+
     const size_t base_special_frames = enc_state->special_frames.size();
     for (size_t rdo_pass = 0; rdo_pass < num_rdo_passes; ++rdo_pass) {
       const bool last_pass = (rdo_pass + 1 == num_rdo_passes);
@@ -1277,9 +1297,60 @@ Status ComputeVarDCTEncodingData(const FrameHeader& frame_header,
                               cparams.decoding_speed_tier);
       }
 
+      const bool collect_ls =
+          (can_opt_qbias && qb_mode == QuantBiasMode::kImageAdaptiveLS);
+      const bool collect_gate =
+          (can_opt_qbias && qb_mode == QuantBiasMode::kDistanceSchedule &&
+           last_pass);
+      QuantBiasStats qb_stats;
       JXL_RETURN_IF_ERROR(ComputeCoefficientsRDOQ(
           frame_header, *opsin, rect, initial_quant_field,
-          enc_state->initial_quant_masking1x1, rate_model, pool, enc_state));
+          enc_state->initial_quant_masking1x1, rate_model, pool, enc_state,
+          (collect_ls || collect_gate) ? &qb_stats : nullptr));
+
+      if (collect_gate) {
+        float gated_b[4];
+        if (!GateQuantBiasesFromStats(
+                qb_stats, mutable_opsin_inverse_matrix->quant_biases,
+                qbias_lambda, hdr_bits, gated_b)) {
+          SetOpsinInverseMatrixQuantBiases(kDefaultQuantBias,
+                                           mutable_opsin_inverse_matrix);
+          JXL_RETURN_IF_ERROR(ComputeCoefficientsRDOQ(
+              frame_header, *opsin, rect, initial_quant_field,
+              enc_state->initial_quant_masking1x1, rate_model, pool, enc_state,
+              nullptr));
+        }
+      } else if (collect_ls) {
+        float opt_b[4];
+        OptimizeQuantBiasesFromStats(qb_stats, qbias_lambda, hdr_bits, opt_b);
+        if (!last_pass) {
+          SetOpsinInverseMatrixQuantBiases(opt_b, mutable_opsin_inverse_matrix);
+        } else {
+          float max_diff = 0.0f;
+          for (size_t c = 0; c < 4; ++c) {
+            max_diff = std::max(
+                max_diff,
+                std::abs(opt_b[c] -
+                         mutable_opsin_inverse_matrix->quant_biases[c]));
+          }
+          const bool cur_default =
+              Bundle::AllDefault(*mutable_opsin_inverse_matrix);
+          bool new_default = true;
+          for (size_t c = 0; c < 4; ++c) {
+            if (std::abs(opt_b[c] - kDefaultQuantBias[c]) >= 1e-5f) {
+              new_default = false;
+            }
+          }
+          if ((new_default != cur_default) || max_diff > 0.008f) {
+            SetOpsinInverseMatrixQuantBiases(opt_b,
+                                             mutable_opsin_inverse_matrix);
+            JXL_RETURN_IF_ERROR(ComputeCoefficientsRDOQ(
+                frame_header, *opsin, rect, initial_quant_field,
+                enc_state->initial_quant_masking1x1, rate_model, pool,
+                enc_state, nullptr));
+          }
+        }
+      }
 
       JXL_RETURN_IF_ERROR(ComputeEPFSharpnessRDO(frame_header, orig_opsin, rect,
                                                  rate_model, pool, enc_state));
@@ -1685,7 +1756,8 @@ Status ComputeEncodingData(
     size_t ysize, const JxlCmsInterface& cms, ThreadPool* pool,
     FrameHeader& mutable_frame_header, ModularFrameEncoder& enc_modular,
     PassesEncoderState& enc_state,
-    std::vector<std::unique_ptr<BitWriter>>* group_codes, AuxOut* aux_out) {
+    std::vector<std::unique_ptr<BitWriter>>* group_codes, AuxOut* aux_out,
+    OpsinInverseMatrix* mutable_opsin_inverse_matrix = nullptr) {
   JXL_ENSURE(x0 + xsize <= frame_data.xsize);
   JXL_ENSURE(y0 + ysize <= frame_data.ysize);
   JxlMemoryManager* memory_manager = enc_state.memory_manager();
@@ -1841,7 +1913,7 @@ Status ComputeEncodingData(
     } else {
       JXL_RETURN_IF_ERROR(ComputeVarDCTEncodingData(
           frame_header, linear, &color, group_rect, cms, pool, &enc_modular,
-          &enc_state, aux_out));
+          &enc_state, aux_out, mutable_opsin_inverse_matrix));
     }
     JXL_RETURN_IF_ERROR(ComputeAllCoeffOrders(enc_state, frame_dim));
     if (!enc_state.streaming_mode) {
@@ -1891,9 +1963,8 @@ Status ComputeEncodingData(
 }
 
 Status PermuteGroups(const CompressParams& cparams,
-                     const FrameDimensions& frame_dim,
-                     size_t num_passes, size_t dc_level,
-                     std::vector<coeff_order_t>* permutation,
+                     const FrameDimensions& frame_dim, size_t num_passes,
+                     size_t dc_level, std::vector<coeff_order_t>* permutation,
                      std::vector<std::unique_ptr<BitWriter>>* group_codes) {
   const size_t num_groups = frame_dim.num_groups;
   if (!cparams.centerfirst || (num_passes == 1 && num_groups == 1)) {
@@ -1913,7 +1984,7 @@ Status PermuteGroups(const CompressParams& cparams,
   // Calculate the coordinate scaling for LF frames.
   // libjxl only implements 2 LF frames, so won't overflow.
   const size_t dc_scale = size_t{1} << (3 * dc_level);
-  
+
   int64_t imag_cx;
   if (cparams.center_x != static_cast<size_t>(-1)) {
     imag_cx = cparams.center_x / dc_scale;
@@ -2487,17 +2558,24 @@ JXL_NOINLINE Status EncodeFrameStreaming(
   return true;
 }
 
-Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
-                          const CompressParams& cparams,
-                          const FrameInfo& frame_info,
-                          const CodecMetadata* metadata,
-                          JxlEncoderChunkedFrameAdapter& frame_data,
-                          const JxlCmsInterface& cms, ThreadPool* pool,
-                          JxlEncoderOutputProcessorWrapper* output_processor,
-                          AuxOut* aux_out) {
+Status EncodeFrameOneShot(
+    JxlMemoryManager* memory_manager, const CompressParams& cparams,
+    const FrameInfo& frame_info, const CodecMetadata* metadata,
+    JxlEncoderChunkedFrameAdapter& frame_data, const JxlCmsInterface& cms,
+    ThreadPool* pool, JxlEncoderOutputProcessorWrapper* output_processor,
+    AuxOut* aux_out,
+    OpsinInverseMatrix* mutable_opsin_inverse_matrix = nullptr) {
+  CodecMetadata local_metadata;
+  const CodecMetadata* eff_metadata = metadata;
+  OpsinInverseMatrix* eff_qbias = nullptr;
+  if (mutable_opsin_inverse_matrix != nullptr) {
+    local_metadata = *metadata;
+    eff_metadata = &local_metadata;
+    eff_qbias = &local_metadata.transform_data.opsin_inverse_matrix;
+  }
   auto enc_state = jxl::make_unique<PassesEncoderState>(memory_manager);
   SetProgressiveMode(cparams, &enc_state->progressive_splitter);
-  FrameHeader frame_header(metadata);
+  FrameHeader frame_header(eff_metadata);
   std::unique_ptr<jpeg::JPEGData> jpeg_data;
   if (frame_data.IsJPEG()) {
     jpeg_data = frame_data.TakeJPEGData();
@@ -2513,9 +2591,9 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
                                                    cparams, false));
   std::vector<std::unique_ptr<BitWriter>> group_codes;
   JXL_RETURN_IF_ERROR(ComputeEncodingData(
-      cparams, frame_info, metadata, frame_data, jpeg_data.get(), 0, 0,
+      cparams, frame_info, eff_metadata, frame_data, jpeg_data.get(), 0, 0,
       frame_data.xsize, frame_data.ysize, cms, pool, frame_header, *enc_modular,
-      *enc_state, &group_codes, aux_out));
+      *enc_state, &group_codes, aux_out, eff_qbias));
 
   BitWriter writer{memory_manager};
   JXL_RETURN_IF_ERROR(writer.AppendByteAligned(enc_state->special_frames));
@@ -2538,6 +2616,11 @@ Status EncodeFrameOneShot(JxlMemoryManager* memory_manager,
   JXL_RETURN_IF_ERROR(writer.AppendByteAligned(group_codes));
   PaddedBytes frame_bytes = std::move(writer).TakeBytes();
   JXL_RETURN_IF_ERROR(AppendData(*output_processor, frame_bytes));
+
+  if (mutable_opsin_inverse_matrix != nullptr) {
+    *mutable_opsin_inverse_matrix =
+        local_metadata.transform_data.opsin_inverse_matrix;
+  }
 
   return true;
 }
@@ -2745,7 +2828,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
                    JxlEncoderChunkedFrameAdapter& frame_data,
                    const JxlCmsInterface& cms, ThreadPool* pool,
                    JxlEncoderOutputProcessorWrapper* output_processor,
-                   AuxOut* aux_out, uint32_t* jxlp_counter) {
+                   AuxOut* aux_out, uint32_t* jxlp_counter,
+                   OpsinInverseMatrix* mutable_opsin_inverse_matrix) {
   CompressParams cparams = cparams_orig;
   if (cparams.speed_tier == SpeedTier::kTectonicPlate &&
       !cparams.IsLossless()) {
@@ -2889,7 +2973,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
           output_processor->Seek(output_processor->CurrentPosition() + 12));
     }
     return EncodeFrameOneShot(memory_manager, cparams, frame_info, metadata,
-                              frame_data, cms, pool, output_processor, aux_out);
+                              frame_data, cms, pool, output_processor, aux_out,
+                              mutable_opsin_inverse_matrix);
   }
 }
 
@@ -2897,7 +2982,8 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
                    const CompressParams& cparams_orig,
                    const FrameInfo& frame_info, const CodecMetadata* metadata,
                    ImageBundle& ib, const JxlCmsInterface& cms,
-                   ThreadPool* pool, BitWriter* writer, AuxOut* aux_out) {
+                   ThreadPool* pool, BitWriter* writer, AuxOut* aux_out,
+                   OpsinInverseMatrix* mutable_opsin_inverse_matrix) {
   JxlEncoderChunkedFrameAdapter frame_data(ib.xsize(), ib.ysize(),
                                            ib.extra_channels().size());
   std::vector<uint8_t> color;
@@ -2935,9 +3021,9 @@ Status EncodeFrame(JxlMemoryManager* memory_manager,
   fi.timecode = ib.timecode;
   fi.name = ib.name;
   JxlEncoderOutputProcessorWrapper output_processor(memory_manager);
-  JXL_RETURN_IF_ERROR(EncodeFrame(memory_manager, cparams_orig, fi, metadata,
-                                  frame_data, cms, pool, &output_processor,
-                                  aux_out, nullptr));
+  JXL_RETURN_IF_ERROR(EncodeFrame(
+      memory_manager, cparams_orig, fi, metadata, frame_data, cms, pool,
+      &output_processor, aux_out, nullptr, mutable_opsin_inverse_matrix));
   JXL_RETURN_IF_ERROR(output_processor.SetFinalizedPosition());
   std::vector<uint8_t> output;
   JXL_RETURN_IF_ERROR(output_processor.CopyOutput(output));

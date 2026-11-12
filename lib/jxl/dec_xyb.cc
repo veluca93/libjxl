@@ -141,13 +141,33 @@ bool CanOutputToColorEncoding(const ColorEncoding& c_desired) {
   return true;
 }
 
+namespace {
+
+bool IsDefaultOpsinMatrixAndBias(const OpsinInverseMatrix& im) {
+  const Matrix3x3& def = jxl::cms::DefaultInverseOpsinAbsorbanceMatrix();
+  for (size_t r = 0; r < 3; ++r) {
+    for (size_t c = 0; c < 3; ++c) {
+      if (std::abs(im.inverse_matrix[r][c] - def[r][c]) > 5e-3f) {
+        return false;
+      }
+    }
+    if (std::abs(im.opsin_biases[r] - jxl::cms::kNegOpsinAbsorbanceBiasRGB[r]) >
+        1e-5f) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 Status OutputEncodingInfo::SetFromMetadata(const CodecMetadata& metadata) {
   orig_color_encoding = metadata.m.color_encoding;
   orig_intensity_target = metadata.m.IntensityTarget();
   desired_intensity_target = orig_intensity_target;
   const auto& im = metadata.transform_data.opsin_inverse_matrix;
   orig_inverse_matrix = im.inverse_matrix;
-  default_transform = im.all_default;
+  default_transform = im.all_default || IsDefaultOpsinMatrixAndBias(im);
   xyb_encoded = metadata.m.xyb_encoded;
   std::copy(std::begin(im.opsin_biases), std::end(im.opsin_biases),
             opsin_params.opsin_biases);
